@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2016, 2020, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2016, 2024, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * The Universal Permissive License (UPL), Version 1.0
@@ -40,7 +40,6 @@
  */
 package com.oracle.truffle.api.instrumentation;
 
-import java.io.InputStream;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.List;
@@ -51,7 +50,6 @@ import java.util.function.Supplier;
 import org.graalvm.options.OptionDescriptor;
 import org.graalvm.options.OptionDescriptors;
 import org.graalvm.options.OptionValues;
-import org.graalvm.polyglot.io.MessageTransport;
 
 import com.oracle.truffle.api.CallTarget;
 import com.oracle.truffle.api.CompilerAsserts;
@@ -59,7 +57,6 @@ import com.oracle.truffle.api.CompilerDirectives;
 import com.oracle.truffle.api.TruffleContext;
 import com.oracle.truffle.api.TruffleLanguage;
 import com.oracle.truffle.api.impl.Accessor;
-import com.oracle.truffle.api.impl.DispatchOutputStream;
 import com.oracle.truffle.api.instrumentation.InstrumentationHandler.InstrumentClientInstrumenter;
 import com.oracle.truffle.api.instrumentation.TruffleInstrument.ContextLocalFactory;
 import com.oracle.truffle.api.instrumentation.TruffleInstrument.ContextThreadLocalFactory;
@@ -67,6 +64,7 @@ import com.oracle.truffle.api.nodes.ExplodeLoop;
 import com.oracle.truffle.api.nodes.LanguageInfo;
 import com.oracle.truffle.api.nodes.Node;
 import com.oracle.truffle.api.nodes.RootNode;
+import com.oracle.truffle.api.source.SourceSection;
 
 final class InstrumentAccessor extends Accessor {
 
@@ -74,7 +72,6 @@ final class InstrumentAccessor extends Accessor {
 
     static final NodeSupport NODES = ACCESSOR.nodeSupport();
     static final SourceSupport SOURCE = ACCESSOR.sourceSupport();
-    static final JDKSupport JDK = ACCESSOR.jdkSupport();
     static final LanguageSupport LANGUAGE = ACCESSOR.languageSupport();
     static final EngineSupport ENGINE = ACCESSOR.engineSupport();
     static final InteropSupport INTEROP = ACCESSOR.interopSupport();
@@ -109,9 +106,8 @@ final class InstrumentAccessor extends Accessor {
     static final class InstrumentImpl extends InstrumentSupport {
 
         @Override
-        public Object createInstrumentationHandler(Object polyglotEngine, DispatchOutputStream out, DispatchOutputStream err, InputStream in, MessageTransport messageInterceptor,
-                        boolean strongReferences) {
-            return new InstrumentationHandler(polyglotEngine, out, err, in, messageInterceptor);
+        public Object createInstrumentationHandler(Object polyglotEngine, boolean strongReferences) {
+            return new InstrumentationHandler(polyglotEngine);
         }
 
         @Override
@@ -141,17 +137,38 @@ final class InstrumentAccessor extends Accessor {
         public OptionDescriptors describeEngineOptions(Object instrumentationHandler, Object key, String requiredGroup) {
             InstrumentClientInstrumenter instrumenter = (InstrumentClientInstrumenter) ((InstrumentationHandler) instrumentationHandler).instrumenterMap.get(key);
             OptionDescriptors descriptors = instrumenter.instrument.getOptionDescriptors();
-            return validateOptions(requiredGroup, instrumenter, descriptors);
+            return validateOptions(requiredGroup, instrumenter.instrument, descriptors);
         }
 
         @Override
         public OptionDescriptors describeContextOptions(Object instrumentationHandler, Object key, String requiredGroup) {
             InstrumentClientInstrumenter instrumenter = (InstrumentClientInstrumenter) ((InstrumentationHandler) instrumentationHandler).instrumenterMap.get(key);
             OptionDescriptors descriptors = instrumenter.instrument.getContextOptionDescriptors();
-            return validateOptions(requiredGroup, instrumenter, descriptors);
+            return validateOptions(requiredGroup, instrumenter.instrument, descriptors);
         }
 
-        private static OptionDescriptors validateOptions(String requiredGroup, InstrumentClientInstrumenter instrumenter, OptionDescriptors descriptors) {
+        @Override
+        public OptionDescriptors describeSourceOptions(Object instrumentationHandler, Object key, String requiredGroup) {
+            InstrumentClientInstrumenter instrumenter = (InstrumentClientInstrumenter) ((InstrumentationHandler) instrumentationHandler).instrumenterMap.get(key);
+            OptionDescriptors descriptors = instrumenter.instrument.getSourceOptionDescriptors();
+            return validateOptions(requiredGroup, instrumenter.instrument, descriptors);
+        }
+
+        @Override
+        public OptionDescriptors describeOptions(Object truffleInstrument, String requiredGroup) {
+            TruffleInstrument instrument = (TruffleInstrument) truffleInstrument;
+            OptionDescriptors engineDescriptors = validateOptions(requiredGroup, instrument, instrument.getOptionDescriptors());
+            OptionDescriptors contextDescriptors = validateOptions(requiredGroup, instrument, instrument.getContextOptionDescriptors());
+            if (engineDescriptors == OptionDescriptors.EMPTY) {
+                return contextDescriptors;
+            }
+            if (contextDescriptors == OptionDescriptors.EMPTY) {
+                return engineDescriptors;
+            }
+            return InstrumentAccessor.LANGUAGE.createOptionDescriptorsUnion(engineDescriptors, contextDescriptors);
+        }
+
+        private static OptionDescriptors validateOptions(String requiredGroup, TruffleInstrument instrument, OptionDescriptors descriptors) {
             if (descriptors == null) {
                 return OptionDescriptors.EMPTY;
             }
@@ -160,7 +177,7 @@ final class InstrumentAccessor extends Accessor {
                 if (!descriptor.getName().equals(requiredGroup) && !descriptor.getName().startsWith(groupPlusDot)) {
                     throw new IllegalArgumentException(String.format("Illegal option prefix in name '%s' specified for option described by instrument '%s'. " +
                                     "The option prefix must match the id of the instrument '%s'.",
-                                    descriptor.getName(), instrumenter.instrument.getClass().getName(), requiredGroup));
+                                    descriptor.getName(), instrument.getClass().getName(), requiredGroup));
                 }
             }
             return descriptors;
@@ -177,8 +194,8 @@ final class InstrumentAccessor extends Accessor {
         }
 
         @Override
-        public void collectEnvServices(Set<Object> collectTo, Object polyglotLanguage, TruffleLanguage<?> language) {
-            InstrumentationHandler instrumentationHandler = (InstrumentationHandler) engineAccess().getInstrumentationHandler(polyglotLanguage);
+        public void collectEnvServices(Set<Object> collectTo, Object polyglotLanguageContext, TruffleLanguage<?> language) {
+            InstrumentationHandler instrumentationHandler = (InstrumentationHandler) engineAccess().getInstrumentationHandler(polyglotLanguageContext);
             Instrumenter instrumenter = instrumentationHandler.forLanguage(language);
             collectTo.add(instrumenter);
             AllocationReporter allocationReporter = instrumentationHandler.getAllocationReporter(InstrumentAccessor.langAccess().getLanguageInfo(language));
@@ -302,19 +319,9 @@ final class InstrumentAccessor extends Accessor {
         }
 
         @Override
-        public org.graalvm.polyglot.SourceSection createSourceSection(Object instrumentEnv, org.graalvm.polyglot.Source source, com.oracle.truffle.api.source.SourceSection ss) {
+        public Object createPolyglotSourceSection(Object instrumentEnv, Object polyglotSource, SourceSection ss) {
             TruffleInstrument.Env env = (TruffleInstrument.Env) instrumentEnv;
-            return engineAccess().createSourceSection(env.getPolyglotInstrument(), source, ss);
-        }
-
-        @Override
-        public void patchInstrumentationHandler(Object instrumentationHandler, DispatchOutputStream out, DispatchOutputStream err, InputStream in) {
-            ((InstrumentationHandler) instrumentationHandler).patch(out, err, in);
-        }
-
-        @Override
-        public void finalizeStoreInstrumentationHandler(Object instrumentationHandler) {
-            ((InstrumentationHandler) instrumentationHandler).finalizeStore();
+            return engineAccess().createPolyglotSourceSection(env.getPolyglotInstrument(), polyglotSource, ss);
         }
 
         @Override
@@ -398,6 +405,5 @@ final class InstrumentAccessor extends Accessor {
                 listener.onLeaveThread(truffleContext);
             }
         }
-
     }
 }

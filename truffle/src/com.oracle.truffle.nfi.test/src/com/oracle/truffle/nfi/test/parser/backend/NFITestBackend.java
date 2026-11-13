@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2019, 2021, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2019, 2024, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * The Universal Permissive License (UPL), Version 1.0
@@ -42,6 +42,7 @@ package com.oracle.truffle.nfi.test.parser.backend;
 
 import com.oracle.truffle.api.CallTarget;
 import com.oracle.truffle.api.CompilerDirectives;
+import com.oracle.truffle.api.ContextThreadLocal;
 import com.oracle.truffle.api.CompilerDirectives.TruffleBoundary;
 import com.oracle.truffle.api.TruffleLanguage;
 import com.oracle.truffle.api.TruffleLanguage.Env;
@@ -54,14 +55,12 @@ import com.oracle.truffle.api.nodes.RootNode;
 import com.oracle.truffle.nfi.backend.spi.NFIBackend;
 import com.oracle.truffle.nfi.backend.spi.NFIBackendFactory;
 import com.oracle.truffle.nfi.backend.spi.NFIBackendLibrary;
-import com.oracle.truffle.nfi.backend.spi.NFIBackendTools;
+import com.oracle.truffle.nfi.backend.spi.NFIState;
 import com.oracle.truffle.nfi.backend.spi.types.NativeLibraryDescriptor;
 import com.oracle.truffle.nfi.backend.spi.types.NativeSimpleType;
 
 @Registration(id = "test/nfi-backend", name = "NFITestBackend", internal = true, services = NFIBackendFactory.class)
 public class NFITestBackend extends TruffleLanguage<Env> {
-
-    NFIBackendTools tools;
 
     NFIBackend backend = new NFITestBackendImpl();
 
@@ -118,8 +117,7 @@ public class NFITestBackend extends TruffleLanguage<Env> {
             }
 
             @Override
-            public NFIBackend createBackend(NFIBackendTools t) {
-                tools = t;
+            public NFIBackend createBackend(ContextThreadLocal<NFIState> state) {
                 return backend;
             }
         });

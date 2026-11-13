@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2018, 2019, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2018, 2022, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * The Universal Permissive License (UPL), Version 1.0
@@ -110,8 +110,8 @@ public class FunctionalInterfaceTest extends ProxyLanguageEnvTest {
     public void testThread() throws InteropException {
         TruffleObject threadClass = (TruffleObject) env.lookupHostSymbol("java.lang.Thread");
         Object result = INTEROP.instantiate(threadClass, new TestExecutable());
-        assertTrue(env.isHostObject(result));
-        Object thread = env.asHostObject(result);
+        assertTrue(INTEROP.isHostObject(result));
+        Object thread = INTEROP.asHostObject(result);
         assertTrue(thread instanceof Thread);
     }
 

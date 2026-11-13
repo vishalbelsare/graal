@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2021, 2021, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2021, 2024, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -81,7 +81,8 @@ typedef union {
                       : 1,
              osxsave  : 1,
              avx      : 1,
-                      : 2,
+             f16c     : 1,
+                      : 1,
              hv       : 1;
   } bits;
 } StdCpuid1Ecx;
@@ -140,12 +141,11 @@ typedef union {
     uint32_t LahfSahf     : 1,
              CmpLegacy    : 1,
                           : 3,
-             lzcnt_intel  : 1,
              lzcnt        : 1,
              sse4a        : 1,
              misalignsse  : 1,
              prefetchw    : 1,
-                          : 22;
+                          : 23;
   } bits;
 } ExtCpuid1Ecx;
 
@@ -156,7 +156,10 @@ typedef union {
              mmx_amd   : 1,
              mmx       : 1,
              fxsr      : 1,
-                       : 4,
+             fxsr_opt  : 1,
+             pdpe1gb   : 1,
+             rdtscp    : 1,
+                       : 1,
              long_mode : 1,
              tdnow2    : 1,
              tdnow     : 1;
@@ -212,7 +215,9 @@ typedef union {
              avx512dq : 1,
                       : 1,
                   adx : 1,
-                      : 3,
+                      : 1,
+           avx512ifma : 1,
+                      : 1,
            clflushopt : 1,
                  clwb : 1,
                       : 1,
@@ -235,7 +240,7 @@ typedef union {
                    ospke : 1,
                          : 1,
             avx512_vbmi2 : 1,
-                         : 1,
+                  cet_ss : 1,
                     gfni : 1,
                     vaes : 1,
        avx512_vpclmulqdq : 1,
@@ -243,7 +248,11 @@ typedef union {
            avx512_bitalg : 1,
                          : 1,
         avx512_vpopcntdq : 1,
-                         : 17;
+                         : 1,
+                         : 1,
+                   mawau : 5,
+                   rdpid : 1,
+                         : 9;
   } bits;
 } SefCpuid7Ecx;
 
@@ -253,9 +262,63 @@ typedef union {
     uint32_t             : 2,
            avx512_4vnniw : 1,
            avx512_4fmaps : 1,
-                         : 28;
+      fast_short_rep_mov : 1,
+                         : 9,
+               serialize : 1,
+                         : 5,
+                 cet_ibt : 1,
+                         : 2,
+            avx512_fp16  : 1,
+                         : 8;
   } bits;
 } SefCpuid7Edx;
+
+typedef union {
+  uint32_t value;
+  struct {
+    uint32_t    sha512   : 1,
+                         : 22,
+                avx_ifma : 1,
+                         : 8;
+  } bits;
+} SefCpuid7SubLeaf1Eax;
+
+typedef union {
+  uint32_t value;
+  struct {
+    uint32_t             : 19,
+                avx10    : 1,
+                         : 1,
+                apx_f    : 1,
+                         : 10;
+  } bits;
+} SefCpuid7SubLeaf1Edx;
+
+typedef union {
+  uint32_t value;
+  struct {
+    uint32_t sub_leaves_cnt : 31;
+  } bits;
+} StdCpuid24MainLeafEax;
+
+typedef union StdCpuid24MainLeafEbx {
+  uint32_t value;
+  struct {
+    uint32_t avx10_converged_isa_version : 8,
+                                         : 8,
+                                         : 2,
+             avx10_vlen_512              : 1,
+                                         : 13;
+  } bits;
+} StdCpuid24MainLeafEbx;
+
+typedef union StdCpuidEax29Ecx0 {
+  uint32_t value;
+  struct {
+    uint32_t  apx_nci_ndd_nf  : 1,
+                              : 31;
+  } bits;
+} StdCpuidEax29Ecx0;
 
 typedef union {
   uint32_t value;
@@ -277,7 +340,9 @@ typedef union {
              opmask  : 1,
              zmm512  : 1,
              zmm32   : 1,
-                     : 24;
+                     : 11,
+             apx_f   : 1,
+                     : 12;
   } bits;
 } XemXcr0Eax;
 
@@ -307,10 +372,24 @@ typedef struct {
   uint32_t     dcp_cpuid4_edx; // unused currently
 
   // cpuid function 7 (structured extended features)
+  // eax = 7, ecx = 0
   SefCpuid7Eax sef_cpuid7_eax;
   SefCpuid7Ebx sef_cpuid7_ebx;
   SefCpuid7Ecx sef_cpuid7_ecx;
   SefCpuid7Edx sef_cpuid7_edx;
+  // cpuid function 7 (structured extended features enumeration sub-leaf 1)
+  // eax = 7, ecx = 1
+  SefCpuid7SubLeaf1Eax sefsl1_cpuid7_eax;
+  SefCpuid7SubLeaf1Edx sefsl1_cpuid7_edx;
+
+  // cpuid function 24 converged vector ISA main leaf
+  // eax = 24, ecx = 0
+  StdCpuid24MainLeafEax std_cpuid24_eax;
+  StdCpuid24MainLeafEbx std_cpuid24_ebx;
+
+  // cpuid function 0x29 APX Advanced Performance Extensions Leaf
+  // eax = 0x29, ecx = 0
+  StdCpuidEax29Ecx0 std_cpuid29_ebx;
 
   // cpuid function 0xB (processor topology)
   // ecx = 0
@@ -405,4 +484,3 @@ enum Extended_Family {
   CPU_MODEL_BROADWELL      = 0x3d,
   CPU_MODEL_SKYLAKE        = 0x55
 };
-

@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2019, 2021, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2019, 2026, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * The Universal Permissive License (UPL), Version 1.0
@@ -40,176 +40,95 @@
  */
 package org.graalvm.wasm.nodes;
 
-import static org.graalvm.wasm.nodes.WasmFrame.popLong;
-import static org.graalvm.wasm.nodes.WasmFrame.popDouble;
-import static org.graalvm.wasm.nodes.WasmFrame.popFloat;
-import static org.graalvm.wasm.nodes.WasmFrame.popInt;
-import static org.graalvm.wasm.nodes.WasmFrame.pushLong;
-import static org.graalvm.wasm.nodes.WasmFrame.pushDouble;
-import static org.graalvm.wasm.nodes.WasmFrame.pushFloat;
-import static org.graalvm.wasm.nodes.WasmFrame.pushInt;
-
-import org.graalvm.wasm.WasmCodeEntry;
+import org.graalvm.wasm.WasmArguments;
 import org.graalvm.wasm.WasmContext;
 import org.graalvm.wasm.WasmInstance;
 import org.graalvm.wasm.WasmLanguage;
-import org.graalvm.wasm.WasmType;
-import org.graalvm.wasm.WasmVoidResult;
-import org.graalvm.wasm.exception.Failure;
-import org.graalvm.wasm.exception.WasmException;
+import org.graalvm.wasm.WasmModule;
 
 import com.oracle.truffle.api.CompilerAsserts;
+import com.oracle.truffle.api.CompilerDirectives.CompilationFinal;
+import com.oracle.truffle.api.CompilerDirectives.TruffleBoundary;
 import com.oracle.truffle.api.TruffleLanguage;
 import com.oracle.truffle.api.frame.FrameDescriptor;
 import com.oracle.truffle.api.frame.VirtualFrame;
-import com.oracle.truffle.api.nodes.ExplodeLoop;
 import com.oracle.truffle.api.nodes.NodeInfo;
 import com.oracle.truffle.api.nodes.RootNode;
-import com.oracle.truffle.api.source.SourceSection;
+import com.oracle.truffle.api.profiles.BranchProfile;
 
 @NodeInfo(language = WasmLanguage.ID, description = "The root node of all WebAssembly functions")
-public class WasmRootNode extends RootNode {
+public abstract class WasmRootNode extends RootNode {
 
-    protected final WasmInstance instance;
-    private final WasmCodeEntry codeEntry;
-    private final SourceSection sourceSection;
-    @Child private WasmNode body;
+    private final WasmModule module;
 
-    public WasmRootNode(TruffleLanguage<?> language, FrameDescriptor frameDescriptor, WasmInstance instance, WasmCodeEntry codeEntry) {
+    private final BranchProfile nonLinkedProfile = BranchProfile.create();
+    /** Bound module instance (single-context mode only). */
+    @CompilationFinal private WasmInstance boundInstance;
+
+    public WasmRootNode(TruffleLanguage<?> language, FrameDescriptor frameDescriptor, WasmModule module) {
         super(language, frameDescriptor);
-        this.instance = instance;
-        this.codeEntry = codeEntry;
-        this.body = null;
-        this.sourceSection = instance.module().source().createUnavailableSection();
+        this.module = module;
     }
 
     protected final WasmContext getContext() {
         return WasmContext.get(this);
     }
 
-    public void setBody(WasmNode body) {
-        this.body = insert(body);
+    protected WasmModule module() {
+        return module;
     }
 
-    @Override
-    protected boolean isInstrumentable() {
-        return false;
-    }
-
-    public void tryInitialize(WasmContext context) {
+    @SuppressWarnings("static-method")
+    public final void tryInitialize(WasmInstance instance) {
         // We want to ensure that linking always precedes the running of the WebAssembly code.
         // This linking should be as late as possible, because a WebAssembly context should
         // be able to parse multiple modules before the code gets run.
-        context.linker().tryLink(instance);
+        if (getContext().getContextOptions().evalReturnsInstance() && !instance.isLinkCompletedFastPath()) {
+            nonLinkedProfile.enter();
+            instance.store().linker().tryLinkFastPath(instance);
+        }
+    }
+
+    protected final WasmInstance instance(VirtualFrame frame) {
+        WasmInstance instance = boundInstance;
+        if (instance == null) {
+            instance = WasmArguments.getModuleInstance(frame.getArguments());
+        } else {
+            CompilerAsserts.partialEvaluationConstant(instance);
+            assert instance == WasmArguments.getModuleInstance(frame.getArguments());
+        }
+        assert instance == instance.store().lookupModuleInstance(module());
+        return instance;
+    }
+
+    public final void setBoundModuleInstance(WasmInstance boundInstance) {
+        CompilerAsserts.neverPartOfCompilation();
+        assert this.boundInstance == null;
+        this.boundInstance = boundInstance;
+    }
+
+    @TruffleBoundary
+    protected final WasmContext getContextOrNull() {
+        if (boundInstance != null) {
+            return boundInstance.context();
+        }
+        try {
+            return WasmContext.get(this);
+        } catch (AssertionError e) {
+            assert e.getMessage() != null && e.getMessage().startsWith("No polyglot context is entered.") : e;
+            return null;
+        }
     }
 
     @Override
-    public final Object execute(VirtualFrame frame) {
-        final WasmContext context = getContext();
-        tryInitialize(context);
-        return executeWithContext(frame, context);
+    public Object execute(VirtualFrame frame) {
+        assert WasmArguments.isValid(frame.getArguments());
+        final WasmInstance instance = instance(frame);
+        tryInitialize(instance);
+        return executeWithInstance(frame, instance);
     }
 
-    public Object executeWithContext(VirtualFrame frame, WasmContext context) {
-        // WebAssembly structure dictates that a function's arguments are provided to the function
-        // as local variables, followed by any additional local variables that the function
-        // declares. A VirtualFrame contains a special array for the arguments, so we need to move
-        // the arguments to the array that holds the locals.
-        //
-        // The operand stack is also represented in the same long array.
-        //
-        // This combined array is kept inside a frame slot.
-        // The reason for this is that the operand stack cannot be passed
-        // as an argument to the loop-node's execute method,
-        // and must be restored at the beginning of the loop body.
-        final int numLocals = body.codeEntry().numLocals();
-        moveArgumentsToLocals(frame);
-
-        // WebAssembly rules dictate that a function's locals must be initialized to zero before
-        // function invocation. For more information, check the specification:
-        // https://webassembly.github.io/spec/core/exec/instructions.html#function-calls
-        initializeLocals(frame);
-
-        try {
-            body.execute(context, frame);
-        } catch (StackOverflowError e) {
-            errorBranch();
-            throw WasmException.create(Failure.CALL_STACK_EXHAUSTED);
-        }
-
-        final byte returnTypeId = body.returnTypeId();
-        CompilerAsserts.partialEvaluationConstant(returnTypeId);
-        switch (returnTypeId) {
-            case 0x00:
-            case WasmType.VOID_TYPE:
-                return WasmVoidResult.getInstance();
-            case WasmType.I32_TYPE:
-                return popInt(frame, numLocals);
-            case WasmType.I64_TYPE:
-                return popLong(frame, numLocals);
-            case WasmType.F32_TYPE:
-                return popFloat(frame, numLocals);
-            case WasmType.F64_TYPE:
-                return popDouble(frame, numLocals);
-            default:
-                throw WasmException.format(Failure.UNSPECIFIED_INTERNAL, this, "Unknown return type id: %d", returnTypeId);
-        }
-    }
-
-    protected final void errorBranch() {
-        codeEntry().errorBranch();
-    }
-
-    @ExplodeLoop
-    private void moveArgumentsToLocals(VirtualFrame frame) {
-        Object[] args = frame.getArguments();
-        int numArgs = body.instance().symbolTable().function(codeEntry().functionIndex()).numArguments();
-        assert args.length == numArgs : "Expected number of arguments " + numArgs + ", actual " + args.length;
-        for (int i = 0; i != numArgs; ++i) {
-            final Object arg = args[i];
-            byte type = body.codeEntry().localType(i);
-            switch (type) {
-                case WasmType.I32_TYPE:
-                    pushInt(frame, i, (int) arg);
-                    break;
-                case WasmType.I64_TYPE:
-                    pushLong(frame, i, (long) arg);
-                    break;
-                case WasmType.F32_TYPE:
-                    pushFloat(frame, i, (float) arg);
-                    break;
-                case WasmType.F64_TYPE:
-                    pushDouble(frame, i, (double) arg);
-                    break;
-            }
-        }
-    }
-
-    @ExplodeLoop
-    private void initializeLocals(VirtualFrame frame) {
-        int numArgs = body.instance().symbolTable().function(codeEntry().functionIndex()).numArguments();
-        for (int i = numArgs; i != body.codeEntry().numLocals(); ++i) {
-            byte type = body.codeEntry().localType(i);
-            switch (type) {
-                case WasmType.I32_TYPE:
-                    pushInt(frame, i, 0);
-                    break;
-                case WasmType.I64_TYPE:
-                    pushLong(frame, i, 0L);
-                    break;
-                case WasmType.F32_TYPE:
-                    pushFloat(frame, i, 0F);
-                    break;
-                case WasmType.F64_TYPE:
-                    pushDouble(frame, i, 0D);
-                    break;
-            }
-        }
-    }
-
-    public final WasmCodeEntry codeEntry() {
-        return codeEntry;
-    }
+    public abstract Object executeWithInstance(VirtualFrame frame, WasmInstance instance);
 
     @Override
     public final String toString() {
@@ -217,23 +136,12 @@ public class WasmRootNode extends RootNode {
     }
 
     @Override
-    public String getName() {
-        if (codeEntry == null) {
-            return "function";
-        }
-        return codeEntry.function().name();
+    protected boolean isInstrumentable() {
+        return false;
     }
 
     @Override
-    public final String getQualifiedName() {
-        if (codeEntry == null) {
-            return getName();
-        }
-        return codeEntry.function().moduleName() + "." + getName();
-    }
-
-    @Override
-    public final SourceSection getSourceSection() {
-        return sourceSection;
+    public boolean isInternal() {
+        return true;
     }
 }

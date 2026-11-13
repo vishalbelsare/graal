@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2017, 2021, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2017, 2026, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -29,8 +29,6 @@ import java.util.Collection;
 import java.util.List;
 import java.util.concurrent.atomic.AtomicLong;
 
-import com.oracle.truffle.tools.utils.json.JSONArray;
-import com.oracle.truffle.tools.utils.json.JSONObject;
 import com.oracle.truffle.api.CompilerDirectives;
 import com.oracle.truffle.api.debug.DebugException;
 import com.oracle.truffle.api.debug.DebugScope;
@@ -45,6 +43,8 @@ import com.oracle.truffle.tools.chromeinspector.LanguageChecks;
 import com.oracle.truffle.tools.chromeinspector.objects.NullObject;
 import com.oracle.truffle.tools.chromeinspector.types.TypeInfo.SUBTYPE;
 import com.oracle.truffle.tools.chromeinspector.types.TypeInfo.TYPE;
+import org.graalvm.shadowed.org.json.JSONArray;
+import org.graalvm.shadowed.org.json.JSONObject;
 
 public final class RemoteObject {
 
@@ -62,6 +62,16 @@ public final class RemoteObject {
          * Map entry. An array of the key and value.
          */
         MAP_ENTRY,
+
+        /**
+         * Array properties object created by debugger helper emulation.
+         */
+        ARRAY_PROPERTIES,
+
+        /**
+         * Array slots object created by debugger helper emulation.
+         */
+        ARRAY_SLOTS,
     }
 
     private static final Double NEGATIVE_DOUBLE_0 = Double.valueOf("-0");
@@ -102,7 +112,7 @@ public final class RemoteObject {
         this(debugValue, readEagerly, generatePreview, context, indexRange, null);
     }
 
-    private RemoteObject(DebugValue debugValue, boolean readEagerly, boolean generatePreview, InspectorExecutionContext context, IndexRange indexRange, TypeMark typeMark) {
+    public RemoteObject(DebugValue debugValue, boolean readEagerly, boolean generatePreview, InspectorExecutionContext context, IndexRange indexRange, TypeMark typeMark) {
         this.valueValue = debugValue;
         this.valueScope = null;
         this.generatePreview = generatePreview;
@@ -143,7 +153,11 @@ public final class RemoteObject {
                     toString = sourceSection.getCharacters().toString();
                     addType = false;
                 } else {
-                    toString = debugValue.toDisplayString(context.areToStringSideEffectsAllowed());
+                    if (typeInfo.type == TYPE.STRING && debugValue.isString()) {
+                        rawValue = toString = debugValue.asString();
+                    } else {
+                        toString = debugValue.toDisplayString(context.areToStringSideEffectsAllowed());
+                    }
                     if (typeInfo.type == TYPE.STRING || typeInfo.type == TYPE.SYMBOL) {
                         // The whole description is rendered as a String in quotes, or highlighted
                         // as a symbol. Do not prepend the type.

@@ -22,9 +22,14 @@
  */
 package com.oracle.truffle.espresso.processor;
 
+import java.util.List;
+
 import javax.lang.model.element.Element;
 import javax.lang.model.element.ExecutableElement;
 import javax.lang.model.element.TypeElement;
+import javax.lang.model.type.TypeMirror;
+
+import com.oracle.truffle.espresso.processor.EspressoProcessor.InjectableType;
 
 /**
  * Passed around during espresso annotation processing. It is meant to be subclassed to serve as
@@ -34,14 +39,16 @@ import javax.lang.model.element.TypeElement;
  * @see com.oracle.truffle.espresso.processor.SubstitutionProcessor.SubstitutorHelper
  */
 public class SubstitutionHelper {
-    final boolean hasMetaInjection;
-    final boolean hasProfileInjection;
-    final boolean hasContextInjection;
+    final List<InjectableType> injectedTypes;
+    final boolean skipSafepoint;
+    private final boolean needsContextInjection;
 
-    // Target of the substitution, cab be a public static method or a node.
+    // Target of the substitution, can be a public static method or a node.
     private final Element target;
 
     private final TypeElement implAnnotation;
+
+    private final TypeElement enclosingClass;
 
     public TypeElement getNodeTarget() {
         return (TypeElement) target;
@@ -51,16 +58,29 @@ public class SubstitutionHelper {
         return (ExecutableElement) target;
     }
 
-    public SubstitutionHelper(EspressoProcessor processor, Element target, TypeElement implAnnotation) {
+    public TypeMirror getCollectTarget() {
+        return implAnnotation.asType();
+    }
+
+    @SuppressWarnings("this-escape")
+    public SubstitutionHelper(EspressoProcessor processor, Element target, TypeElement implAnnotation, TypeElement enclosingClass) {
         this.target = target;
         this.implAnnotation = implAnnotation;
+        this.enclosingClass = enclosingClass;
         // If the target is a node, obtain the abstract execute* method.
         ExecutableElement targetMethod = isNodeTarget()
                         ? processor.findNodeExecute(getNodeTarget())
                         : getMethodTarget();
-        this.hasMetaInjection = processor.hasMetaInjection(targetMethod);
-        this.hasProfileInjection = processor.hasProfileInjection(targetMethod);
-        this.hasContextInjection = processor.hasContextInjection(targetMethod);
+        this.injectedTypes = processor.getInjectedTypes(targetMethod);
+        this.skipSafepoint = processor.skipsSafepoint(target);
+        boolean ctxInject = false;
+        for (InjectableType injectableType : injectedTypes) {
+            if (injectableType == InjectableType.CONTEXT || !InjectableType.knownTypes.contains(injectableType)) {
+                ctxInject = true;
+                break;
+            }
+        }
+        this.needsContextInjection = ctxInject;
     }
 
     public boolean isNodeTarget() {
@@ -73,5 +93,13 @@ public class SubstitutionHelper {
 
     public Element getTarget() {
         return target;
+    }
+
+    public final boolean needsContextInjection() {
+        return needsContextInjection;
+    }
+
+    public TypeElement getEnclosingClass() {
+        return enclosingClass;
     }
 }

@@ -24,16 +24,16 @@
  */
 package com.oracle.svm.truffle.api;
 
-import org.graalvm.compiler.truffle.runtime.GraalFastThreadLocal;
 import org.graalvm.nativeimage.Platform;
 import org.graalvm.nativeimage.Platforms;
 
-import com.oracle.svm.core.SubstrateUtil;
-import com.oracle.svm.core.threadlocal.FastThreadLocal;
-import com.oracle.svm.core.threadlocal.FastThreadLocalFactory;
-import com.oracle.svm.core.threadlocal.FastThreadLocalObject;
+import com.oracle.svm.shared.util.SubstrateUtil;
+import com.oracle.svm.guest.staging.core.threadlocal.FastThreadLocal;
+import com.oracle.svm.guest.staging.core.threadlocal.FastThreadLocalFactory;
+import com.oracle.svm.guest.staging.core.threadlocal.FastThreadLocalObject;
+import com.oracle.truffle.runtime.OptimizedFastThreadLocal;
 
-final class SubstrateFastThreadLocal extends GraalFastThreadLocal {
+final class SubstrateFastThreadLocal extends OptimizedFastThreadLocal {
 
     static final SubstrateFastThreadLocal SINGLETON = new SubstrateFastThreadLocal();
     private static final FastThreadLocalObject<Object[]> CONTEXT = FastThreadLocalFactory.createObject(Object[].class, "SubstrateFastThreadLocal.CONTEXT")

@@ -1,5 +1,5 @@
 #
-# Copyright (c) 2021, Oracle and/or its affiliates.
+# Copyright (c) 2022, 2025, Oracle and/or its affiliates.
 #
 # All rights reserved.
 #
@@ -70,7 +70,14 @@ include(SulongCommon)
 
 # Default flags for C/C++
 set(SULONG_C_FLAGS "-g" CACHE STRING "Default C flags  (use CMAKE_C_FLAGS for setting additional flags)")
-set(SULONG_CXX_FLAGS "-std=c++11 -stdlib=libc++ -g" CACHE STRING "Default C++ flags (use CMAKE_CXX_FLAGS for setting additional flags)")
+
+if(WIN32)
+  set(CXX_VERSION "")
+else()
+  set(CXX_VERSION "-std=c++11")
+endif()
+
+set(SULONG_CXX_FLAGS "${CXX_VERSION} -stdlib=libc++ -g" CACHE STRING "Default C++ flags (use CMAKE_CXX_FLAGS for setting additional flags)")
 
 # Tools
 # -----
@@ -84,14 +91,11 @@ set(LLVM_AS "" CACHE STRING "LLVM bitcode assembler")
 set(LLVM_OPT "" CACHE STRING "LLVM opt tool")
 set(LLVM_OBJCOPY "" CACHE STRING "llvm-objcopy (for native object files like elf)")
 set(LLVM_CONFIG "" CACHE STRING "llvm-config utility for setting up library paths")
-set(DRAGONEGG "" CACHE STRING "DRAGONEGG plugin path")
-set(DRAGONEGG_GCC "" CACHE STRING "DRAGONEGG enabled gcc")
-set(DRAGONEGG_FC "" CACHE STRING "DRAGONEGG enabled Fortran compiler")
-set(DRAGONEGG_LLVM_LINK "" CACHE STRING "llvm-link compatible with the DRAGONEGG LLVM version")
-set(DRAGONEGG_LLVMAS "" CACHE STRING "llvm-as compatible with the DRAGONEGG LLVM version")
-# not set by default
-set(TOOLCHAIN_CLANG "" CACHE STRING "Toolchain Wrapper for clang used by the 'bitcode' variant")
-set(TOOLCHAIN_CLANGXX "" CACHE STRING "Toolchain Wrapper for clang++ used by the 'bitcode' variant")
+
+if(WIN32)
+    # On Windows this defaults to 260 and produces a lot of warnings
+    set(CMAKE_OBJECT_PATH_MAX 4096)
+endif()
 
 # Environment Variables
 # ---------------------

@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2021, 2021, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2021, 2024, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -24,20 +24,18 @@ package com.oracle.truffle.espresso.nodes.bytecodes;
 
 import com.oracle.truffle.api.CompilerDirectives;
 import com.oracle.truffle.api.dsl.Bind;
-import com.oracle.truffle.api.dsl.Cached;
 import com.oracle.truffle.api.dsl.GenerateUncached;
 import com.oracle.truffle.api.dsl.ImportStatic;
 import com.oracle.truffle.api.dsl.Specialization;
 import com.oracle.truffle.api.interop.InteropLibrary;
 import com.oracle.truffle.api.interop.UnsupportedMessageException;
 import com.oracle.truffle.api.library.CachedLibrary;
-import com.oracle.truffle.api.nodes.Node;
 import com.oracle.truffle.api.nodes.NodeInfo;
-import com.oracle.truffle.api.profiles.BranchProfile;
+import com.oracle.truffle.espresso.EspressoLanguage;
 import com.oracle.truffle.espresso.meta.EspressoError;
+import com.oracle.truffle.espresso.nodes.EspressoNode;
 import com.oracle.truffle.espresso.nodes.quick.interop.Utils;
-import com.oracle.truffle.espresso.runtime.EspressoContext;
-import com.oracle.truffle.espresso.runtime.StaticObject;
+import com.oracle.truffle.espresso.runtime.staticobject.StaticObject;
 import com.oracle.truffle.espresso.vm.InterpreterToVM;
 
 /**
@@ -58,78 +56,59 @@ import com.oracle.truffle.espresso.vm.InterpreterToVM;
  * If the size of the foreign array does NOT fit in an int, {@link Integer#MAX_VALUE} is returned.
  * </p>
  */
-@GenerateUncached
-@NodeInfo(shortName = "ARRAYLENGTH")
 public abstract class ArrayLength {
-
-    public abstract byte execute(StaticObject receiver);
-
-    @Specialization
-    int executeWithNullCheck(StaticObject array,
-                    @Cached NullCheck nullCheck,
-                    @Cached WithoutNullCheck arrayLength) {
-        return arrayLength.execute(nullCheck.execute(array));
-    }
 
     @GenerateUncached
     @ImportStatic(Utils.class)
     @NodeInfo(shortName = "ARRAYLENGTH !nullcheck")
-    public abstract static class WithoutNullCheck extends Node {
+    public abstract static class WithoutNullCheck extends EspressoNode {
         protected static final int LIMIT = 2;
 
-        public abstract int execute(StaticObject array);
-
-        protected EspressoContext getContext() {
-            return EspressoContext.get(this);
+        public final int executeAsInt(StaticObject array) {
+            long arrayLength = executeAsLong(array);
+            if (arrayLength > Integer.MAX_VALUE) {
+                return Integer.MAX_VALUE;
+            }
+            return (int) arrayLength;
         }
 
+        public abstract long executeAsLong(StaticObject array);
+
         @Specialization(guards = "array.isEspressoObject()")
-        int doEspresso(StaticObject array) {
+        long doEspresso(StaticObject array) {
             assert !StaticObject.isNull(array);
-            return InterpreterToVM.arrayLength(array);
+            return InterpreterToVM.arrayLength(array, getLanguage());
         }
 
         @Specialization(guards = {
                         "array.isForeignObject()",
-                        "isBufferLikeByteArray(context, interop, array)",
+                        "isBufferLikeByteArray(language, getMeta(), interop, array)",
         })
-        int doBufferLike(StaticObject array,
-                        @SuppressWarnings("unused") @Bind("getContext()") EspressoContext context,
-                        @CachedLibrary(limit = "LIMIT") InteropLibrary interop,
-                        @Cached BranchProfile sizeOverflowProfile) {
+        long doBufferLike(StaticObject array,
+                        @Bind("getLanguage()") EspressoLanguage language,
+                        @CachedLibrary(limit = "LIMIT") InteropLibrary interop) {
             assert !StaticObject.isNull(array);
             try {
-                long bufferLength = interop.getBufferSize(array.rawForeignObject());
-                if (bufferLength > Integer.MAX_VALUE) {
-                    sizeOverflowProfile.enter();
-                    return Integer.MAX_VALUE;
-                }
-                return (int) bufferLength;
+                return interop.getBufferSize(array.rawForeignObject(language));
             } catch (UnsupportedMessageException e) {
-                CompilerDirectives.transferToInterpreter();
+                CompilerDirectives.transferToInterpreterAndInvalidate();
                 throw EspressoError.shouldNotReachHere(e);
             }
         }
 
         @Specialization(guards = {
                         "array.isForeignObject()",
-                        "!isBufferLikeByteArray(context, interop, array)",
-                        "isArrayLike(interop, array.rawForeignObject())"
+                        "!isBufferLikeByteArray(language, getMeta(), interop, array)",
+                        "isArrayLike(interop, array.rawForeignObject(language))"
         })
-        int doArrayLike(StaticObject array,
-                        @SuppressWarnings("unused") @Bind("getContext()") EspressoContext context,
-                        @CachedLibrary(limit = "LIMIT") InteropLibrary interop,
-                        @Cached BranchProfile sizeOverflowProfile) {
+        long doArrayLike(StaticObject array,
+                        @Bind("getLanguage()") EspressoLanguage language,
+                        @CachedLibrary(limit = "LIMIT") InteropLibrary interop) {
             assert !StaticObject.isNull(array);
             try {
-                long arrayLength = interop.getArraySize(array.rawForeignObject());
-                if (arrayLength > Integer.MAX_VALUE) {
-                    sizeOverflowProfile.enter();
-                    return Integer.MAX_VALUE;
-                }
-                return (int) arrayLength;
+                return interop.getArraySize(array.rawForeignObject(language));
             } catch (UnsupportedMessageException e) {
-                CompilerDirectives.transferToInterpreter();
+                CompilerDirectives.transferToInterpreterAndInvalidate();
                 throw EspressoError.shouldNotReachHere(e);
             }
         }

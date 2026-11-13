@@ -24,50 +24,137 @@
  */
 package com.oracle.svm.core.reflect;
 
-// Checkstyle: allow reflection
-
 import java.lang.reflect.Executable;
 
+import org.graalvm.nativeimage.Platform;
+import org.graalvm.nativeimage.Platforms;
 import org.graalvm.nativeimage.c.function.CFunctionPointer;
 
-import com.oracle.svm.core.annotate.InvokeJavaFunctionPointer;
-import com.oracle.svm.core.jdk.InternalVMMethod;
-import com.oracle.svm.core.util.VMError;
+import com.oracle.svm.core.classinitialization.EnsureClassInitializedNode;
+import com.oracle.svm.core.graal.nodes.LoadMethodByIndexNode;
+import com.oracle.svm.core.hub.DynamicHub;
+import com.oracle.svm.guest.staging.meta.MethodRef;
+import com.oracle.svm.core.reflect.ReflectionAccessorHolder.MethodInvokeFunctionPointer;
+import com.oracle.svm.core.reflect.ReflectionAccessorHolder.MethodInvokeFunctionPointerForCallerSensitiveAdapter;
+import com.oracle.svm.shared.util.VMError;
 
-@InternalVMMethod
-public abstract class SubstrateMethodAccessor {
+import jdk.internal.reflect.MethodAccessor;
+import jdk.internal.vm.annotation.Hidden;
+import jdk.vm.ci.meta.ResolvedJavaMethod;
 
-    interface MethodInvokeFunctionPointer extends CFunctionPointer {
-        /** Must match the signature of {@link ReflectionAccessorHolder#invokePrototype}. */
-        @InvokeJavaFunctionPointer
-        Object invoke(boolean invokeSpecial, Object obj, Object[] args);
+public final class SubstrateMethodAccessor extends SubstrateAccessor implements MethodAccessor {
+
+    public static final int VTABLE_INDEX_STATICALLY_BOUND = -1;
+    public static final int VTABLE_INDEX_NOT_YET_COMPUTED = -2;
+
+    public static final int INTERFACE_TYPEID_CLASS_TABLE = -1;
+    public static final int INTERFACE_TYPEID_NOT_YET_COMPUTED = 0xdead0001;
+    public static final int INTERFACE_TYPEID_UNNEEDED = -3;
+
+    /**
+     * The expected receiver type, which is checked before invoking the address from
+     * {@link #getExpandSignature()}, or {@code null} for static methods.
+     */
+    private final Class<?> receiverType;
+    /** The actual value is computed after static analysis using a field value transformer. */
+    private int vtableIndex;
+    private int interfaceTypeID;
+    private final boolean callerSensitiveAdapter;
+
+    @Platforms(Platform.HOSTED_ONLY.class)
+    public SubstrateMethodAccessor(Executable member, Class<?> receiverType, MethodRef expandSignature, MethodRef directTarget, ResolvedJavaMethod targetMethod, int vtableIndex,
+                    DynamicHub initializeBeforeInvoke, boolean callerSensitiveAdapter) {
+        super(member, expandSignature, directTarget, targetMethod, initializeBeforeInvoke);
+        this.receiverType = receiverType;
+        this.vtableIndex = vtableIndex;
+        this.interfaceTypeID = INTERFACE_TYPEID_NOT_YET_COMPUTED;
+        this.callerSensitiveAdapter = callerSensitiveAdapter;
     }
 
-    private final Executable member;
-    private final CFunctionPointer invokeFunctionPointer;
-
-    protected SubstrateMethodAccessor(Executable member, CFunctionPointer invokeFunctionPointer) {
-        this.member = member;
-        this.invokeFunctionPointer = invokeFunctionPointer;
+    public int getVTableIndex() {
+        return vtableIndex;
     }
 
+    public int getInterfaceTypeID() {
+        return interfaceTypeID;
+    }
+
+    private void preInvoke(Object obj) {
+        if (initializeBeforeInvoke != null) {
+            EnsureClassInitializedNode.ensureClassInitialized(DynamicHub.toClass(initializeBeforeInvoke));
+        }
+        if (receiverType != null) {
+            if (obj == null) {
+                /*
+                 * The specification explicitly demands a NullPointerException and not a
+                 * IllegalArgumentException when the receiver of a non-static method is null
+                 */
+                throw new NullPointerException();
+            } else if (!receiverType.isInstance(obj)) {
+                throw new IllegalArgumentException("Receiver type " + obj.getClass().getTypeName() + " is not an instance of the declaring class " + receiverType.getTypeName());
+            }
+        }
+    }
+
+    private CFunctionPointer invokeTarget(Object obj) {
+        /*
+         * In case we have both a vtableIndex and a directTarget, the vtable lookup wins. For such
+         * methods, the directTarget is only used when doing an invokeSpecial.
+         */
+        VMError.guarantee(vtableIndex != VTABLE_INDEX_NOT_YET_COMPUTED && interfaceTypeID != INTERFACE_TYPEID_NOT_YET_COMPUTED, "Missed recomputation at image build time");
+        if (vtableIndex == VTABLE_INDEX_STATICALLY_BOUND) {
+            return getDirectTarget();
+        } else {
+            return (CFunctionPointer) LoadMethodByIndexNode.loadMethodByIndex(obj.getClass(), vtableIndex, interfaceTypeID);
+        }
+    }
+
+    @Override
     public Object invoke(Object obj, Object[] args) {
-        MethodInvokeFunctionPointer functionPointer = (MethodInvokeFunctionPointer) this.invokeFunctionPointer;
-        if (functionPointer.isNull()) {
-            throw invokeError();
+        if (callerSensitiveAdapter) {
+            throw VMError.shouldNotReachHere("Cannot invoke method that has a @CallerSensitiveAdapter without an explicit caller");
         }
-        return functionPointer.invoke(false, obj, args);
+        preInvoke(obj);
+        return ((MethodInvokeFunctionPointer) getExpandSignature()).invoke(obj, args, invokeTarget(obj));
     }
 
-    private RuntimeException invokeError() {
-        throw VMError.shouldNotReachHere("No SubstrateMethodAccessor.invokeFunctionPointer for " + member);
+    /**
+     * This variant of {@link #invoke(Object, Object[], Class)} is @Hidden. This is important when
+     * this is called as part of the method handle implementation where this frame is not expected
+     * to appear.
+     */
+    @Hidden
+    public Object methodHandleInvoke(Object obj, Object[] args, Class<?> caller) {
+        if (callerSensitiveAdapter) {
+            if (caller == null) {
+                throw VMError.shouldNotReachHere("Cannot invoke method that has a @CallerSensitiveAdapter without an explicit caller");
+            }
+            preInvoke(obj);
+            return ((MethodInvokeFunctionPointerForCallerSensitiveAdapter) getExpandSignature()).invoke(obj, args, invokeTarget(obj), caller);
+        } else {
+            preInvoke(obj);
+            return ((MethodInvokeFunctionPointer) getExpandSignature()).invoke(obj, args, invokeTarget(obj));
+        }
     }
 
-    public Object invokeSpecial(Object obj, Object[] args) {
-        MethodInvokeFunctionPointer functionPointer = (MethodInvokeFunctionPointer) this.invokeFunctionPointer;
-        if (functionPointer.isNull()) {
-            throw invokeError();
+    @Override
+    public Object invoke(Object obj, Object[] args, Class<?> caller) {
+        if (callerSensitiveAdapter) {
+            preInvoke(obj);
+            return ((MethodInvokeFunctionPointerForCallerSensitiveAdapter) getExpandSignature()).invoke(obj, args, invokeTarget(obj), caller);
+        } else {
+            /* Not a @CallerSensitiveAdapter method, so we can ignore the caller argument. */
+            return invoke(obj, args);
         }
-        return functionPointer.invoke(true, obj, args);
+    }
+
+    @Override
+    @Hidden
+    public Object methodHandleInvokeSpecial(Object obj, Object[] args) {
+        if (callerSensitiveAdapter) {
+            throw VMError.shouldNotReachHere("Cannot invoke method that has a @CallerSensitiveAdapter without an explicit caller");
+        }
+        preInvoke(obj);
+        return super.methodHandleInvokeSpecial(obj, args);
     }
 }

@@ -24,10 +24,63 @@
  */
 package com.oracle.svm.configure;
 
-import com.oracle.svm.configure.json.JsonPrintable;
+import java.io.IOException;
+import java.util.EnumSet;
+import java.util.function.Consumer;
 
-public interface ConfigurationBase extends JsonPrintable {
+import jdk.graal.compiler.util.json.JsonPrintable;
+import jdk.graal.compiler.util.json.JsonWriter;
 
-    boolean isEmpty();
+public abstract class ConfigurationBase<T extends ConfigurationBase<T, P>, P> implements JsonPrintable {
 
+    public abstract boolean isEmpty();
+
+    public abstract T copy();
+
+    protected abstract void merge(T other);
+
+    public abstract void mergeConditional(UnresolvedAccessCondition condition, T other);
+
+    protected abstract void subtract(T other);
+
+    protected abstract void intersect(T other);
+
+    protected abstract void removeIf(P predicate);
+
+    protected T copyAnd(Consumer<T> consumer) {
+        T copy = copy();
+        consumer.accept(copy);
+        return copy;
+    }
+
+    public T copyAndMerge(T other) {
+        return copyAnd(copy -> copy.merge(other));
+    }
+
+    public T copyAndSubtract(T other) {
+        return copyAnd(copy -> copy.subtract(other));
+    }
+
+    public T copyAndIntersect(T other) {
+        return copyAnd(copy -> copy.intersect(other));
+    }
+
+    public T copyAndFilter(P predicate) {
+        return copyAnd(copy -> copy.removeIf(predicate));
+    }
+
+    /**
+     * Creates a JSON parser used to parse and register configuration.
+     *
+     * @param combinedFileSchema whether the parser should support the combined
+     *            reachability-metadata.json schema (if false, uses the legacy schema).
+     * @param parserOptions parser-specific options to enable different parsing features.
+     */
+    public abstract ConfigurationParser createParser(boolean combinedFileSchema, EnumSet<ConfigurationParserOption> parserOptions);
+
+    public abstract boolean supportsCombinedFile();
+
+    public void printLegacyJson(JsonWriter writer) throws IOException {
+        printJson(writer);
+    }
 }

@@ -43,6 +43,8 @@ package com.oracle.truffle.polyglot;
 import org.graalvm.options.OptionDescriptors;
 import org.graalvm.polyglot.impl.AbstractPolyglotImpl.AbstractInstrumentDispatch;
 
+import java.util.Objects;
+
 final class PolyglotInstrumentDispatch extends AbstractInstrumentDispatch {
 
     protected PolyglotInstrumentDispatch(PolyglotImpl impl) {
@@ -74,4 +76,23 @@ final class PolyglotInstrumentDispatch extends AbstractInstrumentDispatch {
         return ((PolyglotInstrument) receiver).lookup(type);
     }
 
+    @Override
+    public OptionDescriptors getSourceOptions(Object receiver) {
+        return ((PolyglotInstrument) receiver).getSourceOptions();
+    }
+
+    @Override
+    public String getWebsite(Object receiver) {
+        return ((PolyglotInstrument) receiver).getWebsite();
+    }
+
+    @Override
+    public int hashCode(Object receiver) {
+        return Objects.hashCode(receiver);
+    }
+
+    @Override
+    public boolean equals(Object receiver, Object otherImpl) {
+        return receiver.equals(otherImpl);
+    }
 }

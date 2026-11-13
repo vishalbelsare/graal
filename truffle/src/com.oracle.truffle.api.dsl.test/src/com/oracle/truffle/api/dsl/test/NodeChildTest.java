@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2012, 2018, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2012, 2026, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * The Universal Permissive License (UPL), Version 1.0
@@ -48,14 +48,22 @@ import org.junit.Test;
 import com.oracle.truffle.api.dsl.NodeChild;
 import com.oracle.truffle.api.dsl.NodeChildren;
 import com.oracle.truffle.api.dsl.Specialization;
+import com.oracle.truffle.api.dsl.test.NodeChildTestFactory.EmptyVariadicNodeGen;
 import com.oracle.truffle.api.dsl.test.NodeFieldTestFactory.IntFieldTestNodeFactory;
 import com.oracle.truffle.api.dsl.test.TypeSystemTest.ValueNode;
+import com.oracle.truffle.api.frame.VirtualFrame;
+import com.oracle.truffle.api.nodes.Node;
 
 public class NodeChildTest {
 
     @Test
     public void testIntField() {
         assertEquals(42, createCallTarget(IntFieldTestNodeFactory.create(42)).call());
+    }
+
+    @Test
+    public void testEmptyVariadicChild() {
+        assertEquals(42, EmptyVariadicNodeGen.create(null, new ValueNode[0]).executeInt(null, 42));
     }
 
     @NodeChild("child0")
@@ -96,7 +104,6 @@ public class NodeChildTest {
     @NodeChildren({@NodeChild(value = "child2", type = ValueNode.class)})
     abstract static class Child2Node extends Base1Node {
 
-        @ExpectError("Method signature (int, int, int) does not match to the expected signature:%")
         @Specialization
         int intField(int child0, int child1, int child2) {
             return child0 + child1 + child2;
@@ -128,6 +135,28 @@ public class NodeChildTest {
         @Specialization
         public int doIt(int value0, int value1, int value2) {
             return value0 + value1 + value2;
+        }
+    }
+
+    @NodeChildren({@NodeChild(value = "receiver", type = ValueNode.class), @NodeChild(value = "arguments", type = ValueNode[].class)})
+    abstract static class EmptyVariadicNode extends Node {
+        abstract int executeInt(VirtualFrame frame, int receiver);
+
+        @Specialization
+        static int doIt(int receiver) {
+            return receiver;
+        }
+    }
+
+    @ExpectError({"Unnecessary @NodeChild declaration. All evaluated child values are provided as parameters in execute methods.",
+                    "Unnecessary @NodeChild declaration. All evaluated child values are provided as parameters in execute methods."})
+    @NodeChildren({@NodeChild(value = "receiver", type = ValueNode.class), @NodeChild(value = "arguments", type = ValueNode[].class)})
+    abstract static class NonEmptyVariadicNode extends Node {
+        abstract int executeInt(VirtualFrame frame, int receiver, int argument);
+
+        @Specialization
+        static int doIt(int receiver, int argument) {
+            return receiver + argument;
         }
     }
 

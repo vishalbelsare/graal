@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2017, 2020, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2017, 2022, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * The Universal Permissive License (UPL), Version 1.0
@@ -89,11 +89,20 @@ public class InstrumentationUpdateTest {
         };
         context.eval("InstrumentationUpdateLanguage", "");
         instrumentEnv = context.getEngine().getInstruments().get("InstrumentationUpdateInstrument").lookup(TruffleInstrument.Env.class);
+        context.enter();
     }
 
     @After
     public void teardown() {
-        context.close();
+        try {
+            if (context != null) {
+                context.leave();
+                context.close();
+            }
+        } finally {
+            context = null;
+            run = null;
+        }
     }
 
     /*

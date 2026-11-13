@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2018, 2021, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2018, 2026, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * The Universal Permissive License (UPL), Version 1.0
@@ -40,6 +40,8 @@
  */
 package com.oracle.truffle.regex.dead;
 
+import com.oracle.truffle.api.frame.VirtualFrame;
+import com.oracle.truffle.api.strings.TruffleString;
 import com.oracle.truffle.regex.RegexExecNode;
 import com.oracle.truffle.regex.RegexLanguage;
 import com.oracle.truffle.regex.RegexSource;
@@ -56,12 +58,8 @@ public final class DeadRegexExecNode extends RegexExecNode {
     }
 
     @Override
-    protected RegexResult execute(Object input, int fromIndex) {
+    protected RegexResult execute(VirtualFrame frame, TruffleString input, int fromIndex, int toIndex, int regionFrom, int regionTo) {
         return RegexResult.getNoMatchInstance();
     }
 
-    @Override
-    protected String getEngineLabel() {
-        return "dead";
-    }
 }

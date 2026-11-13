@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2017, 2021, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2017, 2026, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * The Universal Permissive License (UPL), Version 1.0
@@ -44,6 +44,7 @@ import static com.oracle.truffle.api.CompilerDirectives.shouldNotReachHere;
 
 import java.io.Closeable;
 import java.io.IOException;
+import java.io.InputStream;
 import java.io.OutputStream;
 import java.lang.ref.Reference;
 import java.lang.ref.WeakReference;
@@ -54,8 +55,8 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collection;
 import java.util.Collections;
+import java.util.HashMap;
 import java.util.HashSet;
-import java.util.Iterator;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -65,20 +66,29 @@ import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.Future;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.function.Consumer;
 import java.util.function.Function;
+import java.util.function.Predicate;
 import java.util.function.Supplier;
-import java.util.logging.Handler;
 import java.util.logging.Level;
 import java.util.logging.LogRecord;
+import java.util.stream.Collectors;
 
 import org.graalvm.collections.Pair;
 import org.graalvm.nativeimage.ImageInfo;
+import org.graalvm.options.OptionDescriptors;
 import org.graalvm.options.OptionKey;
+import org.graalvm.options.OptionMap;
 import org.graalvm.options.OptionValues;
-import org.graalvm.polyglot.PolyglotException;
-import org.graalvm.polyglot.Value;
-import org.graalvm.polyglot.impl.AbstractPolyglotImpl.AbstractHostService;
+import org.graalvm.polyglot.Context;
+import org.graalvm.polyglot.SandboxPolicy;
+import org.graalvm.polyglot.impl.AbstractPolyglotImpl;
+import org.graalvm.polyglot.impl.AbstractPolyglotImpl.APIAccess;
+import org.graalvm.polyglot.impl.AbstractPolyglotImpl.AbstractValueDispatch;
+import org.graalvm.polyglot.impl.AbstractPolyglotImpl.LogHandler;
 import org.graalvm.polyglot.io.FileSystem;
+import org.graalvm.polyglot.io.MessageEndpoint;
+import org.graalvm.polyglot.io.MessageTransport.VetoException;
 import org.graalvm.polyglot.io.ProcessHandler;
 
 import com.oracle.truffle.api.CallTarget;
@@ -88,6 +98,8 @@ import com.oracle.truffle.api.CompilerDirectives.TruffleBoundary;
 import com.oracle.truffle.api.ContextLocal;
 import com.oracle.truffle.api.ContextThreadLocal;
 import com.oracle.truffle.api.InstrumentInfo;
+import com.oracle.truffle.api.InternalResource;
+import com.oracle.truffle.api.RootCallTarget;
 import com.oracle.truffle.api.ThreadLocalAction;
 import com.oracle.truffle.api.Truffle;
 import com.oracle.truffle.api.TruffleContext;
@@ -97,28 +109,44 @@ import com.oracle.truffle.api.TruffleLanguage;
 import com.oracle.truffle.api.TruffleLanguage.ContextReference;
 import com.oracle.truffle.api.TruffleLanguage.Env;
 import com.oracle.truffle.api.TruffleLanguage.LanguageReference;
+import com.oracle.truffle.api.TruffleLanguage.Registration;
 import com.oracle.truffle.api.TruffleLogger;
 import com.oracle.truffle.api.TruffleSafepoint;
-import com.oracle.truffle.api.frame.Frame;
+import com.oracle.truffle.api.frame.FrameDescriptor;
+import com.oracle.truffle.api.frame.MaterializedFrame;
+import com.oracle.truffle.api.frame.VirtualFrame;
 import com.oracle.truffle.api.impl.Accessor;
-import com.oracle.truffle.api.impl.TruffleLocator;
+import com.oracle.truffle.api.impl.DispatchOutputStream;
+import com.oracle.truffle.api.impl.JDKAccessor;
 import com.oracle.truffle.api.instrumentation.ContextsListener;
+import com.oracle.truffle.api.instrumentation.ProbeNode;
 import com.oracle.truffle.api.instrumentation.ThreadsListener;
+import com.oracle.truffle.api.interop.HeapIsolationException;
 import com.oracle.truffle.api.interop.InteropLibrary;
 import com.oracle.truffle.api.interop.TruffleObject;
 import com.oracle.truffle.api.interop.UnsupportedMessageException;
+import com.oracle.truffle.api.nodes.EncapsulatingNodeReference;
+import com.oracle.truffle.api.nodes.ExecutableNode;
 import com.oracle.truffle.api.nodes.LanguageInfo;
 import com.oracle.truffle.api.nodes.Node;
 import com.oracle.truffle.api.nodes.RootNode;
 import com.oracle.truffle.api.source.Source;
 import com.oracle.truffle.api.source.SourceSection;
+import com.oracle.truffle.polyglot.FileSystems.ResetablePath;
+import com.oracle.truffle.polyglot.PolyglotContextConfig.FileSystemConfig;
+import com.oracle.truffle.polyglot.PolyglotEngineImpl.FinalizationResult;
+import com.oracle.truffle.polyglot.PolyglotEngineImpl.LogConfig;
 import com.oracle.truffle.polyglot.PolyglotImpl.EmbedderFileSystemContext;
 import com.oracle.truffle.polyglot.PolyglotImpl.VMObject;
 import com.oracle.truffle.polyglot.PolyglotLocals.InstrumentContextLocal;
 import com.oracle.truffle.polyglot.PolyglotLocals.InstrumentContextThreadLocal;
 import com.oracle.truffle.polyglot.PolyglotLocals.LanguageContextLocal;
 import com.oracle.truffle.polyglot.PolyglotLocals.LanguageContextThreadLocal;
-import com.oracle.truffle.polyglot.PolyglotThread.ThreadSpawnRootNode;
+import com.oracle.truffle.polyglot.PolyglotSourceCache.ParseOrigin;
+import com.oracle.truffle.polyglot.PolyglotThreadTask.PolyglotThread;
+import com.oracle.truffle.polyglot.PolyglotThreadTask.ThreadSpawnRootNode;
+import com.oracle.truffle.polyglot.SystemThread.InstrumentSystemThread;
+import com.oracle.truffle.polyglot.SystemThread.LanguageSystemThread;
 
 final class EngineAccessor extends Accessor {
 
@@ -127,49 +155,72 @@ final class EngineAccessor extends Accessor {
     static final NodeSupport NODES = ACCESSOR.nodeSupport();
     static final SourceSupport SOURCE = ACCESSOR.sourceSupport();
     static final InstrumentSupport INSTRUMENT = ACCESSOR.instrumentSupport();
+    static final StringsSupport STRINGS = ACCESSOR.stringsSupport();
     static final LanguageSupport LANGUAGE = ACCESSOR.languageSupport();
-    static final JDKSupport JDKSERVICES = ACCESSOR.jdkSupport();
     static final InteropSupport INTEROP = ACCESSOR.interopSupport();
-    static final ExceptionSupport EXCEPTION = ACCESSOR.exceptionSupport();
     static final RuntimeSupport RUNTIME = ACCESSOR.runtimeSupport();
     static final HostSupport HOST = ACCESSOR.hostSupport();
+    static final BytecodeSupport BYTECODE = ACCESSOR.bytecodeSupport();
+    static final LanguageProviderSupport LANGUAGE_PROVIDER = ACCESSOR.languageProviderSupport();
+    static final InstrumentProviderSupport INSTRUMENT_PROVIDER = ACCESSOR.instrumentProviderSupport();
+    static final ExceptionSupport EXCEPTION = ACCESSOR.exceptionSupport();
+    static final PolyglotIsolateSupport ISOLATE = ACCESSOR.polyglotIsolateSupport();
+    static final SandboxSupport SANDBOX = ACCESSOR.sandboxSupport();
 
-    private static List<AbstractClassLoaderSupplier> locatorLoaders() {
-        if (ImageInfo.inImageRuntimeCode()) {
-            return Collections.emptyList();
+    /**
+     * Check that Truffle classes loaded by {@code loader} are the same as active Truffle runtime
+     * classes.
+     */
+    private static boolean isValidLoader(ClassLoader loader) {
+        try {
+            Class<?> truffleClassAsSeenByLoader = Class.forName(Truffle.class.getName(), true, loader);
+            return truffleClassAsSeenByLoader == Truffle.class;
+        } catch (ClassNotFoundException ex) {
+            return false;
         }
-        List<ClassLoader> loaders = TruffleLocator.loaders();
-        if (loaders == null) {
-            return null;
-        }
-        List<AbstractClassLoaderSupplier> suppliers = new ArrayList<>(loaders.size());
-        for (ClassLoader loader : loaders) {
-            suppliers.add(new StrongClassLoaderSupplier(loader));
-        }
-        return suppliers;
     }
 
-    private static List<AbstractClassLoaderSupplier> defaultLoaders() {
-        return Arrays.<AbstractClassLoaderSupplier> asList(
-                        new StrongClassLoaderSupplier(EngineAccessor.class.getClassLoader()),
-                        new StrongClassLoaderSupplier(ClassLoader.getSystemClassLoader()),
-                        new WeakClassLoaderSupplier(Thread.currentThread().getContextClassLoader()));
-    }
-
-    static List<AbstractClassLoaderSupplier> locatorOrDefaultLoaders() {
-        List<AbstractClassLoaderSupplier> loaders = locatorLoaders();
-        if (loaders == null) {
-            loaders = defaultLoaders();
+    static AbstractClassLoaderSupplier loader() {
+        ClassLoader contextClassLoader = Thread.currentThread().getContextClassLoader();
+        ClassLoader systemClassLoader = ClassLoader.getSystemClassLoader();
+        if (contextClassLoader != null && isValidLoader(contextClassLoader)) {
+            return new WeakClassLoaderSupplier(contextClassLoader);
+        } else if (isValidLoader(systemClassLoader)) {
+            return new StrongClassLoaderSupplier(ClassLoader.getSystemClassLoader());
+        } else {
+            return new StrongClassLoaderSupplier(EngineAccessor.class.getClassLoader());
         }
-        return loaders;
     }
 
     private EngineAccessor() {
     }
 
-    @Override
-    protected void initializeNativeImageTruffleLocator() {
-        super.initializeNativeImageTruffleLocator();
+    /*
+     * An interop exception may also delegate host-object messages to an arbitrary host value, so
+     * the isException and isHostObject messages alone are not sufficient to identify a host
+     * exception.
+     */
+    static Throwable getHostException(Throwable exception) throws HeapIsolationException {
+        if (exception != null) {
+            InteropLibrary interop = InteropLibrary.getUncached(exception);
+            if (interop.isException(exception) && interop.isHostObject(exception)) {
+                try {
+                    Object hostObject = interop.asHostObject(exception);
+                    return hostObject instanceof Throwable hostException ? hostException : null;
+                } catch (UnsupportedMessageException e) {
+                    return null;
+                }
+            }
+        }
+        return null;
+    }
+
+    static boolean isHostException(Throwable exception) {
+        try {
+            return getHostException(exception) != null;
+        } catch (HeapIsolationException e) {
+            return true;
+        }
     }
 
     static final class EngineImpl extends EngineSupport {
@@ -188,9 +239,9 @@ final class EngineAccessor extends Accessor {
         }
 
         @Override
-        public boolean isPolyglotEvalAllowed(Object polyglotLanguageContext) {
+        public boolean isPolyglotEvalAllowed(Object polyglotLanguageContext, LanguageInfo language) {
             PolyglotLanguageContext languageContext = ((PolyglotLanguageContext) polyglotLanguageContext);
-            return languageContext.isPolyglotEvalAllowed(null);
+            return languageContext.isPolyglotEvalAllowed(language);
         }
 
         @Override
@@ -210,27 +261,62 @@ final class EngineAccessor extends Accessor {
         }
 
         @Override
-        public Object getDefaultLanguageView(TruffleLanguage<?> truffleLanguage, Object value) {
-            return new DefaultLanguageView<>(truffleLanguage, value);
+        public Object getDefaultLanguageView(Object polyglotLanguageContext, Object value) {
+            return new DefaultLanguageView<>(((PolyglotLanguageContext) polyglotLanguageContext).language.getId(), value);
         }
 
+        @Override
+        public String getLanguageId(Node anchor, Class<? extends TruffleLanguage<?>> languageClass) {
+            PolyglotEngineImpl e = PolyglotFastThreadLocals.getEngine(anchor);
+            if (e == null) {
+                return null;
+            }
+            PolyglotLanguage l = e.getLanguage(languageClass, false);
+            if (l == null) {
+                // not in this isolate
+                return null;
+            }
+            return l.info.getId();
+        }
+
+        @Override
+        @SuppressWarnings("unchecked")
+        public Class<? extends TruffleLanguage<?>> getLanguageClass(Node anchor, String languageId) {
+            PolyglotEngineImpl e = PolyglotFastThreadLocals.getEngine(anchor);
+            if (e == null) {
+                return null;
+            }
+            PolyglotLanguage l = e.getLanguage(languageId, false);
+            if (l == null) {
+                // not in this isolate
+                return null;
+            }
+            PolyglotContextImpl context = PolyglotFastThreadLocals.getContextWithEngine(e);
+            if (context == null) {
+                return null;
+            }
+
+            PolyglotLanguageContext lc = context.contexts[l.engineIndex];
+            if (!lc.isCreated()) {
+                // language is available on the host, but not initialized
+                // we must not return the language class to avoid loading it
+                return null;
+            }
+            return (Class<? extends TruffleLanguage<?>>) lc.getLanguageInstance().spi.getClass();
+        }
+
+        @TruffleBoundary
         @Override
         public Object getLanguageView(LanguageInfo viewLanguage, Object value) {
-            PolyglotLanguage language = (PolyglotLanguage) NODES.getPolyglotLanguage(viewLanguage);
-            PolyglotLanguageContext context = PolyglotContextImpl.requireContext().getContextInitialized(language, null);
-            return context.getLanguageView(value);
+            PolyglotContextImpl context = PolyglotContextImpl.requireContext();
+            PolyglotLanguage language = context.engine.findLanguage(viewLanguage);
+            PolyglotLanguageContext languageContext = context.getContextInitialized(language, null);
+            return languageContext.getLanguageView(value);
         }
 
         @Override
-        public Object getScopedView(LanguageInfo viewLanguage, Node location, Frame frame, Object value) {
-            PolyglotLanguage language = (PolyglotLanguage) NODES.getPolyglotLanguage(viewLanguage);
-            PolyglotLanguageContext context = PolyglotContextImpl.requireContext().getContextInitialized(language, null);
-            return context.getScopedView(location, frame, value);
-        }
-
-        @Override
-        public LanguageInfo getLanguageInfo(Object polyglotInstrument, Class<? extends TruffleLanguage<?>> languageClass) {
-            return ((PolyglotInstrument) polyglotInstrument).engine.getLanguage(languageClass, true).info;
+        public LanguageInfo getLanguageInfo(Object vmObject, Class<? extends TruffleLanguage<?>> languageClass) {
+            return ((VMObject) vmObject).getEngine().getLanguage(languageClass, true).info;
         }
 
         @Override
@@ -243,7 +329,20 @@ final class EngineAccessor extends Accessor {
             PolyglotLanguage targetLanguage = sourceContext.context.engine.findLanguage(sourceContext, source.getLanguage(), source.getMimeType(), true, allowInternal);
             PolyglotLanguageContext targetContext = sourceContext.context.getContextInitialized(targetLanguage, sourceContext.language);
             targetContext.checkAccess(sourceContext.getLanguageInstance().language);
-            return targetContext.parseCached(sourceContext.language, source, argumentNames);
+            return targetContext.parseCached(ParseOrigin.LANGUAGE, sourceContext.language, source, argumentNames);
+        }
+
+        @Override
+        public ExecutableNode parseInlineForLanguage(Object languageContext, Source source, Node node, MaterializedFrame frame) {
+            PolyglotLanguageContext sourceContext = (PolyglotLanguageContext) languageContext;
+            TruffleLanguage.Env env = sourceContext.requireEnv();
+            OptionValuesImpl options = sourceContext.getLanguageInstance().parseSourceOptions(ParseOrigin.LANGUAGE, source, null);
+            ExecutableNode fragment = EngineAccessor.LANGUAGE.parseInline(env, source, options, node, frame);
+            if (fragment != null) {
+                TruffleLanguage<?> languageSPI = EngineAccessor.LANGUAGE.getSPI(env);
+                fragment = new GuardedExecutableNode(languageSPI, fragment, frame);
+            }
+            return fragment;
         }
 
         @Override
@@ -254,50 +353,51 @@ final class EngineAccessor extends Accessor {
         }
 
         @Override
-        public org.graalvm.polyglot.SourceSection createSourceSection(Object polyglotObject, org.graalvm.polyglot.Source source, SourceSection sectionImpl) {
+        public boolean isInstrumentReadyForContextEvents(Object polyglotInstrument) {
+            return ((PolyglotInstrument) polyglotInstrument).isReadyForContextEvents();
+        }
+
+        @Override
+        public Object createPolyglotSourceSection(Object polyglotObject, Object source, SourceSection sectionImpl) {
             return PolyglotImpl.getPolyglotSourceSection(((VMObject) polyglotObject).getImpl(), sectionImpl);
         }
 
         @Override
-        public TruffleFile getTruffleFile(String path) {
-            PolyglotContextImpl context = PolyglotContextImpl.requireContext();
-            return EngineAccessor.LANGUAGE.getTruffleFile(context.getHostContext().getPublicFileSystemContext(), path);
+        public TruffleFile getTruffleFile(TruffleContext truffleContext, String path) {
+            PolyglotContextImpl context = getPolyglotContext(truffleContext);
+            return EngineAccessor.LANGUAGE.getTruffleFile(path, context.getHostContext().getPublicFileSystemContext());
         }
 
         @Override
-        public TruffleFile getTruffleFile(URI uri) {
-            PolyglotContextImpl context = PolyglotContextImpl.requireContext();
-            return EngineAccessor.LANGUAGE.getTruffleFile(context.getHostContext().getPublicFileSystemContext(), uri);
+        public TruffleFile getTruffleFile(TruffleContext truffleContext, URI uri) {
+            PolyglotContextImpl context = getPolyglotContext(truffleContext);
+            return EngineAccessor.LANGUAGE.getTruffleFile(uri, context.getHostContext().getPublicFileSystemContext());
+        }
+
+        private static PolyglotContextImpl getPolyglotContext(TruffleContext truffleContext) {
+            if (truffleContext == null) {
+                return PolyglotContextImpl.requireContext();
+            } else {
+                return (PolyglotContextImpl) LANGUAGE.getPolyglotContext(truffleContext);
+            }
         }
 
         @Override
+        @SuppressWarnings("deprecation")
         public <T> Iterable<T> loadServices(Class<T> type) {
             Map<Class<?>, T> found = new LinkedHashMap<>();
-            // Library providers exported by Truffle are not on the GuestLangToolsLoader path.
-            if (type.getClassLoader() == Truffle.class.getClassLoader()) {
-                for (T service : ServiceLoader.load(type, type.getClassLoader())) {
-                    found.putIfAbsent(service.getClass(), service);
-                }
-            }
-            // Search guest languages and tools.
-            for (AbstractClassLoaderSupplier loaderSupplier : EngineAccessor.locatorOrDefaultLoaders()) {
-                ClassLoader loader = loaderSupplier.get();
-                if (seesTheSameClass(loader, type)) {
-                    EngineAccessor.JDKSERVICES.exportTo(loader, null);
-                    for (T service : ServiceLoader.load(type, loader)) {
+            AbstractClassLoaderSupplier loaderSupplier = EngineAccessor.loader();
+            ClassLoader loader = loaderSupplier.get();
+            if (loader != null) {
+                // Lookup implementations of a module aware interface
+                for (T service : ServiceLoader.load(type, loader)) {
+                    if (loaderSupplier.accepts(service.getClass())) {
+                        JDKSupport.exportTransitivelyTo(service.getClass().getModule());
                         found.putIfAbsent(service.getClass(), service);
                     }
                 }
             }
             return found.values();
-        }
-
-        private static boolean seesTheSameClass(ClassLoader loader, Class<?> type) {
-            try {
-                return loader != null && loader.loadClass(type.getName()) == type;
-            } catch (ClassNotFoundException ex) {
-                return false;
-            }
         }
 
         @Override
@@ -308,11 +408,12 @@ final class EngineAccessor extends Accessor {
 
         @Override
         public <S> S lookup(LanguageInfo info, Class<S> serviceClass) {
-            PolyglotLanguage language = (PolyglotLanguage) NODES.getPolyglotLanguage(info);
-            if (!language.cache.supportsService(serviceClass)) {
+            if (!((LanguageCache) NODES.getLanguageCache(info)).supportsService(serviceClass)) {
                 return null;
             }
-            PolyglotLanguageContext languageContext = PolyglotContextImpl.requireContext().getContext(language);
+            PolyglotContextImpl context = PolyglotContextImpl.requireContext();
+            PolyglotLanguage language = context.engine.findLanguage(info);
+            PolyglotLanguageContext languageContext = context.getContext(language);
             languageContext.ensureCreated(language);
             return languageContext.lookupService(serviceClass);
         }
@@ -334,12 +435,17 @@ final class EngineAccessor extends Accessor {
         @Override
         public TruffleContext getTruffleContext(Object polyglotLanguageContext) {
             PolyglotLanguageContext languageContext = (PolyglotLanguageContext) polyglotLanguageContext;
-            return languageContext.context.currentTruffleContext;
+            return languageContext.context.getCreatorTruffleContext();
         }
 
         @Override
         public Object getHostContext(Object polyglotContext) {
             return ((PolyglotContextImpl) polyglotContext).getHostContextImpl();
+        }
+
+        @Override
+        public Object asValue(Object polyglotContextImpl, Object guestValue) {
+            return ((PolyglotContextImpl) polyglotContextImpl).getHostContext().asValue(guestValue);
         }
 
         @Override
@@ -355,9 +461,35 @@ final class EngineAccessor extends Accessor {
         }
 
         @Override
+        public Object enterRootNodeVisit(RootNode root) {
+            return PolyglotFastThreadLocals.enterLayer(root);
+        }
+
+        @Override
+        public void leaveRootNodeVisit(RootNode root, Object prev) {
+            PolyglotFastThreadLocals.leaveLayer(prev);
+        }
+
+        @Override
         public TruffleContext getCurrentCreatorTruffleContext() {
             PolyglotContextImpl context = PolyglotFastThreadLocals.getContext(null);
-            return context != null ? context.creatorTruffleContext : null;
+            return context != null ? context.getCreatorTruffleContext() : null;
+        }
+
+        @Override
+        public void assertReturnParityEnter(Node probe, Object polyglotEngine) {
+            if (((PolyglotEngineImpl) polyglotEngine).probeAssertionsEnabled) {
+                PolyglotThreadInfo threadInfo = PolyglotFastThreadLocals.getCurrentThread(probe);
+                threadInfo.assertProbeEntered((ProbeNode) probe);
+            }
+        }
+
+        @Override
+        public void assertReturnParityLeave(Node probe, Object polyglotEngine) {
+            if (((PolyglotEngineImpl) polyglotEngine).probeAssertionsEnabled) {
+                PolyglotThreadInfo threadInfo = PolyglotFastThreadLocals.getCurrentThread(probe);
+                threadInfo.assertProbeReturned((ProbeNode) probe);
+            }
         }
 
         @SuppressWarnings("unchecked")
@@ -384,6 +516,11 @@ final class EngineAccessor extends Accessor {
         }
 
         @Override
+        public LanguageInfo getHostLanguage(Object vmObject) {
+            return ((VMObject) vmObject).getEngine().hostLanguage.info;
+        }
+
+        @Override
         public Map<String, LanguageInfo> getPublicLanguages(Object polyglotObject) {
             return ((PolyglotLanguageContext) polyglotObject).getAccessibleLanguages(false);
         }
@@ -402,15 +539,35 @@ final class EngineAccessor extends Accessor {
 
         @Override
         public TruffleLanguage.Env getEnvForInstrument(LanguageInfo info) {
-            PolyglotLanguage language = (PolyglotLanguage) NODES.getPolyglotLanguage(info);
-            return PolyglotContextImpl.requireContext().getContextInitialized(language, null).env;
+            PolyglotContextImpl context = PolyglotContextImpl.requireContext();
+            PolyglotLanguage language = context.engine.findLanguage(info);
+            return context.getContextInitialized(language, null).env;
+        }
+
+        @Override
+        public Object getScope(Object polyglotLanguageContext, LanguageInfo requiredLanguage, boolean internal) {
+            PolyglotLanguageContext languageContext = (PolyglotLanguageContext) polyglotLanguageContext;
+            Set<String> allowedLanguages;
+            if (internal) {
+                allowedLanguages = getInternalLanguages(languageContext).keySet();
+            } else {
+                allowedLanguages = getPublicLanguages(languageContext).keySet();
+            }
+            String requiredId = requiredLanguage.getId();
+            if (!allowedLanguages.contains(requiredId) && !(internal && PolyglotEngineImpl.HOST_LANGUAGE_ID.equals(requiredId) && languageContext.context.config.hostLookupAllowed)) {
+                throw new PolyglotEngineException(new SecurityException(String.format("Access to language '%s' is not permitted.", requiredLanguage.getId())));
+            }
+            PolyglotContextImpl context = languageContext.context;
+            PolyglotLanguage requiredPolyglotLanguage = context.engine.findLanguage(requiredLanguage);
+            PolyglotLanguageContext requestedPolyglotLanguageContext = context.getContextInitialized(requiredPolyglotLanguage, languageContext.language);
+            return LANGUAGE.getScope(requestedPolyglotLanguageContext.env);
         }
 
         static PolyglotLanguage findObjectLanguage(PolyglotEngineImpl engine, Object value) {
             InteropLibrary lib = InteropLibrary.getFactory().getUncached(value);
-            if (lib.hasLanguage(value)) {
+            if (lib.hasLanguageId(value)) {
                 try {
-                    return engine.getLanguage(lib.getLanguage(value), false);
+                    return engine.getLanguage(lib.getLanguageId(value), false);
                 } catch (UnsupportedMessageException e) {
                     throw shouldNotReachHere(e);
                 }
@@ -421,9 +578,9 @@ final class EngineAccessor extends Accessor {
 
         static PolyglotLanguage getLanguageView(PolyglotEngineImpl engine, Object value) {
             InteropLibrary lib = InteropLibrary.getFactory().getUncached(value);
-            if (lib.hasLanguage(value)) {
+            if (lib.hasLanguageId(value)) {
                 try {
-                    return engine.getLanguage(lib.getLanguage(value), false);
+                    return engine.getLanguage(lib.getLanguageId(value), false);
                 } catch (UnsupportedMessageException e) {
                     throw shouldNotReachHere(e);
                 }
@@ -465,7 +622,7 @@ final class EngineAccessor extends Accessor {
             }
             if (isPrimitive(guestObject)) {
                 return false;
-            } else if (context.engine.host.isHostValue(guestObject) || guestObject instanceof PolyglotBindings) {
+            } else if (InteropLibrary.getFactory().getUncached(guestObject).isHostObject(guestObject) || context.engine.host.isHostProxy(guestObject) || guestObject instanceof PolyglotBindings) {
                 return true;
             }
             PolyglotLanguage language = findObjectLanguage(context.engine, guestObject);
@@ -478,7 +635,7 @@ final class EngineAccessor extends Accessor {
 
         @Override
         public boolean isEvalRoot(RootNode target) {
-            // TODO no eval root nodes anymore on the stack for the polyglot api
+            // TODO GR-38632 no eval root nodes anymore on the stack for the polyglot api
             return false;
         }
 
@@ -509,8 +666,8 @@ final class EngineAccessor extends Accessor {
 
         @Override
         public Map<String, Collection<? extends FileTypeDetector>> getEngineFileTypeDetectors(Object engineFileSystemObject) {
-            if (engineFileSystemObject instanceof PolyglotLanguageContext) {
-                return ((PolyglotLanguageContext) engineFileSystemObject).context.engine.getFileTypeDetectorsSupplier().get();
+            if (engineFileSystemObject instanceof VMObject vmObject) {
+                return vmObject.getEngine().getFileTypeDetectorsSupplier().get();
             } else if (engineFileSystemObject instanceof EmbedderFileSystemContext) {
                 return ((EmbedderFileSystemContext) engineFileSystemObject).fileTypeDetectors.get();
             } else {
@@ -529,8 +686,8 @@ final class EngineAccessor extends Accessor {
         }
 
         private static LanguageCache getLanguageCache(Object engineObject, String language) throws AssertionError {
-            if (engineObject instanceof PolyglotLanguageContext) {
-                PolyglotLanguage polyglotLanguage = ((PolyglotLanguageContext) engineObject).context.engine.idToLanguage.get(language);
+            if (engineObject instanceof VMObject vmObject) {
+                PolyglotLanguage polyglotLanguage = vmObject.getEngine().idToLanguage.get(language);
                 if (polyglotLanguage != null) {
                     return polyglotLanguage.cache;
                 } else {
@@ -588,9 +745,9 @@ final class EngineAccessor extends Accessor {
         @CompilerDirectives.TruffleBoundary
         public Object importSymbol(Object polyglotLanguageContext, TruffleLanguage.Env env, String symbolName) {
             PolyglotLanguageContext context = (PolyglotLanguageContext) polyglotLanguageContext;
-            Value value = context.context.polyglotBindings.get(symbolName);
+            Object value = context.context.polyglotBindings.get(symbolName);
             if (value != null) {
-                return context.getAPIAccess().getReceiver(value);
+                return context.getAPIAccess().getValueReceiver(value);
             }
             return null;
         }
@@ -598,6 +755,9 @@ final class EngineAccessor extends Accessor {
         @Override
         public Object lookupHostSymbol(Object polyglotLanguageContext, TruffleLanguage.Env env, String symbolName) {
             PolyglotContextImpl context = ((PolyglotLanguageContext) polyglotLanguageContext).context;
+            if (!context.config.hostLookupAllowed) {
+                context.engine.host.throwHostLanguageException("Host class access is not allowed.");
+            }
             return context.engine.host.findStaticClass(context.getHostContextImpl(), symbolName);
         }
 
@@ -620,18 +780,37 @@ final class EngineAccessor extends Accessor {
         }
 
         @Override
+        public boolean isIOAllowed(Object polyglotLanguageContext, Env env) {
+            PolyglotLanguageContext context = (PolyglotLanguageContext) polyglotLanguageContext;
+            return context.context.config.isAllowIO();
+        }
+
+        @Override
+        public boolean isInnerContextOptionsAllowed(Object polyglotLanguageContext, TruffleLanguage.Env env) {
+            PolyglotLanguageContext context = (PolyglotLanguageContext) polyglotLanguageContext;
+            return context.context.config.innerContextOptionsAllowed;
+        }
+
+        @Override
+        public boolean isCurrentNativeAccessAllowed(Node node) {
+            PolyglotContextImpl context = PolyglotFastThreadLocals.getContext(PolyglotFastThreadLocals.resolveLayer(node));
+            if (context == null) {
+                CompilerDirectives.transferToInterpreterAndInvalidate();
+                throw new IllegalStateException("No current context entered.");
+            }
+            return context.config.nativeAccessAllowed;
+        }
+
+        @Override
         public boolean inContextPreInitialization(Object polyglotObject) {
-            PolyglotContextImpl polyglotContext;
-            if (polyglotObject instanceof PolyglotContextImpl) {
-                polyglotContext = (PolyglotContextImpl) polyglotObject;
-            } else if (polyglotObject instanceof PolyglotLanguageContext) {
-                polyglotContext = ((PolyglotLanguageContext) polyglotObject).context;
+            if (polyglotObject instanceof PolyglotLanguageContext languageContext) {
+                PolyglotContextImpl polyglotContext = languageContext.context;
+                return polyglotContext.getEngine().inEnginePreInitialization && polyglotContext.parent == null;
             } else if (polyglotObject instanceof EmbedderFileSystemContext) {
                 return false;
             } else {
                 throw shouldNotReachHere();
             }
-            return polyglotContext.inContextPreInitialization;
         }
 
         @Override
@@ -648,13 +827,6 @@ final class EngineAccessor extends Accessor {
             context.context.getPolyglotGuestBindings().put(symbolName, context.asValue(value));
         }
 
-        @SuppressWarnings("unchecked")
-        @Override
-        public Map<String, ? extends Object> getExportedSymbols() {
-            PolyglotContextImpl currentContext = PolyglotFastThreadLocals.getContext(null);
-            return currentContext.getPolyglotBindings().as(Map.class);
-        }
-
         @Override
         public Object getPolyglotBindingsObject() {
             PolyglotContextImpl currentContext = PolyglotFastThreadLocals.getContext(null);
@@ -662,9 +834,8 @@ final class EngineAccessor extends Accessor {
         }
 
         @Override
-        public Object toGuestValue(Node node, Object obj, Object languageContext) {
-            PolyglotContextImpl context = ((PolyglotLanguageContext) languageContext).context;
-            return context.toGuestValue(node, obj, false);
+        public Object toGuestValue(Node node, Object obj) {
+            return PolyglotContextImpl.toGuestValue(node, obj, false);
         }
 
         @Override
@@ -691,20 +862,84 @@ final class EngineAccessor extends Accessor {
         }
 
         @Override
-        public TruffleContext getParentContext(Object polyglotContext) {
-            PolyglotContextImpl parent = ((PolyglotContextImpl) polyglotContext).parent;
-            if (parent != null) {
-                return parent.currentTruffleContext;
-            } else {
-                return null;
-            }
-        }
-
-        @Override
         public Object enterInternalContext(Node location, Object polyglotLanguageContext) {
             PolyglotContextImpl context = ((PolyglotContextImpl) polyglotLanguageContext);
             PolyglotEngineImpl engine = resolveEngine(location, context);
             return engine.enter(context);
+        }
+
+        @Override
+        public Object[] enterContextAsPolyglotThread(Object polyglotContext, Context contextAPI) {
+            PolyglotContextImpl context = ((PolyglotContextImpl) polyglotContext);
+            Object[] prev = context.enterThreadChanged(false, true, false, PolyglotThreadTask.ISOLATE_POLYGLOT_THREAD, false);
+            PolyglotThreadInfo current;
+            synchronized (context) {
+                current = context.getCurrentThreadInfo();
+            }
+            assert current.getThread() == Thread.currentThread();
+            current.explicitEnterAnchor = contextAPI;
+            return prev;
+        }
+
+        @Override
+        public void leaveContextAsPolyglotThread(Object polyglotContext, Object[] prev) {
+            PolyglotContextImpl context = ((PolyglotContextImpl) polyglotContext);
+            PolyglotThreadInfo current;
+            synchronized (context) {
+                current = context.getCurrentThreadInfo();
+            }
+            assert current.getThread() == Thread.currentThread();
+            context.leaveThreadChanged(prev, true, true);
+            current.explicitEnterAnchor = null;
+        }
+
+        @SuppressWarnings("SynchronizationOnLocalVariableOrMethodParameter")
+        @Override
+        public <T, R> R leaveAndEnter(Object polyglotContext, TruffleSafepoint.Interrupter interrupter, TruffleSafepoint.InterruptibleFunction<T, R> interruptible, T object) {
+            PolyglotContextImpl context = ((PolyglotContextImpl) polyglotContext);
+            return context.leaveAndEnter(interrupter, interruptible, object, false);
+        }
+
+        @Override
+        public Object enterIfNeeded(Object polyglotContext) {
+            PolyglotContextImpl context = ((PolyglotContextImpl) polyglotContext);
+            try {
+                return context.engine.enterIfNeeded(context, true);
+            } catch (Throwable t) {
+                throw PolyglotImpl.guestToHostException(context.getHostContext(), t, false);
+            }
+        }
+
+        @Override
+        public void leaveIfNeeded(Object polyglotContext, Object prev) {
+            PolyglotContextImpl context = ((PolyglotContextImpl) polyglotContext);
+            try {
+                context.engine.leaveIfNeeded(prev, context);
+            } catch (Throwable t) {
+                throw PolyglotImpl.guestToHostException(context.getHostContext(), t, false);
+            }
+        }
+
+        @Override
+        public boolean initializeInnerContext(Node location, Object polyglotContext, String languageId, boolean allowInternal) {
+            PolyglotContextImpl context = ((PolyglotContextImpl) polyglotContext);
+            if (context.parent == null) {
+                throw PolyglotEngineException.illegalState("Only created inner contexts can be used to initialize language contexts. " +
+                                "Use TruffleLanguage.Env.initializeLanguage(LanguageInfo) instead.");
+            }
+            PolyglotEngineImpl engine = resolveEngine(location, context);
+            try {
+                Object[] prev = engine.enter(context);
+                try {
+                    PolyglotLanguage language = engine.requireLanguage(languageId, allowInternal);
+                    PolyglotLanguageContext targetLanguageContext = context.getContext(language);
+                    return targetLanguageContext.ensureInitialized(null);
+                } finally {
+                    engine.leave(prev, context);
+                }
+            } catch (Throwable t) {
+                throw OtherContextGuestObject.toHostOrInnerContextBoundaryException(context.parent, t, context);
+            }
         }
 
         @Override
@@ -715,11 +950,15 @@ final class EngineAccessor extends Accessor {
                                 "Use TruffleLanguage.Env.parseInternal(Source) or TruffleInstrument.Env.parse(Source) instead.");
             }
             PolyglotEngineImpl engine = resolveEngine(location, context);
-            Object[] prev = engine.enter(context);
             try {
-                return evalBoundary(source, prev, context, allowInternal);
-            } finally {
-                engine.leave(prev, context);
+                Object[] prev = engine.enter(context);
+                try {
+                    return evalBoundary(source, prev, context, allowInternal);
+                } finally {
+                    engine.leave(prev, context);
+                }
+            } catch (Throwable t) {
+                throw OtherContextGuestObject.toHostOrInnerContextBoundaryException(context.parent, t, context);
             }
         }
 
@@ -735,9 +974,9 @@ final class EngineAccessor extends Accessor {
             targetContext.checkAccess(accessingLanguage);
             Object result;
             try {
-                CallTarget target = targetContext.parseCached(accessingLanguage, source, null);
-                result = target.call(PolyglotImpl.EMPTY_ARGS);
-            } catch (RuntimeException e) {
+                CallTarget target = targetContext.parseCached(ParseOrigin.INSTRUMENT, accessingLanguage, source, null);
+                result = target.call(null, PolyglotImpl.EMPTY_ARGS);
+            } catch (Throwable e) {
                 throw OtherContextGuestObject.migrateException(context.parent, e, context);
             }
             assert InteropLibrary.isValidValue(result) : "invalid call target return value";
@@ -786,23 +1025,189 @@ final class EngineAccessor extends Accessor {
         }
 
         @Override
-        public TruffleContext createInternalContext(Object sourcePolyglotLanguageContext, Map<String, Object> config, boolean initializeCreatorContext) {
+        public TruffleContext createInternalContext(Object sourcePolyglotLanguageContext,
+                        OutputStream out, OutputStream err, InputStream in, ZoneId timeZone,
+                        String[] onlyLanguagesArray, Map<String, Object> config, Map<String, String> options, Map<String, String[]> arguments,
+                        Boolean sharingEnabled, boolean initializeCreatorContext, Runnable onCancelledRunnable,
+                        Consumer<Integer> onExitedRunnable, Runnable onClosedRunnable, boolean inheritAccess, Boolean allowCreateThreads,
+                        Consumer<String> threadAccessDeniedHandler,
+                        Boolean allowNativeAccess, Boolean allowIO, Boolean allowHostLookup, Boolean allowHostClassLoading,
+                        Boolean allowCreateProcess, Boolean allowPolyglotAccess, Boolean allowEnvironmentAccess,
+                        Map<String, String> customEnvironment, Boolean allowInnerContextOptions) {
             PolyglotLanguageContext creator = ((PolyglotLanguageContext) sourcePolyglotLanguageContext);
+            PolyglotEngineImpl engine = creator.context.engine;
+            PolyglotContextConfig creatorConfig = creator.context.config;
             PolyglotContextImpl impl;
-            synchronized (creator.context) {
-                impl = new PolyglotContextImpl(creator, config);
-                creator.context.engine.noInnerContexts.invalidate();
-                creator.context.addChildContext(impl);
-                impl.api = creator.getImpl().getAPIAccess().newContext(creator.getImpl().contextDispatch, impl, creator.context.engine.api);
+            Set<String> allowedLanguages;
+            if (onlyLanguagesArray.length == 0) {
+                allowedLanguages = creatorConfig.onlyLanguages;
+            } else {
+                allowedLanguages = new HashSet<>();
+                allowedLanguages.addAll(Arrays.asList(onlyLanguagesArray));
+                if (initializeCreatorContext) {
+                    allowedLanguages.add(creator.language.getId());
+                }
+                for (String language : allowedLanguages) {
+                    if (!creatorConfig.allowedPublicLanguages.contains(language)) {
+                        throw PolyglotEngineException.illegalArgument(String.format(
+                                        "The language %s permitted for the created inner context is not installed or was not permitted by the parent context. " + //
+                                                        "The parent context only permits the use of the following languages: %s. " + //
+                                                        "Ensure the context has access to the permitted language or remove the language from the permitted language list.",
+                                        language, creatorConfig.allowedPublicLanguages.toString(), language));
+                    }
+                }
             }
+
+            Map<String, String> useOptions;
+            if (options == null) {
+                useOptions = creatorConfig.originalOptions;
+            } else {
+                useOptions = new HashMap<>(creatorConfig.originalOptions);
+                useOptions.putAll(options);
+            }
+
+            if (options != null && !options.isEmpty() && !creatorConfig.innerContextOptionsAllowed) {
+                throw PolyglotEngineException.illegalArgument(String.format(
+                                "Language options were specified for the inner context but the outer context does not have the required context options privilege for this operation. " +
+                                                "Use TruffleLanguage.Env.isInnerContextOptionsAllowed() to check whether the inner context has this privilege. " +
+                                                "Use Context.Builder.allowInnerContextOptions(true) to grant inner context option privilege for inner contexts."));
+            }
+
+            APIAccess api = engine.getAPIAccess();
+
+            OutputStream useOut = out;
+            if (useOut == null) {
+                useOut = creatorConfig.out;
+            } else {
+                useOut = INSTRUMENT.createDelegatingOutput(out, engine.out);
+            }
+
+            OutputStream useErr = err;
+            if (useErr == null) {
+                useErr = creatorConfig.err;
+            } else {
+                useErr = INSTRUMENT.createDelegatingOutput(useErr, engine.out);
+            }
+            final InputStream useIn = in == null ? creatorConfig.in : in;
+
+            boolean useAllowCreateThread = inheritAccess(inheritAccess, allowCreateThreads, creatorConfig.createThreadAllowed);
+            boolean useAllowNativeAccess = inheritAccess(inheritAccess, allowNativeAccess, creatorConfig.nativeAccessAllowed);
+
+            FileSystemConfig fileSystemConfig;
+            if (inheritAccess(inheritAccess, allowIO, true)) {
+                fileSystemConfig = creatorConfig.fileSystemConfig;
+            } else {
+                FileSystem publicFileSystem = FileSystems.newDenyIOFileSystem();
+                FileSystem internalFileSystem = PolyglotEngineImpl.ALLOW_IO ? FileSystems.newResourcesFileSystem(engine) : publicFileSystem;
+                fileSystemConfig = new FileSystemConfig(api.getIOAccessNone(), publicFileSystem, internalFileSystem);
+            }
+
+            /*
+             * We currently only support one host access configuration per engine. So we need to
+             * inherit the host access configuration from the creator. Exposing host values is
+             * explicit anyway, by exposing a value to the inner context.
+             */
+            Object useAllowHostAccess = creatorConfig.hostAccess;
+
+            boolean useAllowHostClassLoading = inheritAccess(inheritAccess, allowHostClassLoading, creatorConfig.hostClassLoadingAllowed);
+            boolean useAllowHostLookup = inheritAccess(inheritAccess, allowHostLookup, creatorConfig.hostLookupAllowed);
+            Predicate<String> useClassFilter;
+            if (useAllowHostLookup) {
+                useClassFilter = creatorConfig.classFilter;
+            } else {
+                useClassFilter = null;
+            }
+
+            boolean useAllowCreateProcess = inheritAccess(inheritAccess, allowCreateProcess, creatorConfig.createProcessAllowed);
+            ProcessHandler useProcessHandler;
+            if (useAllowCreateProcess) {
+                useProcessHandler = creatorConfig.processHandler;
+            } else {
+                useProcessHandler = null;
+            }
+
+            Object usePolyglotAccess;
+            if (inheritAccess(inheritAccess, allowPolyglotAccess, true)) {
+                usePolyglotAccess = creatorConfig.polyglotAccess;
+            } else {
+                usePolyglotAccess = api.getPolyglotAccessNone();
+            }
+
+            Object useEnvironmentAccess;
+            if (inheritAccess(inheritAccess, allowEnvironmentAccess, true)) {
+                useEnvironmentAccess = creatorConfig.environmentAccess;
+            } else {
+                useEnvironmentAccess = api.getEnvironmentAccessNone();
+            }
+
+            Map<String, String> useCustomEnvironment;
+            if (useEnvironmentAccess == api.getEnvironmentAccessInherit() && !creatorConfig.customEnvironment.isEmpty()) {
+                useCustomEnvironment = new HashMap<>(creatorConfig.customEnvironment);
+                if (customEnvironment != null) {
+                    useCustomEnvironment.putAll(customEnvironment);
+                }
+            } else {
+                useCustomEnvironment = customEnvironment;
+            }
+
+            boolean useAllowInnerContextOptions = inheritAccess(inheritAccess, allowInnerContextOptions, creatorConfig.innerContextOptionsAllowed);
+
+            ZoneId useTimeZone = timeZone == null ? creatorConfig.timeZone : timeZone;
+
+            Consumer<String> useDeniedThreadAccess = threadAccessDeniedHandler != null ? threadAccessDeniedHandler : creatorConfig.threadAccessDeniedHandler;
+
+            Map<String, String[]> useArguments;
+            if (arguments == null) {
+                // change: application arguments are not inherited by default
+                useArguments = Collections.emptyMap();
+            } else {
+                useArguments = arguments;
+            }
+
+            PolyglotContextConfig innerConfig = new PolyglotContextConfig(engine, creatorConfig.sandboxPolicy, sharingEnabled, useOut, useErr, useIn,
+                            useAllowHostLookup, usePolyglotAccess, useAllowNativeAccess, useAllowCreateThread, useDeniedThreadAccess, useAllowHostClassLoading,
+                            useAllowInnerContextOptions, creatorConfig.allowExperimentalOptions,
+                            useClassFilter, useArguments, allowedLanguages, useOptions, fileSystemConfig, creatorConfig.logHandler,
+                            useAllowCreateProcess, useProcessHandler, useEnvironmentAccess, useCustomEnvironment,
+                            useTimeZone, creatorConfig.limits, creatorConfig.hostClassLoader, useAllowHostAccess,
+                            creatorConfig.allowValueSharing, false,
+                            config, onCancelledRunnable, onExitedRunnable, onClosedRunnable);
+            TruffleContext creatorContext;
+            synchronized (creator.context) {
+                impl = new PolyglotContextImpl(creator, innerConfig);
+                Object contextApi = creator.getImpl().getAPIAccess().newInnerContext(creator.getImpl().contextDispatch, impl, creator.context.getContextAPI(),
+                                creator.context.engine.getEngineAPI());
+                assert contextApi == impl.getContextAPI();
+                creatorContext = EngineAccessor.LANGUAGE.createTruffleContext(impl, creator.context.getCreatorTruffleContext());
+                impl.setCreatorTruffleContextReference(new TruffleContextCleanableReference(creatorContext, impl));
+                creator.context.addChildContext(impl);
+            }
+            creator.getImpl().getAPIAccess().processReferenceQueue();
+            TruffleContextCleanableReference.processReferenceQueue();
+
             synchronized (impl) {
                 impl.initializeContextLocals();
                 impl.notifyContextCreated();
-                if (initializeCreatorContext) {
-                    impl.initializeInnerContextLanguage(creator.language.getId());
-                }
             }
-            return impl.creatorTruffleContext;
+            if (initializeCreatorContext) {
+                impl.initializeInnerContextLanguage(creator.language.getId());
+            }
+            return creatorContext;
+        }
+
+        private static boolean inheritAccess(boolean inheritAccess, Boolean newPrivilege, boolean creatorPrivilege) {
+            if (newPrivilege != null) {
+                /*
+                 * Explicitly set privilege in the context builder. Still we need to respect the
+                 * creator privilege.
+                 */
+                return newPrivilege && creatorPrivilege;
+            } else {
+                /*
+                 * Not set privilege we can inherit the creator privilege if that is enabled.
+                 */
+                return inheritAccess && creatorPrivilege;
+            }
         }
 
         @Override
@@ -811,7 +1216,8 @@ final class EngineAccessor extends Accessor {
         }
 
         @Override
-        public Thread createThread(Object polyglotLanguageContext, Runnable runnable, Object innerContextImpl, ThreadGroup group, long stackSize) {
+        public Thread createThread(Object polyglotLanguageContext, Runnable runnable, Object innerContextImpl, ThreadGroup group, long stackSize, Runnable beforeEnter, Runnable afterLeave,
+                        boolean virtual) {
             if (!isCreateThreadAllowed(polyglotLanguageContext)) {
                 throw PolyglotEngineException.illegalState("Creating threads is not allowed.");
             }
@@ -820,9 +1226,24 @@ final class EngineAccessor extends Accessor {
                 PolyglotContextImpl innerContext = (PolyglotContextImpl) innerContextImpl;
                 threadContext = innerContext.getContext(threadContext.language);
             }
-            PolyglotThread newThread = new PolyglotThread(threadContext, runnable, group, stackSize);
-            threadContext.context.checkMultiThreadedAccess(newThread);
-            return newThread;
+
+            String name = PolyglotThreadTask.createDefaultName(threadContext);
+            PolyglotThreadTask task = new PolyglotThreadTask(threadContext, runnable, beforeEnter, afterLeave);
+            Thread newThread;
+            if (virtual) {
+                newThread = JDKAccessor.newVirtualThread(name, task);
+            } else {
+                newThread = new PolyglotThread(group, task, name, stackSize, threadContext.context);
+            }
+            newThread.setUncaughtExceptionHandler(threadContext.getPolyglotExceptionHandler());
+            for (;;) {
+                try {
+                    threadContext.context.checkMultiThreadedAccess(newThread);
+                    return newThread;
+                } catch (PolyglotThreadAccessException ex) {
+                    ex.rethrow(threadContext.context);
+                }
+            }
         }
 
         @Override
@@ -832,20 +1253,23 @@ final class EngineAccessor extends Accessor {
         }
 
         @Override
-        public boolean isHostException(Object languageContext, Throwable exception) {
-            PolyglotContextImpl context = ((PolyglotLanguageContext) languageContext).context;
-            return context.engine.host.isHostException(exception);
+        @TruffleBoundary
+        public boolean isHostException(Throwable exception) {
+            return EngineAccessor.isHostException(exception);
         }
 
         @Override
-        public Throwable asHostException(Object languageContext, Throwable exception) {
-            PolyglotContextImpl context = ((PolyglotLanguageContext) languageContext).context;
-            Throwable host = context.engine.host.unboxHostException(exception);
-            if (host == null) {
-                CompilerDirectives.transferToInterpreterAndInvalidate();
-                throw new IllegalArgumentException("Provided value not a host exception.");
+        @TruffleBoundary
+        public Throwable asHostException(Throwable exception) {
+            try {
+                Throwable hostException = getHostException(exception);
+                if (hostException != null) {
+                    return hostException;
+                }
+            } catch (HeapIsolationException e) {
+                return null;
             }
-            return host;
+            throw new IllegalArgumentException("Provided value not a host exception.");
         }
 
         @Override
@@ -874,23 +1298,28 @@ final class EngineAccessor extends Accessor {
 
         @SuppressWarnings("cast")
         @Override
-        public PolyglotException wrapGuestException(String languageId, Throwable e) {
+        public RuntimeException wrapGuestException(String languageId, Throwable e) {
             PolyglotContextImpl pc = PolyglotFastThreadLocals.getContext(null);
             if (pc == null) {
                 return null;
             }
             PolyglotLanguage language = pc.engine.findLanguage(null, languageId, null, true, true);
             PolyglotLanguageContext languageContext = pc.getContextInitialized(language, null);
-            return (PolyglotException) PolyglotImpl.guestToHostException(languageContext, e, true);
+            return PolyglotImpl.guestToHostException(languageContext, e, true);
         }
 
         @Override
-        public PolyglotException wrapGuestException(Object polyglotObject, Throwable e) {
+        public RuntimeException wrapGuestException(Object polyglotObject, Throwable e) {
             if (polyglotObject instanceof PolyglotContextImpl) {
                 PolyglotContextImpl polyglotContext = (PolyglotContextImpl) polyglotObject;
-                PolyglotLanguage language = polyglotContext.getHostContext().language;
-                PolyglotLanguageContext languageContext = polyglotContext.getContextInitialized(language, null);
-                return PolyglotImpl.guestToHostException(languageContext, e, true);
+                PolyglotLanguageContext hostLanguageContext = polyglotContext.getHostContext();
+                if (polyglotContext.state.isInvalidOrClosed()) {
+                    return PolyglotImpl.guestToHostException(hostLanguageContext, e, false);
+                } else {
+                    PolyglotLanguage language = polyglotContext.getHostContext().language;
+                    PolyglotLanguageContext languageContext = polyglotContext.getContextInitialized(language, null);
+                    return PolyglotImpl.guestToHostException(languageContext, e, true);
+                }
             } else if (polyglotObject instanceof PolyglotEngineImpl) {
                 return PolyglotImpl.guestToHostException((PolyglotEngineImpl) polyglotObject, e);
             } else {
@@ -900,7 +1329,7 @@ final class EngineAccessor extends Accessor {
 
         @Override
         public Set<? extends Class<?>> getProvidedTags(LanguageInfo language) {
-            return ((PolyglotLanguage) NODES.getPolyglotLanguage(language)).cache.getProvidedTags();
+            return ((LanguageCache) NODES.getLanguageCache(language)).getProvidedTags();
         }
 
         @SuppressWarnings("unchecked")
@@ -930,8 +1359,13 @@ final class EngineAccessor extends Accessor {
         }
 
         @Override
-        public void finalizeStore(Object polyglotEngine) {
-            ((PolyglotEngineImpl) polyglotEngine).finalizeStore();
+        public Object finalizeStore(Object polyglotEngine) {
+            return ((PolyglotEngineImpl) polyglotEngine).finalizeStore();
+        }
+
+        @Override
+        public void restoreStore(Object polyglotEngine, Object finalizationResult) {
+            ((PolyglotEngineImpl) polyglotEngine).restoreStore((FinalizationResult) finalizationResult);
         }
 
         @Override
@@ -941,12 +1375,18 @@ final class EngineAccessor extends Accessor {
 
         @Override
         public boolean isInternal(FileSystem fs) {
-            return FileSystems.isInternal(fs);
+            return FileSystems.isInternalDelegatingToHost(fs);
         }
 
         @Override
-        public boolean hasAllAccess(FileSystem fs) {
-            return FileSystems.hasAllAccess(fs);
+        public boolean isSocketIOAllowed(Object engineFileSystemContext) {
+            if (engineFileSystemContext instanceof PolyglotLanguageContext languageContext) {
+                return languageContext.getImpl().getIO().hasHostSocketAccess(languageContext.context.config.fileSystemConfig.ioAccess);
+            } else if (engineFileSystemContext instanceof EmbedderFileSystemContext) {
+                return true;
+            } else {
+                throw new AssertionError();
+            }
         }
 
         @Override
@@ -969,12 +1409,18 @@ final class EngineAccessor extends Accessor {
         @Override
         public void addToHostClassPath(Object polyglotLanguageContext, TruffleFile entry) {
             PolyglotContextImpl context = ((PolyglotLanguageContext) polyglotLanguageContext).context;
+            if (!context.config.hostLookupAllowed) {
+                context.engine.host.throwHostLanguageException("Host class access is not allowed.");
+            }
+            if (!context.config.hostClassLoadingAllowed) {
+                context.engine.host.throwHostLanguageException("Host class loading is not allowed.");
+            }
             context.engine.host.addToHostClassPath(context.getHostContextImpl(), entry);
         }
 
         @Override
-        public String getLanguageHome(Object engineObject) {
-            return ((PolyglotLanguage) engineObject).cache.getLanguageHome();
+        public String getLanguageHome(LanguageInfo languageInfo) {
+            return ((LanguageCache) NODES.getLanguageCache(languageInfo)).getLanguageHome();
         }
 
         @Override
@@ -1006,13 +1452,54 @@ final class EngineAccessor extends Accessor {
         }
 
         @Override
-        public Handler getLogHandler(Object loggerCache) {
-            return ((PolyglotLoggers.LoggerCache) loggerCache).getLogHandler();
+        public void publish(Object loggerCache, LogRecord logRecord) {
+            ((PolyglotLoggers.LoggerCache) loggerCache).getLogHandler().publish(logRecord);
         }
 
         @Override
         public LogRecord createLogRecord(Object loggerCache, Level level, String loggerName, String message, String className, String methodName, Object[] parameters, Throwable thrown) {
             return ((PolyglotLoggers.LoggerCache) loggerCache).createLogRecord(level, loggerName, message, className, methodName, parameters, thrown);
+        }
+
+        @Override
+        public boolean isKnownLoggerId(Object loggerCache, String id) {
+            if (PolyglotLoggers.getInternalIds().contains(id)) {
+                return true;
+            }
+            if (loggerCache == PolyglotLoggers.LoggerCache.DEFAULT) {
+                /*
+                 * TruffleLogger#getLogger() is invoked from a static initializer, no vmObject
+                 * anchor is available at this point.
+                 */
+                return LanguageCache.languages().containsKey(id) || InstrumentCache.load().containsKey(id);
+            } else {
+                PolyglotEngineImpl polyglotEngine = ((PolyglotLoggers.LoggerCache) loggerCache).getOwner().getEngine();
+                return polyglotEngine.idToLanguage.containsKey(id) || polyglotEngine.idToInstrument.containsKey(id);
+            }
+        }
+
+        @Override
+        public Collection<String> getKnownLoggerIds(Object loggerCache) {
+            List<String> ids = new ArrayList<>(PolyglotLoggers.getInternalIds());
+            if (loggerCache == PolyglotLoggers.LoggerCache.DEFAULT) {
+                /*
+                 * TruffleLogger#getLogger() is invoked from a static initializer, no vmObject
+                 * anchor is available at this point.
+                 */
+                ids.addAll(LanguageCache.languages().keySet());
+                ids.addAll(InstrumentCache.load().keySet());
+            } else {
+                PolyglotEngineImpl polyglotEngine = ((PolyglotLoggers.LoggerCache) loggerCache).getOwner().getEngine();
+                ids.addAll(polyglotEngine.idToLanguage.keySet());
+                ids.addAll(polyglotEngine.idToInstrument.keySet());
+            }
+            Collections.sort(ids);
+            return ids;
+        }
+
+        @Override
+        public boolean isContextBoundLogger(Object loggerCache) {
+            return ((PolyglotLoggers.LoggerCache) loggerCache).isContextBoundLogger();
         }
 
         @Override
@@ -1041,57 +1528,51 @@ final class EngineAccessor extends Accessor {
         }
 
         @Override
-        public Set<String> getLanguageIds() {
-            return LanguageCache.languages().keySet();
-        }
-
-        @Override
-        public Set<String> getInstrumentIds() {
-            Set<String> ids = new HashSet<>();
-            for (InstrumentCache cache : InstrumentCache.load()) {
-                ids.add(cache.getId());
+        @TruffleBoundary
+        public Object asHostObject(Object obj) {
+            InteropLibrary interop = InteropLibrary.getUncached(obj);
+            if (interop.isHostObject(obj)) {
+                try {
+                    return interop.asHostObject(obj);
+                } catch (HeapIsolationException e) {
+                    return null;
+                } catch (UnsupportedMessageException e) {
+                    // Fall through to IllegalArgumentException
+                }
             }
-            return ids;
+            throw new IllegalArgumentException("Provided value not a host object.");
         }
 
         @Override
-        public Set<String> getInternalIds() {
-            return PolyglotLoggers.getInternalIds();
+        @TruffleBoundary
+        public boolean isHostFunction(Object obj) {
+            InteropLibrary interop = InteropLibrary.getUncached(obj);
+            return interop.isHostObject(obj) && interop.isExecutable(obj) && !interop.hasMembers(obj);
         }
 
         @Override
-        public Object asHostObject(Object languageContext, Object obj) {
-            PolyglotContextImpl context = ((PolyglotLanguageContext) languageContext).context;
-            assert isHostObject(languageContext, obj);
-            return context.engine.host.unboxHostObject(obj);
+        @TruffleBoundary
+        public boolean isHostObject(Object obj) {
+            InteropLibrary interop = InteropLibrary.getUncached(obj);
+            return interop.isHostObject(obj);
         }
 
         @Override
-        public boolean isHostFunction(Object languageContext, Object obj) {
-            PolyglotContextImpl context = ((PolyglotLanguageContext) languageContext).context;
-            return context.engine.host.isHostFunction(obj);
-        }
-
-        @Override
-        public boolean isHostObject(Object languageContext, Object obj) {
-            PolyglotContextImpl context = ((PolyglotLanguageContext) languageContext).context;
-            return context.engine.host.isHostObject(obj);
-        }
-
-        @Override
-        public boolean isHostSymbol(Object languageContext, Object obj) {
-            PolyglotContextImpl context = ((PolyglotLanguageContext) languageContext).context;
-            return context.engine.host.isHostSymbol(obj);
+        @TruffleBoundary
+        public boolean isHostSymbol(Object obj) {
+            InteropLibrary interop = InteropLibrary.getUncached(obj);
+            return interop.isHostObject(obj) && interop.isScope(obj);
         }
 
         @Override
         public <S> S lookupService(Object polyglotLanguageContext, LanguageInfo language, LanguageInfo accessingLanguage, Class<S> type) {
-            PolyglotLanguage lang = (PolyglotLanguage) NODES.getPolyglotLanguage(language);
+            PolyglotLanguage lang = ((PolyglotLanguageContext) polyglotLanguageContext).context.engine.findLanguage(language);
             if (!lang.cache.supportsService(type)) {
                 return null;
             }
             PolyglotLanguageContext context = ((PolyglotLanguageContext) polyglotLanguageContext).context.getContext(lang);
-            context.ensureCreated((PolyglotLanguage) NODES.getPolyglotLanguage(accessingLanguage));
+            PolyglotLanguage accessingLang = ((PolyglotLanguageContext) polyglotLanguageContext).context.engine.findLanguage(accessingLanguage);
+            context.ensureCreated(accessingLang);
             return context.lookupService(type);
         }
 
@@ -1105,24 +1586,24 @@ final class EngineAccessor extends Accessor {
         }
 
         @Override
-        public <T extends TruffleLanguage<C>, C> ContextReference<C> createContextReference(Node node, Class<T> languageClass) {
-            return PolyglotFastThreadLocals.createContextReference(node, languageClass);
+        public <T extends TruffleLanguage<C>, C> ContextReference<C> createContextReference(Class<T> languageClass) {
+            return PolyglotFastThreadLocals.createContextReference(languageClass);
         }
 
         @SuppressWarnings("unchecked")
         @Override
-        public <T extends TruffleLanguage<?>> LanguageReference<T> createLanguageReference(Node node, Class<T> targetLanguageClass) {
-            return (TruffleLanguage.LanguageReference<T>) PolyglotFastThreadLocals.createLanguageReference(node, targetLanguageClass);
+        public <T extends TruffleLanguage<?>> LanguageReference<T> createLanguageReference(Class<T> targetLanguageClass) {
+            return (TruffleLanguage.LanguageReference<T>) PolyglotFastThreadLocals.createLanguageReference(targetLanguageClass);
         }
 
         @Override
         public FileSystem getFileSystem(Object polyglotContext) {
-            return ((PolyglotContextImpl) polyglotContext).config.fileSystem;
+            return ((PolyglotContextImpl) polyglotContext).config.fileSystemConfig.fileSystem;
         }
 
         @Override
-        public int getAsynchronousStackDepth(Object polylgotLanguage) {
-            return ((PolyglotLanguage) polylgotLanguage).engine.getAsynchronousStackDepth();
+        public int getAsynchronousStackDepth(Object polyglotLanguageInstance) {
+            return ((PolyglotLanguageInstance) polyglotLanguageInstance).getEngine().getAsynchronousStackDepth();
         }
 
         @Override
@@ -1144,11 +1625,11 @@ final class EngineAccessor extends Accessor {
         public Process createSubProcess(Object polyglotLanguageContext, List<String> cmd, String cwd, Map<String, String> environment, boolean redirectErrorStream,
                         ProcessHandler.Redirect inputRedirect, ProcessHandler.Redirect outputRedirect, ProcessHandler.Redirect errorRedirect) throws IOException {
             PolyglotLanguageContext languageContext = (PolyglotLanguageContext) polyglotLanguageContext;
-            OutputStream stdOut = languageContext.getImpl().getIO().getOutputStream(outputRedirect);
-            OutputStream stdErr = languageContext.getImpl().getIO().getOutputStream(errorRedirect);
+            OutputStream stdOut = outputRedirect.getOutputStream();
+            OutputStream stdErr = errorRedirect.getOutputStream();
             ProcessHandler.Redirect useOutputRedirect = stdOut == null ? outputRedirect : ProcessHandler.Redirect.PIPE;
             ProcessHandler.Redirect useErrorRedirect = stdErr == null ? errorRedirect : ProcessHandler.Redirect.PIPE;
-            ProcessHandler.ProcessCommand command = languageContext.getImpl().getIO().newProcessCommand(cmd, cwd, environment, redirectErrorStream, inputRedirect, useOutputRedirect, useErrorRedirect);
+            ProcessHandler.ProcessCommand command = ProcessHandler.ProcessCommand.create(cmd, cwd, environment, redirectErrorStream, inputRedirect, useOutputRedirect, useErrorRedirect);
             Process process = languageContext.context.config.processHandler.start(command);
             return ProcessHandlers.decorate(
                             languageContext,
@@ -1160,30 +1641,33 @@ final class EngineAccessor extends Accessor {
 
         @Override
         public boolean hasDefaultProcessHandler(Object polyglotLanguageContext) {
-            return ProcessHandlers.isDefault(((PolyglotLanguageContext) polyglotLanguageContext).context.config.processHandler);
+            PolyglotLanguageContext context = (PolyglotLanguageContext) polyglotLanguageContext;
+            if (EngineAccessor.ISOLATE.isIsolateGuest()) {
+                // In polyglot isolate ask the host
+                return EngineAccessor.ISOLATE.isDefaultProcessHandler(context.context.config.processHandler);
+            } else {
+                return ProcessHandlers.isDefault(context.context.config.processHandler);
+            }
         }
 
         @Override
-        public ProcessHandler.Redirect createRedirectToOutputStream(Object polyglotLanguageContext, OutputStream stream) {
-            return ((PolyglotLanguageContext) polyglotLanguageContext).getImpl().getIO().createRedirectToStream(stream);
+        public boolean isDefaultProcessHandler(ProcessHandler handler) {
+            return ProcessHandlers.isDefault(handler);
         }
 
         @Override
-        public boolean isIOAllowed() {
+        public boolean isIOSupported() {
             return PolyglotEngineImpl.ALLOW_IO;
         }
 
         @Override
-        public String getUnparsedOptionValue(OptionValues optionValues, OptionKey<?> optionKey) {
-            if (!(optionValues instanceof OptionValuesImpl)) {
-                throw new IllegalArgumentException(String.format("Only %s is supported.", OptionValuesImpl.class.getName()));
-            }
-            return ((OptionValuesImpl) optionValues).getUnparsedOptionValue(optionKey);
+        public boolean isCreateProcessSupported() {
+            return PolyglotEngineImpl.ALLOW_CREATE_PROCESS;
         }
 
         @Override
-        public String getRelativePathInLanguageHome(TruffleFile truffleFile) {
-            return FileSystems.getRelativePathInLanguageHome(truffleFile);
+        public String getRelativePathInResourceRoot(TruffleFile truffleFile) {
+            return FileSystems.getRelativePathInResourceRoot(truffleFile);
         }
 
         @Override
@@ -1205,21 +1689,19 @@ final class EngineAccessor extends Accessor {
 
         @Override
         public String getReinitializedPath(TruffleFile truffleFile) {
-            FileSystem fs = EngineAccessor.LANGUAGE.getFileSystem(truffleFile);
             Path path = EngineAccessor.LANGUAGE.getPath(truffleFile);
-            return ((FileSystems.PreInitializeContextFileSystem) fs).pathToString(path);
+            return ((ResetablePath) path).getReinitializedPath();
         }
 
         @Override
         public URI getReinitializedURI(TruffleFile truffleFile) {
-            FileSystem fs = EngineAccessor.LANGUAGE.getFileSystem(truffleFile);
             Path path = EngineAccessor.LANGUAGE.getPath(truffleFile);
-            return ((FileSystems.PreInitializeContextFileSystem) fs).absolutePathtoURI(path);
+            return ((ResetablePath) path).getReinitializedURI();
         }
 
         @Override
         public boolean initializeLanguage(Object polyglotLanguageContext, LanguageInfo targetLanguage) {
-            PolyglotLanguage targetPolyglotLanguage = (PolyglotLanguage) NODES.getPolyglotLanguage(targetLanguage);
+            PolyglotLanguage targetPolyglotLanguage = ((PolyglotLanguageContext) polyglotLanguageContext).context.engine.findLanguage(targetLanguage);
             PolyglotLanguageContext targetLanguageContext = ((PolyglotLanguageContext) polyglotLanguageContext).context.getContext(targetPolyglotLanguage);
             PolyglotLanguage accessingPolyglotLanguage = ((PolyglotLanguageContext) polyglotLanguageContext).language;
             try {
@@ -1276,8 +1758,8 @@ final class EngineAccessor extends Accessor {
         }
 
         @Override
-        public boolean isPolyglotObject(Object polyglotObject) {
-            return PolyglotImpl.getInstance() == polyglotObject;
+        public boolean isPolyglotSecret(Object polyglotObject) {
+            return PolyglotImpl.SECRET == polyglotObject;
         }
 
         @SuppressWarnings("unchecked")
@@ -1297,6 +1779,22 @@ final class EngineAccessor extends Accessor {
             PolyglotInstrument instrument = (PolyglotInstrument) polyglotInstrument;
             PolyglotContextImpl context = (PolyglotContextImpl) polyglotContext;
             return context.getInstrumentContextOptions(instrument);
+        }
+
+        @Override
+        public OptionValues getInstrumentSourceOptions(Object polyglotInstrument, Source source) {
+            PolyglotInstrument instrument = (PolyglotInstrument) polyglotInstrument;
+            return instrument.parseSourceOptions(source, instrument.getId());
+        }
+
+        @Override
+        public OptionValues parseLanguageSourceOptions(Object polyglotLanguageContext, Source source) {
+            try {
+                PolyglotLanguageInstance c = (PolyglotLanguageInstance) polyglotLanguageContext;
+                return c.parseSourceOptions(ParseOrigin.LANGUAGE, source, c.language.getId());
+            } catch (Throwable t) {
+                throw engineToLanguageException(t);
+            }
         }
 
         @Override
@@ -1338,6 +1836,18 @@ final class EngineAccessor extends Accessor {
             return context.isActive(Thread.currentThread());
         }
 
+        @Override
+        public void clearExplicitContextStack(Object polyglotContext) {
+            PolyglotContextImpl context = (PolyglotContextImpl) polyglotContext;
+            context.clearExplicitContextStack();
+        }
+
+        @Override
+        public void initiateCancelOrExit(Object polyglotContext, boolean exit, int exitCode, boolean resourceLimit, String message) {
+            PolyglotContextImpl context = (PolyglotContextImpl) polyglotContext;
+            context.initiateCancelOrExit(exit, exitCode, resourceLimit, message);
+        }
+
         @SuppressWarnings("SynchronizationOnLocalVariableOrMethodParameter")
         @Override
         @CompilerDirectives.TruffleBoundary
@@ -1376,15 +1886,29 @@ final class EngineAccessor extends Accessor {
         }
 
         @Override
-        public <T, G> Iterator<T> mergeHostGuestFrames(Object instrumentEnv, StackTraceElement[] hostStack, Iterator<G> guestFrames, boolean inHostLanguage,
-                        Function<StackTraceElement, T> hostFrameConvertor,
-                        Function<G, T> guestFrameConvertor) {
-            PolyglotInstrument instrument = (PolyglotInstrument) INSTRUMENT.getPolyglotInstrument(instrumentEnv);
-            return new PolyglotExceptionImpl.MergedHostGuestIterator<>(instrument.engine, hostStack, guestFrames, inHostLanguage, hostFrameConvertor, guestFrameConvertor);
+        @CompilerDirectives.TruffleBoundary
+        public void closeContext(Object impl, boolean force, boolean resourceExhaused, String resourceExhausedReason) {
+            PolyglotContextImpl context = (PolyglotContextImpl) impl;
+            if (force) {
+                context.cancel(resourceExhaused, resourceExhausedReason);
+            } else {
+                context.closeAndMaybeWait(false, null);
+            }
         }
 
         @Override
-        public Object createHostAdapterClass(Object languageContext, Class<?>[] types, Object classOverrides) {
+        public void closeEngine(Object polyglotEngine, boolean force) {
+            PolyglotEngineImpl engine = (PolyglotEngineImpl) polyglotEngine;
+            engine.ensureClosed(force, false);
+        }
+
+        @Override
+        public boolean isHostToGuestRootNode(RootNode root) {
+            return root instanceof HostToGuestRootNode;
+        }
+
+        @Override
+        public Object createHostAdapterClass(Object languageContext, Object[] types, Object classOverrides) {
             CompilerAsserts.neverPartOfCompilation();
             PolyglotContextImpl context = ((PolyglotLanguageContext) languageContext).context;
             return context.engine.host.createHostAdapter(context.getHostContextImpl(), types, classOverrides);
@@ -1414,13 +1938,13 @@ final class EngineAccessor extends Accessor {
         }
 
         @Override
-        public ClassLoader getStaticObjectClassLoader(Object polyglotLanguageInstance, Class<?> referenceClass) {
+        public Object getStaticObjectClassLoaders(Object polyglotLanguageInstance, Class<?> referenceClass) {
             return ((PolyglotLanguageInstance) polyglotLanguageInstance).staticObjectClassLoaders.get(referenceClass);
         }
 
         @Override
-        public void setStaticObjectClassLoader(Object polyglotLanguageInstance, Class<?> referenceClass, ClassLoader cl) {
-            ((PolyglotLanguageInstance) polyglotLanguageInstance).staticObjectClassLoaders.put(referenceClass, cl);
+        public void setStaticObjectClassLoaders(Object polyglotLanguageInstance, Class<?> referenceClass, Object value) {
+            ((PolyglotLanguageInstance) polyglotLanguageInstance).staticObjectClassLoaders.put(referenceClass, value);
         }
 
         @Override
@@ -1431,6 +1955,11 @@ final class EngineAccessor extends Accessor {
         @Override
         public boolean areStaticObjectSafetyChecksRelaxed(Object polyglotLanguageInstance) {
             return ((PolyglotLanguageInstance) polyglotLanguageInstance).getEngine().getEngineOptionValues().get(PolyglotEngineOptions.RelaxStaticObjectSafetyChecks);
+        }
+
+        @Override
+        public boolean areStaticObjectSafetyChecksForced(Object polyglotLanguageInstance) {
+            return ((PolyglotLanguageInstance) polyglotLanguageInstance).getEngine().getEngineOptionValues().get(PolyglotEngineOptions.ForceStaticObjectSafetyChecks);
         }
 
         @Override
@@ -1447,16 +1976,6 @@ final class EngineAccessor extends Accessor {
         @Override
         public Throwable getPolyglotExceptionCause(Object polyglotExceptionImpl) {
             return ((PolyglotExceptionImpl) polyglotExceptionImpl).exception;
-        }
-
-        @Override
-        public Object getPolyglotExceptionContext(Object polyglotExceptionImpl) {
-            return ((PolyglotExceptionImpl) polyglotExceptionImpl).context;
-        }
-
-        @Override
-        public Object getPolyglotExceptionEngine(Object polyglotExceptionImpl) {
-            return ((PolyglotExceptionImpl) polyglotExceptionImpl).engine;
         }
 
         @Override
@@ -1477,6 +1996,21 @@ final class EngineAccessor extends Accessor {
         @Override
         public boolean isResourceLimitCancelExecution(Throwable cancelExecution) {
             return ((PolyglotEngineImpl.CancelExecution) cancelExecution).isResourceLimit();
+        }
+
+        @Override
+        public boolean isPolyglotEngineException(Throwable throwable) {
+            return throwable instanceof PolyglotEngineException;
+        }
+
+        @Override
+        public RuntimeException getPolyglotEngineExceptionCause(Throwable polyglotEngineException) {
+            return ((PolyglotEngineException) polyglotEngineException).e;
+        }
+
+        @Override
+        public RuntimeException createPolyglotEngineException(RuntimeException cause) {
+            return new PolyglotEngineException(cause);
         }
 
         @Override
@@ -1510,23 +2044,18 @@ final class EngineAccessor extends Accessor {
         }
 
         @Override
-        public Map<String, String> readOptionsFromSystemProperties(Map<String, String> options) {
-            return PolyglotEngineImpl.readOptionsFromSystemProperties(options);
-        }
-
-        @Override
-        public AbstractHostService getHostService(Object polyglotEngineImpl) {
+        public AbstractPolyglotImpl.AbstractHostLanguageService getHostService(Object polyglotEngineImpl) {
             assert polyglotEngineImpl instanceof PolyglotEngineImpl;
             return ((PolyglotEngineImpl) polyglotEngineImpl).host;
         }
 
         @Override
-        public Handler getEngineLogHandler(Object polyglotEngineImpl) {
+        public LogHandler getEngineLogHandler(Object polyglotEngineImpl) {
             return ((PolyglotEngineImpl) polyglotEngineImpl).logHandler;
         }
 
         @Override
-        public Handler getContextLogHandler(Object polyglotContextImpl) {
+        public LogHandler getContextLogHandler(Object polyglotContextImpl) {
             return ((PolyglotContextImpl) polyglotContextImpl).config.logHandler;
         }
 
@@ -1541,8 +2070,24 @@ final class EngineAccessor extends Accessor {
         }
 
         @Override
-        public boolean isPolyglotThread(Thread thread) {
-            return thread instanceof PolyglotThread;
+        public boolean isLogRecordCallerClassSet(LogRecord logRecord) {
+            return PolyglotLoggers.isCallerClassSet(logRecord);
+        }
+
+        @Override
+        public boolean isLogRecordCallerMethodSet(LogRecord logRecord) {
+            return PolyglotLoggers.isCallerMethodSet(logRecord);
+        }
+
+        @Override
+        public void logFallback(String s) {
+            PolyglotEngineImpl.logFallback(s);
+        }
+
+        @Override
+        public boolean isCurrentThreadPolyglotThread() {
+            PolyglotThreadInfo info = PolyglotFastThreadLocals.getCurrentThread(null);
+            return info != null && info.isPolyglotThread();
         }
 
         @Override
@@ -1554,14 +2099,440 @@ final class EngineAccessor extends Accessor {
         public Object getPolyglotSharingLayer(Object polyglotLanguageInstance) {
             return ((PolyglotLanguageInstance) polyglotLanguageInstance).sharing;
         }
+
+        @Override
+        public boolean getNeedsAllEncodings() {
+            return LanguageCache.getNeedsAllEncodings();
+        }
+
+        @Override
+        public boolean requireLanguageWithAllEncodings(Object encoding) {
+            PolyglotContextImpl context = PolyglotFastThreadLocals.getContext(null);
+            if (context == null) {
+                // we cannot really check this without an entered context.
+                return true;
+            }
+
+            boolean needsAllEncodingsFound = false;
+            for (PolyglotLanguage language : context.engine.languages) {
+                if (language != null && !language.isFirstInstance() && language.cache.isNeedsAllEncodings()) {
+                    needsAllEncodingsFound = true;
+                    break;
+                }
+            }
+            if (!needsAllEncodingsFound) {
+                throw new AssertionError(String.format(
+                                "The encoding %s for a new TruffleString was requested but was not configured by any language. " +
+                                                "In order to use this encoding configure your language using %s.%s(...needsAllEncodings=true).",
+                                encoding, TruffleLanguage.class.getSimpleName(), Registration.class.getSimpleName()));
+            }
+            return true;
+        }
+
+        @Override
+        public Object getGuestToHostCodeCache(Object polyglotContextImpl) {
+            return ((PolyglotContextImpl) polyglotContextImpl).getHostContext().getLanguageInstance().getGuestToHostCodeCache();
+        }
+
+        @Override
+        public Object installGuestToHostCodeCache(Object polyglotContextImpl, Object cache) {
+            return ((PolyglotContextImpl) polyglotContextImpl).getHostContext().getLanguageInstance().installGuestToHostCodeCache(cache);
+        }
+
+        @Override
+        public AutoCloseable createPolyglotThreadScope() {
+            return PolyglotImpl.findInstance().createThreadScope();
+        }
+
+        @Override
+        public EncapsulatingNodeReference getEncapsulatingNodeReference(boolean invalidateOnNull) {
+            return PolyglotFastThreadLocals.getEncapsulatingNodeReference(invalidateOnNull);
+        }
+
+        @Override
+        public Thread createInstrumentSystemThread(Object polyglotInstrument, Runnable runnable, ThreadGroup threadGroup) {
+            return new InstrumentSystemThread((PolyglotInstrument) polyglotInstrument, runnable, threadGroup);
+        }
+
+        @Override
+        public Thread createLanguageSystemThread(Object polyglotLanguageContext, Runnable runnable, ThreadGroup threadGroup) {
+            PolyglotLanguageContext languageContext = (PolyglotLanguageContext) polyglotLanguageContext;
+            PolyglotContextImpl currentContext = PolyglotFastThreadLocals.getContext(null);
+            if (currentContext == null && Thread.currentThread() instanceof LanguageSystemThread systemThread) {
+                currentContext = systemThread.polyglotContext;
+            }
+            // Ensure that thread is entered in correct context
+            if (currentContext != languageContext.context) {
+                throw new IllegalStateException("Not entered in an Env's context.");
+            }
+            return new LanguageSystemThread(languageContext, runnable, threadGroup);
+        }
+
+        @Override
+        public Object getEngineFromPolyglotObject(Object polyglotObject) {
+            return getEngine(polyglotObject);
+        }
+
+        @Override
+        public SandboxPolicy getContextSandboxPolicy(Object polyglotLanguageContext) {
+            return ((PolyglotLanguageContext) polyglotLanguageContext).context.config.sandboxPolicy;
+        }
+
+        @Override
+        public SandboxPolicy getEngineSandboxPolicy(Object polyglotInstrument) {
+            return ((PolyglotInstrument) polyglotInstrument).engine.sandboxPolicy;
+        }
+
+        @Override
+        public void ensureInstrumentCreated(Object polyglotContextImpl, String instrumentId) {
+            PolyglotInstrument polyglotInstrument = ((PolyglotContextImpl) polyglotContextImpl).engine.idToInstrument.get(instrumentId);
+            polyglotInstrument.ensureCreated();
+        }
+
+        @Override
+        public TruffleFile getInternalResource(Object owner, Class<? extends InternalResource> resourceType) throws IOException {
+            InternalResource.Id id = resourceType.getAnnotation(InternalResource.Id.class);
+            assert id != null : resourceType + " must be annotated by @InternalResource.Id";
+            return getInternalResource(owner, id.value(), true);
+        }
+
+        @Override
+        public TruffleFile getInternalResource(Object owner, String resourceId) throws IOException {
+            return getInternalResource(owner, resourceId, false);
+        }
+
+        private static TruffleFile getInternalResource(Object owner, String resourceId, boolean failIfMissing) throws IOException {
+            InternalResourceCache resourceCache;
+            String componentId;
+            Supplier<Collection<String>> supportedResourceIds;
+            PolyglotLanguageContext languageContext;
+            if (owner instanceof PolyglotLanguageContext) {
+                languageContext = (PolyglotLanguageContext) owner;
+                LanguageCache cache = languageContext.language.cache;
+                resourceCache = cache.getResourceCache(resourceId);
+                componentId = cache.getId();
+                supportedResourceIds = cache::getResourceIds;
+            } else if (owner instanceof PolyglotInstrument polyglotInstrument) {
+                InstrumentCache cache = polyglotInstrument.cache;
+                resourceCache = cache.getResourceCache(resourceId);
+                componentId = cache.getId();
+                supportedResourceIds = cache::getResourceIds;
+                languageContext = getPolyglotContext(null).getHostContext();
+            } else {
+                throw CompilerDirectives.shouldNotReachHere("Unsupported owner " + owner);
+            }
+            if (resourceCache == null) {
+                if (failIfMissing) {
+                    throw new IllegalArgumentException(String.format("Resource with id %s is not provided by component %s, provided resource types are %s",
+                                    resourceId, componentId, String.join(", ", supportedResourceIds.get())));
+                } else {
+                    return null;
+                }
+            }
+            Path rootPath = resourceCache.getPath(languageContext.getEngine());
+            return EngineAccessor.LANGUAGE.getTruffleFile(rootPath.toString(), languageContext.getInternalFileSystemContext());
+        }
+
+        @Override
+        public Map<String, InternalResource> getEngineInternalResources() {
+            Map<String, InternalResource> result = new HashMap<>();
+            for (InternalResourceCache cache : InternalResourceCache.getEngineResources()) {
+                result.put(cache.getResourceId(), cache.getInternalResource());
+            }
+            return result;
+        }
+
+        @Override
+        public Path getEngineResource(Object polyglotEngine, String resourceId) throws IOException {
+            InternalResourceCache resourceCache = InternalResourceCache.getEngineResource(resourceId);
+            if (resourceCache != null) {
+                return resourceCache.getPath((PolyglotEngineImpl) polyglotEngine);
+            } else {
+                return null;
+            }
+        }
+
+        @Override
+        public Collection<String> getResourceIds(String componentId) {
+            if (PolyglotEngineImpl.ENGINE_ID.equals(componentId)) {
+                return InternalResourceCache.getEngineResourceIds();
+            }
+            LanguageCache languageCache = LanguageCache.languages().get(componentId);
+            if (languageCache != null) {
+                return languageCache.getResourceIds();
+            }
+            for (Map.Entry<String, InstrumentCache> entry : InstrumentCache.load().entrySet()) {
+                if (entry.getKey().equals(componentId)) {
+                    return entry.getValue().getResourceIds();
+                }
+            }
+            throw new IllegalArgumentException(componentId);
+        }
+
+        @Override
+        public long getEngineId(Object polyglotEngine) {
+            return ((PolyglotEngineImpl) polyglotEngine).engineId;
+        }
+
+        @Override
+        public ModulesAccessor getModulesAccessor() {
+            return JDKSupport.getModulesAccessor();
+        }
+
+        @Override
+        public String getModuleAccessorInitializationError() {
+            return JDKSupport.getInitializationErrorMessage();
+        }
+
+        @Override
+        public Node getUncachedLocation(Object polyglotContext) {
+            return ((PolyglotContextImpl) polyglotContext).uncachedLocation;
+        }
+
+        @Override
+        public MessageEndpoint startEngineServer(Object engineImpl, URI uri, MessageEndpoint server) throws IOException, VetoException {
+            PolyglotEngineImpl engine = ((PolyglotEngineImpl) engineImpl);
+            if (engine.messageTransport == null) {
+                return null;
+            }
+            return engine.messageTransport.open(uri, server);
+        }
+
+        @Override
+        public Object getInstrumentEngine(Object polyglotInstrument) {
+            return ((PolyglotInstrument) polyglotInstrument).engine;
+        }
+
+        @Override
+        public DispatchOutputStream getEngineErr(Object engine) {
+            return ((PolyglotEngineImpl) engine).err;
+        }
+
+        @Override
+        public InputStream getEngineIn(Object engine) {
+            return ((PolyglotEngineImpl) engine).in;
+        }
+
+        @Override
+        public DispatchOutputStream getEngineOut(Object engine) {
+            return ((PolyglotEngineImpl) engine).out;
+        }
+
+        @Override
+        public <T> T getOrCreateBytecodeData(Object languageInstance, Function<Object, T> create) {
+            PolyglotSharingLayer layer = (PolyglotSharingLayer) languageInstance;
+            if (layer == null) {
+                layer = (PolyglotSharingLayer) getCurrentSharingLayer();
+                if (layer == null) {
+                    // we can't support engine instruction tracers for disconnected code
+                    return null;
+                }
+            }
+            return layer.getOrCreateBytecodeData(create);
+        }
+
+        @Override
+        public void forEachLoadedRootNode(Object sharingLayer, Consumer<RootNode> rootNodeUpdater) {
+            PolyglotSharingLayer layer = (PolyglotSharingLayer) sharingLayer;
+            for (CallTarget target : EngineAccessor.INSTRUMENT.getLoadedCallTargets(layer.engine.instrumentationHandler)) {
+                rootNodeUpdater.accept(((RootCallTarget) target).getRootNode());
+            }
+        }
+
+        @Override
+        public Object getSharingLayer(Object languageInstance) {
+            if (languageInstance == null) {
+                return null;
+            }
+            return ((PolyglotLanguageInstance) languageInstance).sharing;
+        }
+
+        @Override
+        public Context getContextAPI(Object polyglotContextImpl) {
+            return ((PolyglotContextImpl) polyglotContextImpl).getContextAPI();
+        }
+
+        @Override
+        public AbstractValueDispatch lookupValueCache(Object polyglotContextImpl, Object value) {
+            PolyglotContextImpl context = ((PolyglotContextImpl) polyglotContextImpl);
+            return context.layer.hostLanguage.lookupValueCache(context, value);
+        }
+
+        @Override
+        public Object getHostLanguageContext(Object polyglotContextImpl) {
+            PolyglotContextImpl context = ((PolyglotContextImpl) polyglotContextImpl);
+            return context.getHostContext();
+        }
+
+        @Override
+        public int findGuestToHostFrame(Object polyglotEngineImpl, StackTraceElement firstElement, StackTraceElement[] hostStack, int nextElementIndex) {
+            PolyglotEngineImpl engine = (PolyglotEngineImpl) polyglotEngineImpl;
+            if (engine.host == null) {
+                return -1;
+            }
+            return engine.host.findNextGuestToHostStackTraceElement(firstElement, hostStack, nextElementIndex);
+        }
+
+        @Override
+        public int findHostToGuestFrame(Object polyglotEngineImpl, StackTraceElement firstElement, StackTraceElement[] hostStack, int nextElementIndex) {
+            PolyglotEngineImpl engine = (PolyglotEngineImpl) polyglotEngineImpl;
+            if (engine.host == null) {
+                return -1;
+            }
+            return engine.host.findNextHostToGuestStackTraceElement(firstElement, hostStack, nextElementIndex);
+        }
+
+        @Override
+        public void materializePolyglotException(RuntimeException polyglotException) {
+            PolyglotExceptionImpl impl = (PolyglotExceptionImpl) PolyglotImpl.findInstance().getAPIAccess().getPolyglotExceptionReceiver(polyglotException);
+            impl.materialize();
+        }
+
+        @Override
+        public IllegalArgumentException sandboxPolicyException(SandboxPolicy sandboxPolicy, String reason, String fix) {
+            return PolyglotImpl.sandboxPolicyException(sandboxPolicy, reason, fix);
+        }
+
+        @Override
+        public AbstractPolyglotImpl findPolyglot() {
+            return PolyglotImpl.findInstance();
+        }
+
+        @Override
+        public ProcessHandler newDefaultProcessHandler() {
+            return PolyglotEngineImpl.newDefaultProcessHandler();
+        }
+
+        @Override
+        public boolean isInCurrentEngineHostCallback(Object polyglotEngine) {
+            return PolyglotContextImpl.isInCurrentEngineHostCallback(polyglotEngine);
+        }
+
+        @Override
+        public boolean isInternalFileSystem(FileSystem fileSystem) {
+            return FileSystems.isInternal(fileSystem);
+        }
+
+        @Override
+        public Map<String, String> filterHostOptions(Object polyglotEngineImpl, Map<String, String> polyglotOptions) {
+            return PolyglotEngineOptions.filterHostOptions(((PolyglotEngineImpl) polyglotEngineImpl).getImpl().createEngineOptionDescriptors(), polyglotOptions);
+        }
+
+        @Override
+        public OptionKey<Long> getMaxIsolateMemoryOption() {
+            return PolyglotEngineOptions.MaxIsolateMemory;
+        }
+
+        @Override
+        public OptionKey<? extends Enum<?>> getUntrustedCodeMitigationOption() {
+            return PolyglotEngineOptions.UntrustedCodeMitigation;
+        }
+
+        @Override
+        public OptionKey<OptionMap<String>> getIsolateOptionOption() {
+            return PolyglotEngineOptions.IsolateOption;
+        }
+
+        @Override
+        public OptionKey<Boolean> getWarnMethodScopingOption() {
+            return PolyglotEngineOptions.WarnMethodScoping;
+        }
+
+        @Override
+        public boolean isIsolateMemoryProtection(OptionValues optionValues) {
+            return PolyglotEngineOptions.isIsolateMemoryProtection(optionValues);
+        }
+
+        @Override
+        public boolean isUntrustedCodeMitigationPolicySoftware(Enum<?> policy) {
+            return policy == PolyglotEngineOptions.UntrustedCodeMitigationPolicy.SOFTWARE;
+        }
+
+        @Override
+        public void collectNativeImagePresetOptions() {
+            if (!ImageInfo.inImageBuildtimeCode()) {
+                throw new AssertionError("CollectNativeImagePresetOptions can be called only in image build time");
+            }
+            PolyglotImpl polyglot = PolyglotImpl.findInstance();
+            Map<String, String> newDefaults = polyglot.getAPIAccess().readOptionsFromSystemProperties();
+            if (!newDefaults.isEmpty()) {
+                // Validate preset options
+                Map<String, String> toValidate = new HashMap<>(newDefaults);
+                // Parse engine options to validate them
+                PolyglotImpl.createEngineOptions(PolyglotImpl.findInstance(), Map.of(), toValidate, true, new LogConfig(), SandboxPolicy.TRUSTED, true);
+                Set<String> componentIds = toValidate.keySet().stream().map(PolyglotEngineImpl::parseOptionGroup).collect(Collectors.toSet());
+                List<OptionDescriptors> descriptors = new ArrayList<>();
+                LanguageCache.languages().entrySet().stream().//
+                                filter((e) -> componentIds.contains(e.getKey())).//
+                                map((e) -> LANGUAGE.describeOptions(e.getValue().loadLanguage(), e.getKey())).//
+                                forEach(descriptors::add);
+                InstrumentCache.load().entrySet().stream().//
+                                filter((e) -> componentIds.contains(e.getKey())).//
+                                map((e) -> INSTRUMENT.describeOptions(e.getValue().loadInstrument(), e.getKey())).//
+                                forEach(descriptors::add);
+                // Parse languages/instrument options to validate them
+                OptionValuesImpl values = new OptionValuesImpl(LANGUAGE.createOptionDescriptorsUnion(descriptors.toArray(new OptionDescriptors[0])), SandboxPolicy.TRUSTED, false);
+                values.putAll(toValidate, true, null);
+                polyglot.presetOptions = Collections.unmodifiableMap(newDefaults);
+            }
+        }
+
+        @Override
+        public Source getSourceReceiver(org.graalvm.polyglot.Source source) {
+            return (Source) PolyglotImpl.findInstance().getAPIAccess().getSourceReceiver(source);
+        }
+
+        @Override
+        public TruffleLogger getEngineLogger(Object polyglotEngine) {
+            return ((PolyglotEngineImpl) polyglotEngine).getEngineLogger();
+        }
+    }
+
+    private static class GuardedExecutableNode extends ExecutableNode {
+
+        private final FrameDescriptor frameDescriptor;
+        @Child private ExecutableNode fragment;
+
+        GuardedExecutableNode(TruffleLanguage<?> languageSPI, ExecutableNode fragment, MaterializedFrame frameLocation) {
+            super(languageSPI);
+            this.frameDescriptor = (frameLocation != null) ? frameLocation.getFrameDescriptor() : null;
+            this.fragment = fragment;
+        }
+
+        private static boolean checkNullOrInterop(Object obj) {
+            if (obj == null) {
+                return true;
+            }
+            EngineAccessor.INTEROP.checkInteropType(obj);
+            return true;
+        }
+
+        @Override
+        public Object execute(VirtualFrame frame) {
+            assert frameDescriptor == null || frameDescriptor == frame.getFrameDescriptor();
+            assureAdopted();
+            Object ret = fragment.execute(frame);
+            assert checkNullOrInterop(ret);
+            return ret;
+        }
+
+        private void assureAdopted() {
+            if (getParent() == null) {
+                CompilerDirectives.transferToInterpreterAndInvalidate();
+                throw new IllegalStateException("Needs to be inserted into the AST before execution.");
+            }
+        }
     }
 
     abstract static class AbstractClassLoaderSupplier implements Supplier<ClassLoader> {
-
         private final int hashCode;
 
         AbstractClassLoaderSupplier(ClassLoader loader) {
             this.hashCode = loader == null ? 0 : loader.hashCode();
+        }
+
+        boolean accepts(@SuppressWarnings("unused") Class<?> clazz) {
+            return true;
         }
 
         @Override
@@ -1582,7 +2553,7 @@ final class EngineAccessor extends Accessor {
         }
     }
 
-    static final class StrongClassLoaderSupplier extends AbstractClassLoaderSupplier {
+    static class StrongClassLoaderSupplier extends AbstractClassLoaderSupplier {
 
         private final ClassLoader classLoader;
 
@@ -1597,7 +2568,7 @@ final class EngineAccessor extends Accessor {
         }
     }
 
-    private static final class WeakClassLoaderSupplier extends AbstractClassLoaderSupplier {
+    private static class WeakClassLoaderSupplier extends AbstractClassLoaderSupplier {
 
         private final Reference<ClassLoader> classLoaderRef;
 

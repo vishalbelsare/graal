@@ -24,68 +24,94 @@
  */
 package com.oracle.svm.hosted.code;
 
-import org.graalvm.compiler.debug.DebugContext;
-import org.graalvm.compiler.nodes.CallTargetNode.InvokeKind;
-import org.graalvm.compiler.nodes.InvokeWithExceptionNode;
-import org.graalvm.compiler.nodes.StructuredGraph;
-import org.graalvm.compiler.nodes.ValueNode;
-import org.graalvm.compiler.nodes.java.AbstractNewObjectNode;
+import static com.oracle.svm.util.GuestAnnotationAccess.newAnnotationValue;
+
+import java.util.List;
+
 import org.graalvm.nativeimage.ImageSingletons;
 
-import com.oracle.graal.pointsto.infrastructure.UniverseMetaAccess;
 import com.oracle.graal.pointsto.meta.AnalysisMethod;
+import com.oracle.graal.pointsto.meta.AnalysisType;
 import com.oracle.graal.pointsto.meta.HostedProviders;
-import com.oracle.svm.core.SubstrateUtil;
+import com.oracle.svm.core.NeverInlineTrivial;
 import com.oracle.svm.hosted.meta.HostedMethod;
 import com.oracle.svm.hosted.phases.HostedGraphKit;
 
+import jdk.graal.compiler.annotation.AnnotationValue;
+import jdk.graal.compiler.debug.DebugContext;
+import jdk.graal.compiler.nodes.CallTargetNode.InvokeKind;
+import jdk.graal.compiler.nodes.StructuredGraph;
+import jdk.graal.compiler.nodes.UnwindNode;
+import jdk.graal.compiler.nodes.ValueNode;
+import jdk.graal.compiler.nodes.java.AbstractNewObjectNode;
 import jdk.vm.ci.meta.ConstantPool;
-import jdk.vm.ci.meta.MetaAccessProvider;
 import jdk.vm.ci.meta.ResolvedJavaMethod;
 import jdk.vm.ci.meta.ResolvedJavaType;
 import jdk.vm.ci.meta.Signature;
 
-public final class FactoryMethod extends NonBytecodeStaticMethod {
+public final class FactoryMethod extends NonBytecodeMethod {
 
     private final ResolvedJavaMethod targetConstructor;
+    private final ResolvedJavaType instantiatedType;
+    private final boolean throwAllocatedObject;
 
-    FactoryMethod(ResolvedJavaMethod targetConstructor, ResolvedJavaType declaringClass, Signature signature, ConstantPool constantPool) {
-        super(SubstrateUtil.uniqueShortName(targetConstructor), declaringClass, signature, constantPool);
+    FactoryMethod(String name, ResolvedJavaMethod targetConstructor, ResolvedJavaType instantiatedType, ResolvedJavaType declaringClass, Signature signature, ConstantPool constantPool,
+                    boolean throwAllocatedObject) {
+        super(name, true, declaringClass, signature, constantPool);
         this.targetConstructor = targetConstructor;
+        this.instantiatedType = instantiatedType;
+        this.throwAllocatedObject = throwAllocatedObject;
 
-        assert targetConstructor.isConstructor();
-        assert !(targetConstructor instanceof AnalysisMethod) && !(targetConstructor instanceof HostedMethod);
+        assert targetConstructor.isConstructor() : targetConstructor;
+        assert !(targetConstructor instanceof AnalysisMethod) && !(targetConstructor instanceof HostedMethod) : targetConstructor;
+    }
+
+    /**
+     * Even though factory methods have few Graal nodes and are therefore considered "trivial", we
+     * do not want them inlined immediately by the trivial method inliner because we know that the
+     * machine code for allocations is large. Note that this does not preclude later inlining of the
+     * method as part of the regular AOT compilation pipeline.
+     */
+    private static final List<AnnotationValue> INJECTED_ANNOTATIONS = List.of(newAnnotationValue(NeverInlineTrivial.class, "reason", "FactoryMethod"));
+
+    @Override
+    public List<AnnotationValue> getInjectedAnnotations() {
+        return INJECTED_ANNOTATIONS;
     }
 
     @Override
-    public StructuredGraph buildGraph(DebugContext debug, ResolvedJavaMethod method, HostedProviders providers, Purpose purpose) {
+    public StructuredGraph buildGraph(DebugContext debug, AnalysisMethod method, HostedProviders providers, Purpose purpose) {
+        HostedGraphKit kit = new HostedGraphKit(debug, providers, method);
         FactoryMethodSupport support = ImageSingletons.lookup(FactoryMethodSupport.class);
 
-        UniverseMetaAccess metaAccess = (UniverseMetaAccess) providers.getMetaAccess();
-        ResolvedJavaMethod universeTargetConstructor = lookupMethodInUniverse(metaAccess, targetConstructor);
-        HostedGraphKit kit = new HostedGraphKit(debug, providers, method);
+        AnalysisMethod aTargetConstructor = kit.getMetaAccess().getUniverse().lookup(targetConstructor);
+        AnalysisType aInstantiatedType = kit.getMetaAccess().getUniverse().lookup(instantiatedType);
 
-        AbstractNewObjectNode newInstance = support.createNewInstance(kit, universeTargetConstructor.getDeclaringClass(), true);
+        AbstractNewObjectNode newInstance = support.createNewInstance(kit, aInstantiatedType, true);
 
-        ValueNode[] originalArgs = kit.loadArguments(method.toParameterTypes()).toArray(new ValueNode[0]);
+        ValueNode[] originalArgs = kit.getInitialArguments().toArray(ValueNode.EMPTY_ARRAY);
         ValueNode[] invokeArgs = new ValueNode[originalArgs.length + 1];
         invokeArgs[0] = newInstance;
         System.arraycopy(originalArgs, 0, invokeArgs, 1, originalArgs.length);
-        InvokeWithExceptionNode invoke = kit.createInvokeWithExceptionAndUnwind(universeTargetConstructor, InvokeKind.Special, kit.getFrameState(), kit.bci(), invokeArgs);
-        if (support.inlineConstructor(universeTargetConstructor)) {
-            kit.inline(invoke, "Constructor in FactoryMethod", "FactoryMethod");
-        }
+        kit.createInvokeWithExceptionAndUnwind(aTargetConstructor, InvokeKind.Special, kit.getFrameState(), kit.bci(), invokeArgs);
 
-        kit.createReturn(newInstance, newInstance.getStackKind());
+        if (throwAllocatedObject) {
+            kit.append(new UnwindNode(newInstance));
+        } else {
+            kit.createReturn(newInstance, newInstance.getStackKind());
+        }
         return kit.finalizeGraph();
     }
 
-    private ResolvedJavaMethod lookupMethodInUniverse(UniverseMetaAccess metaAccess, ResolvedJavaMethod method) {
-        ResolvedJavaMethod universeMethod = method;
-        MetaAccessProvider wrappedMetaAccess = metaAccess.getWrapped();
-        if (wrappedMetaAccess instanceof UniverseMetaAccess) {
-            universeMethod = lookupMethodInUniverse((UniverseMetaAccess) wrappedMetaAccess, universeMethod);
-        }
-        return metaAccess.getUniverse().lookup(universeMethod);
+    public ResolvedJavaMethod getTargetConstructor() {
+        return targetConstructor;
+    }
+
+    public boolean throwAllocatedObject() {
+        return throwAllocatedObject;
+    }
+
+    public ResolvedJavaType getInstantiatedType() {
+        return instantiatedType;
     }
 }

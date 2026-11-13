@@ -24,20 +24,19 @@
  */
 package com.oracle.graal.pointsto.flow;
 
-import org.graalvm.compiler.nodes.ParameterNode;
-
 import com.oracle.graal.pointsto.PointsToAnalysis;
-import com.oracle.graal.pointsto.meta.AnalysisMethod;
 import com.oracle.graal.pointsto.meta.AnalysisType;
 import com.oracle.graal.pointsto.typestate.TypeState;
+
+import jdk.vm.ci.code.BytecodePosition;
 
 /**
  * Represents the type flow for 'this' parameter for instance methods.
  */
 public class FormalReceiverTypeFlow extends FormalParamTypeFlow {
 
-    public FormalReceiverTypeFlow(ParameterNode source, AnalysisType declaredType, AnalysisMethod method) {
-        super(source, declaredType, method, 0);
+    public FormalReceiverTypeFlow(BytecodePosition sourcePosition, AnalysisType declaredType) {
+        super(sourcePosition, declaredType, 0);
     }
 
     public FormalReceiverTypeFlow(FormalReceiverTypeFlow original, MethodFlowsGraph methodFlows) {
@@ -49,8 +48,11 @@ public class FormalReceiverTypeFlow extends FormalParamTypeFlow {
         return new FormalReceiverTypeFlow(this, methodFlows);
     }
 
+    /**
+     * Filters the incoming type state using the declared type.
+     */
     @Override
-    public TypeState filter(PointsToAnalysis bb, TypeState newState) {
+    protected TypeState processInputState(PointsToAnalysis bb, TypeState newState) {
         /*
          * If the type flow constraints are relaxed filter the incoming value using the receiver's
          * declared type.
@@ -65,10 +67,8 @@ public class FormalReceiverTypeFlow extends FormalParamTypeFlow {
      * i.e., 'this' parameter, state must ONLY reflect those objects of the actual receiver that
      * generated the context for the method clone which it belongs to. A direct link would instead
      * transfer all the objects of compatible type from the actual receiver to the formal receiver.
-     * The formal receiver state for the non-initial parameters is updated through the
-     * FormalReceiverTypeFlow.addReceiverState method invoked directly from
-     * VirtualInvokeTypeFlow.update, SpecialInvokeTypeFlow.update or from
-     * InitialReceiverTypeFlow.update.
+     * The formal receiver state is updated through the FormalReceiverTypeFlow.addReceiverState
+     * method invoked from (VirtualInvokeTypeFlow|SpecialInvokeTypeFlow).onObservedUpdate.
      */
     @Override
     public boolean addState(PointsToAnalysis bb, TypeState add) {
@@ -78,10 +78,21 @@ public class FormalReceiverTypeFlow extends FormalParamTypeFlow {
     @Override
     protected void onInputSaturated(PointsToAnalysis bb, TypeFlow<?> input) {
         /*
-         * The saturation of the actual receiver doesn't result in the saturation of the formal
-         * receiver; some callees, depending how low in the type hierarchies they are, may only see
-         * a number of types smaller than the saturation cut-off limit.
+         * Note that in open world analysis the formal receiver of all callees linked to a context
+         * insensitive invoke will be notified of saturation.
+         * 
+         * For a formal receiver with a closed declared type (which corresponds to the declaring
+         * class of its method) the saturation of the actual receiver doesn't result in the
+         * saturation of the formal receiver; some callees, depending on how low in the type
+         * hierarchies they are, may only see a number of types smaller than the saturation cut-off
+         * limit.
+         * 
+         * If the declared type is open we cannot make any assumptions and simply propagate the
+         * saturation stamp.
          */
+        if (!bb.getExtensionPolicy().isTypeClosed(declaredType)) {
+            super.onInputSaturated(bb, input);
+        }
     }
 
     public boolean addReceiverState(PointsToAnalysis bb, TypeState add) {
@@ -91,9 +102,9 @@ public class FormalReceiverTypeFlow extends FormalParamTypeFlow {
 
     @Override
     public String format(boolean withState, boolean withSource) {
-        return "Formal receiver of " + method.format("%H.%n(%p)") +
+        return "Formal receiver of " + method().format("%H.%n(%p)") +
                         (withSource ? " at " + formatSource() : "") +
-                        (withState ? " with state <" + getState() + ">" : "");
+                        (withState ? " with state <" + getStateDescription() + ">" : "");
     }
 
 }

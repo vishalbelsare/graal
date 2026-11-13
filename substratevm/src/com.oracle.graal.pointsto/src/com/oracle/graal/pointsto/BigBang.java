@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2021, 2021, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2021, 2026, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -24,37 +24,46 @@
  */
 package com.oracle.graal.pointsto;
 
-import com.oracle.graal.pointsto.api.HostVM;
-import com.oracle.graal.pointsto.constraints.UnsupportedFeatures;
-import com.oracle.graal.pointsto.meta.AnalysisMethod;
-import com.oracle.graal.pointsto.meta.AnalysisUniverse;
-import com.oracle.graal.pointsto.meta.HostedProviders;
-import com.oracle.graal.pointsto.util.Timer;
-import jdk.vm.ci.meta.ConstantReflectionProvider;
-import org.graalvm.compiler.api.replacements.SnippetReflectionProvider;
-import org.graalvm.compiler.debug.DebugContext;
-import org.graalvm.compiler.debug.DebugHandlersFactory;
-import org.graalvm.compiler.graph.NodeSourcePosition;
-import org.graalvm.compiler.options.OptionValues;
-
 import java.io.PrintWriter;
 import java.util.List;
 import java.util.function.Function;
+
+import com.oracle.graal.pointsto.api.HostVM;
+import com.oracle.graal.pointsto.constraints.UnsupportedFeatures;
+import com.oracle.graal.pointsto.meta.AnalysisField;
+import com.oracle.graal.pointsto.meta.AnalysisMethod;
+import com.oracle.graal.pointsto.meta.AnalysisType;
+import com.oracle.graal.pointsto.meta.AnalysisUniverse;
+import com.oracle.graal.pointsto.meta.HostedProviders;
+import com.oracle.graal.pointsto.util.CompletionExecutor;
+import com.oracle.svm.common.meta.MethodVariant;
+
+import jdk.graal.compiler.api.replacements.SnippetReflectionProvider;
+import jdk.graal.compiler.debug.DebugContext;
+import jdk.graal.compiler.debug.DebugDumpHandlersFactory;
+import jdk.graal.compiler.options.OptionValues;
+import jdk.graal.compiler.word.WordTypes;
+import jdk.vm.ci.code.BytecodePosition;
+import jdk.vm.ci.meta.ConstantReflectionProvider;
+import jdk.vm.ci.meta.JavaKind;
+import jdk.vm.ci.meta.ResolvedJavaType;
 
 /**
  * Central static analysis interface that groups together the functionality of reachability analysis
  * and heap scanning and adds utility methods and lifecycle hooks that should be used to query and
  * change the state of the analysis.
- * 
+ *
  * In long term, all mutable accesses that change the state of the analysis should go through this
  * interface.
  *
  * @see PointsToAnalysis
  */
-public interface BigBang extends ReachabilityAnalysis, HeapScanning {
+public interface BigBang extends ReachabilityAnalysis {
     HostVM getHostVM();
 
     UnsupportedFeatures getUnsupportedFeatures();
+
+    boolean isPointsToAnalysis();
 
     /**
      * Checks if all user defined limitations such as the number of types are satisfied.
@@ -63,24 +72,13 @@ public interface BigBang extends ReachabilityAnalysis, HeapScanning {
 
     OptionValues getOptions();
 
-    HostedProviders getProviders();
+    default HostedProviders getProviders(AnalysisMethod method) {
+        return getProviders(method.getMethodVariantKey());
+    }
 
-    List<DebugHandlersFactory> getDebugHandlerFactories();
+    HostedProviders getProviders(MethodVariant.MethodVariantKey key);
 
-    /**
-     * @return the timer for measuring the overall duration of the analysis
-     */
-    Timer getAnalysisTimer();
-
-    /**
-     * @return the timer for measuring the time spent in features
-     */
-    Timer getProcessFeaturesTimer();
-
-    /**
-     * Prints all analysis timers.
-     */
-    void printTimers();
+    List<DebugDumpHandlersFactory> getDebugHandlerFactories();
 
     /**
      * Prints more detailed information about all analysis timers.
@@ -91,17 +89,80 @@ public interface BigBang extends ReachabilityAnalysis, HeapScanning {
 
     SnippetReflectionProvider getSnippetReflectionProvider();
 
+    WordTypes getWordTypes();
+
     DebugContext getDebug();
-
-    Runnable getHeartbeatCallback();
-
-    boolean extendedAsserts();
 
     void runAnalysis(DebugContext debug, Function<AnalysisUniverse, Boolean> duringAnalysisAction) throws InterruptedException;
 
+    boolean trackPrimitiveValues();
+
+    default boolean isSupportedJavaKind(JavaKind javaKind) {
+        return javaKind == JavaKind.Object;
+    }
+
     /** You can blacklist certain callees here. */
     @SuppressWarnings("unused")
-    default boolean isCallAllowed(PointsToAnalysis bb, AnalysisMethod caller, AnalysisMethod target, NodeSourcePosition srcPosition) {
+    default boolean isCallAllowed(PointsToAnalysis bb, AnalysisMethod caller, AnalysisMethod target, BytecodePosition srcPosition) {
         return true;
+    }
+
+    /**
+     * Callback for when a field is marked as read, written, or unsafe accessed. See
+     * {@link AnalysisField#isAccessed()} for field accessibility definition.
+     */
+    @SuppressWarnings("unused")
+    default void onFieldAccessed(AnalysisField field) {
+    }
+
+    @SuppressWarnings("unused")
+    default void onTypeInstantiated(AnalysisType type) {
+    }
+
+    @SuppressWarnings("unused")
+    default void onTypeReachable(AnalysisType type) {
+    }
+
+    void postTask(CompletionExecutor.DebugContextRunnable task);
+
+    boolean executorIsStarted();
+
+    void initializeMetaData(AnalysisType type);
+
+    void markInitializationFinished();
+
+    boolean isInitialized();
+
+    /**
+     * Callback executed after the analysis finished. The cleanupAfterAnalysis is executed after the
+     * universe builder, which can be too late for some tasks.
+     */
+    default void afterAnalysis() {
+
+    }
+
+    @SuppressWarnings("unused")
+    default AnalysisMethod fallbackResolveConcreteMethod(AnalysisType resolvingType, AnalysisMethod method) {
+        return null;
+    }
+
+    @SuppressWarnings("unused")
+    default void tryRegisterTypeForBaseImage(ResolvedJavaType type) {
+
+    }
+
+    @SuppressWarnings("unused")
+    default void tryRegisterMethodForBaseImage(AnalysisMethod method) {
+
+    }
+
+    @SuppressWarnings("unused")
+    default void tryRegisterFieldForBaseImage(AnalysisField field) {
+
+    }
+
+    @SuppressWarnings("unused")
+    default void tryRegisterNativeMethodsForBaseImage(ResolvedJavaType analysisType) {
+
     }
 }

@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2012, 2021, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2012, 2024, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * The Universal Permissive License (UPL), Version 1.0
@@ -41,6 +41,7 @@
 package com.oracle.truffle.api.frame;
 
 import com.oracle.truffle.api.CompilerDirectives;
+import com.oracle.truffle.api.nodes.UnexpectedResultException;
 
 /**
  * Represents a frame containing values of local variables of the guest language. Instances of this
@@ -48,7 +49,7 @@ import com.oracle.truffle.api.CompilerDirectives;
  *
  * @since 0.8 or earlier
  */
-@SuppressWarnings("deprecation")
+// Bind.DefaultExpression("$frame")
 public interface Frame {
 
     /**
@@ -67,172 +68,6 @@ public interface Frame {
     Object[] getArguments();
 
     /**
-     * Read access to a local variable of type {@link Object}.
-     *
-     * @param slot the slot of the local variable
-     * @return the current value of the local variable
-     * @since 0.8 or earlier
-     * @deprecated use index-based slots instead
-     */
-    @Deprecated
-    Object getObject(FrameSlot slot) throws FrameSlotTypeException;
-
-    /**
-     * Write access to a local variable of type {@link Object}.
-     *
-     * @param slot the slot of the local variable
-     * @param value the new value of the local variable
-     * @since 0.8 or earlier
-     * @deprecated use index-based slots instead
-     */
-    @Deprecated
-    void setObject(FrameSlot slot, Object value);
-
-    /**
-     * Read access to a local variable of type byte.
-     *
-     * @param slot the slot of the local variable
-     * @return the current value of the local variable
-     * @throws FrameSlotTypeException
-     * @since 0.8 or earlier
-     * @deprecated use index-based slots instead
-     */
-    @Deprecated
-    byte getByte(FrameSlot slot) throws FrameSlotTypeException;
-
-    /**
-     * Write access to a local variable of type byte.
-     *
-     * @param slot the slot of the local variable
-     * @param value the new value of the local variable
-     * @since 0.8 or earlier
-     * @deprecated use index-based slots instead
-     */
-    @Deprecated
-    void setByte(FrameSlot slot, byte value);
-
-    /**
-     * Read access to a local variable of type boolean.
-     *
-     * @param slot the slot of the local variable
-     * @return the current value of the local variable
-     * @since 0.8 or earlier
-     * @deprecated use index-based slots instead
-     */
-    @Deprecated
-    boolean getBoolean(FrameSlot slot) throws FrameSlotTypeException;
-
-    /**
-     * Write access to a local variable of type boolean.
-     *
-     * @param slot the slot of the local variable
-     * @param value the new value of the local variable
-     * @since 0.8 or earlier
-     * @deprecated use index-based slots instead
-     */
-    @Deprecated
-    void setBoolean(FrameSlot slot, boolean value);
-
-    /**
-     * Read access to a local variable of type int.
-     *
-     * @param slot the slot of the local variable
-     * @return the current value of the local variable
-     * @since 0.8 or earlier
-     * @deprecated use index-based slots instead
-     */
-    @Deprecated
-    int getInt(FrameSlot slot) throws FrameSlotTypeException;
-
-    /**
-     * Write access to a local variable of type int.
-     *
-     * @param slot the slot of the local variable
-     * @param value the new value of the local variable
-     * @since 0.8 or earlier
-     * @deprecated use index-based slots instead
-     */
-    @Deprecated
-    void setInt(FrameSlot slot, int value);
-
-    /**
-     * Read access to a local variable of type long.
-     *
-     * @param slot the slot of the local variable
-     * @return the current value of the local variable
-     * @since 0.8 or earlier
-     * @deprecated use index-based slots instead
-     */
-    @Deprecated
-    long getLong(FrameSlot slot) throws FrameSlotTypeException;
-
-    /**
-     * Write access to a local variable of type long.
-     *
-     * @param slot the slot of the local variable
-     * @param value the new value of the local variable
-     * @since 0.8 or earlier
-     * @deprecated use index-based slots instead
-     */
-    @Deprecated
-    void setLong(FrameSlot slot, long value);
-
-    /**
-     * Read access to a local variable of type float.
-     *
-     * @param slot the slot of the local variable
-     * @return the current value of the local variable
-     * @since 0.8 or earlier
-     * @deprecated use index-based slots instead
-     */
-    @Deprecated
-    float getFloat(FrameSlot slot) throws FrameSlotTypeException;
-
-    /**
-     * Write access to a local variable of type float.
-     *
-     * @param slot the slot of the local variable
-     * @param value the new value of the local variable
-     * @since 0.8 or earlier
-     * @deprecated use index-based slots instead
-     */
-    @Deprecated
-    void setFloat(FrameSlot slot, float value);
-
-    /**
-     * Read access to a local variable of type double.
-     *
-     * @param slot the slot of the local variable
-     * @return the current value of the local variable
-     * @since 0.8 or earlier
-     * @deprecated use index-based slots instead
-     */
-    @Deprecated
-    double getDouble(FrameSlot slot) throws FrameSlotTypeException;
-
-    /**
-     * Write access to a local variable of type double.
-     *
-     * @param slot the slot of the local variable
-     * @param value the new value of the local variable
-     * @since 0.8 or earlier
-     * @deprecated use index-based slots instead
-     */
-    @Deprecated
-    void setDouble(FrameSlot slot, double value);
-
-    /**
-     * Read access to a local variable of any type.
-     *
-     * @param slot the slot of the local variable
-     * @return the current value of the local variable or defaultValue if unset
-     * @since 0.8 or earlier
-     * @deprecated use index-based slots instead
-     */
-    @Deprecated
-    Object getValue(FrameSlot slot);
-
-    /**
      * Materializes this frame, which allows it to be stored in a field or cast to
      * {@link java.lang.Object}.
      *
@@ -240,91 +75,6 @@ public interface Frame {
      * @since 0.8 or earlier
      */
     MaterializedFrame materialize();
-
-    /**
-     * Check whether the given frame slot is of type object.
-     *
-     * @since 0.8 or earlier
-     * @deprecated use index-based slots instead
-     */
-    @Deprecated
-    boolean isObject(FrameSlot slot);
-
-    /**
-     * Check whether the given frame slot is of type byte.
-     *
-     * @since 0.8 or earlier
-     * @deprecated use index-based slots instead
-     */
-    @Deprecated
-    boolean isByte(FrameSlot slot);
-
-    /**
-     * Check whether the given frame slot is of type boolean.
-     *
-     * @since 0.8 or earlier
-     * @deprecated use index-based slots instead
-     */
-    @Deprecated
-    boolean isBoolean(FrameSlot slot);
-
-    /**
-     * Check whether the given frame slot is of type int.
-     *
-     * @since 0.8 or earlier
-     * @deprecated use index-based slots instead
-     */
-    @Deprecated
-    boolean isInt(FrameSlot slot);
-
-    /**
-     * Check whether the given frame slot is of type long.
-     *
-     * @since 0.8 or earlier
-     * @deprecated use index-based slots instead
-     */
-    @Deprecated
-    boolean isLong(FrameSlot slot);
-
-    /**
-     * Check whether the given frame slot is of type float.
-     *
-     * @since 0.8 or earlier
-     * @deprecated use index-based slots instead
-     */
-    @Deprecated
-    boolean isFloat(FrameSlot slot);
-
-    /**
-     * Check whether the given frame slot is of type double.
-     *
-     * @since 0.8 or earlier
-     * @deprecated use index-based slots instead
-     */
-    @Deprecated
-    boolean isDouble(FrameSlot slot);
-
-    /**
-     * Clears the given slot in the frame. Writing over a previously cleared slot is still allowed.
-     * Subsequent reads to this slot, unless re-written to, will fail with
-     * {@link FrameSlotTypeException}.
-     * <p>
-     * This method is intended to be used for implementations of liveness analysis. As such, the
-     * compiler will find and report any inconsistency with respect to liveness analysis when using
-     * this method, such as clearing a slot in a branch, but not on another one, and their execution
-     * merge.
-     * <p>
-     * Liveness analysis implementations are expected to clear unused slots on method entry
-     *
-     * @param slot the slot of the local variable
-     * @since 21.1
-     * @deprecated use index-based slots instead
-     */
-    @Deprecated
-    default void clear(FrameSlot slot) {
-        CompilerDirectives.transferToInterpreterAndInvalidate();
-        throw new UnsupportedOperationException();
-    }
 
     /**
      * Read access to a local variable of type {@link Object}.
@@ -335,6 +85,25 @@ public interface Frame {
      * @since 22.0
      */
     default Object getObject(int slot) throws FrameSlotTypeException {
+        CompilerDirectives.transferToInterpreterAndInvalidate();
+        throw new UnsupportedOperationException();
+    }
+
+    /**
+     * Read and expects a value of type object for a given slot. Expect methods are intended to be
+     * used to implement speculative behavior where slots are expected to be tagged with a type. If
+     * the type changes an {@link UnexpectedResultException} will be thrown containing the result of
+     * {@link #getValue(int) getValue(slot)}. Clients of this API are then expected to rewrite and
+     * no longer use an expect methods for future reads of that slot. Expect methods are
+     * particularly useful to implement stack like behavior with a frame.
+     *
+     * @param slot the index of the slot
+     * @return the value of the slot in this frame
+     * @throws UnexpectedResultException if the current value is not of type object
+     * @since 24.2
+     */
+    @SuppressWarnings("unused")
+    default Object expectObject(int slot) throws UnexpectedResultException {
         CompilerDirectives.transferToInterpreterAndInvalidate();
         throw new UnsupportedOperationException();
     }
@@ -365,6 +134,25 @@ public interface Frame {
     }
 
     /**
+     * Read and expects a value of type byte for a given slot. Expect methods are intended to be
+     * used to implement speculative behavior where slots are expected to be tagged with a type. If
+     * the type changes an {@link UnexpectedResultException} will be thrown containing the result of
+     * {@link #getValue(int) getValue(slot)}. Clients of this API are then expected to rewrite and
+     * no longer use an expect methods for future reads of that slot. Expect methods are
+     * particularly useful to implement stack like behavior with a frame.
+     *
+     * @param slot the index of the slot
+     * @return the value of the slot in this frame
+     * @throws UnexpectedResultException if the current value is not of type byte
+     * @since 24.2
+     */
+    @SuppressWarnings("unused")
+    default byte expectByte(int slot) throws UnexpectedResultException {
+        CompilerDirectives.transferToInterpreterAndInvalidate();
+        throw new UnsupportedOperationException();
+    }
+
+    /**
      * Write access to a local variable of type byte.
      *
      * @param slot the slot of the local variable
@@ -385,6 +173,25 @@ public interface Frame {
      * @since 22.0
      */
     default boolean getBoolean(int slot) throws FrameSlotTypeException {
+        CompilerDirectives.transferToInterpreterAndInvalidate();
+        throw new UnsupportedOperationException();
+    }
+
+    /**
+     * Read and expects a value of type boolean for a given slot. Expect methods are intended to be
+     * used to implement speculative behavior where slots are expected to be tagged with a type. If
+     * the type changes an {@link UnexpectedResultException} will be thrown containing the result of
+     * {@link #getValue(int) getValue(slot)}. Clients of this API are then expected to rewrite and
+     * no longer use an expect methods for future reads of that slot. Expect methods are
+     * particularly useful to implement stack like behavior with a frame.
+     *
+     * @param slot the index of the slot
+     * @return the value of the slot in this frame
+     * @throws UnexpectedResultException if the current value is not of type boolean
+     * @since 24.2
+     */
+    @SuppressWarnings("unused")
+    default boolean expectBoolean(int slot) throws UnexpectedResultException {
         CompilerDirectives.transferToInterpreterAndInvalidate();
         throw new UnsupportedOperationException();
     }
@@ -415,6 +222,25 @@ public interface Frame {
     }
 
     /**
+     * Read and expects a value of type int for a given slot. Expect methods are intended to be used
+     * to implement speculative behavior where slots are expected to be tagged with a type. If the
+     * type changes an {@link UnexpectedResultException} will be thrown containing the result of
+     * {@link #getValue(int) getValue(slot)}. Clients of this API are then expected to rewrite and
+     * no longer use an expect methods for future reads of that slot. Expect methods are
+     * particularly useful to implement stack like behavior with a frame.
+     *
+     * @param slot the index of the slot
+     * @return the value of the slot in this frame
+     * @throws UnexpectedResultException if the current value is not of type int
+     * @since 24.2
+     */
+    @SuppressWarnings("unused")
+    default int expectInt(int slot) throws UnexpectedResultException {
+        CompilerDirectives.transferToInterpreterAndInvalidate();
+        throw new UnsupportedOperationException();
+    }
+
+    /**
      * Write access to a local variable of type int.
      *
      * @param slot the slot of the local variable
@@ -435,6 +261,25 @@ public interface Frame {
      * @since 22.0
      */
     default long getLong(int slot) throws FrameSlotTypeException {
+        CompilerDirectives.transferToInterpreterAndInvalidate();
+        throw new UnsupportedOperationException();
+    }
+
+    /**
+     * Read and expects a value of type long for a given slot. Expect methods are intended to be
+     * used to implement speculative behavior where slots are expected to be tagged with a type. If
+     * the type changes an {@link UnexpectedResultException} will be thrown containing the result of
+     * {@link #getValue(int) getValue(slot)}. Clients of this API are then expected to rewrite and
+     * no longer use an expect methods for future reads of that slot. Expect methods are
+     * particularly useful to implement stack like behavior with a frame.
+     *
+     * @param slot the index of the slot
+     * @return the value of the slot in this frame
+     * @throws UnexpectedResultException if the current value is not of type long
+     * @since 24.2
+     */
+    @SuppressWarnings("unused")
+    default long expectLong(int slot) throws UnexpectedResultException {
         CompilerDirectives.transferToInterpreterAndInvalidate();
         throw new UnsupportedOperationException();
     }
@@ -465,6 +310,25 @@ public interface Frame {
     }
 
     /**
+     * Read and expects a value of type float for a given slot. Expect methods are intended to be
+     * used to implement speculative behavior where slots are expected to be tagged with a type. If
+     * the type changes an {@link UnexpectedResultException} will be thrown containing the result of
+     * {@link #getValue(int) getValue(slot)}. Clients of this API are then expected to rewrite and
+     * no longer use an expect methods for future reads of that slot. Expect methods are
+     * particularly useful to implement stack like behavior with a frame.
+     *
+     * @param slot the index of the slot
+     * @return the value of the slot in this frame
+     * @throws UnexpectedResultException if the current value is not of type float
+     * @since 24.2
+     */
+    @SuppressWarnings("unused")
+    default float expectFloat(int slot) throws UnexpectedResultException {
+        CompilerDirectives.transferToInterpreterAndInvalidate();
+        throw new UnsupportedOperationException();
+    }
+
+    /**
      * Write access to a local variable of type float.
      *
      * @param slot the slot of the local variable
@@ -485,6 +349,25 @@ public interface Frame {
      * @since 22.0
      */
     default double getDouble(int slot) throws FrameSlotTypeException {
+        CompilerDirectives.transferToInterpreterAndInvalidate();
+        throw new UnsupportedOperationException();
+    }
+
+    /**
+     * Read and expects a value of type double for a given slot. Expect methods are intended to be
+     * used to implement speculative behavior where slots are expected to be tagged with a type. If
+     * the type changes an {@link UnexpectedResultException} will be thrown containing the result of
+     * {@link #getValue(int) getValue(slot)}. Clients of this API are then expected to rewrite and
+     * no longer use an expect methods for future reads of that slot. Expect methods are
+     * particularly useful to implement stack like behavior with a frame.
+     *
+     * @param slot the index of the slot
+     * @return the value of the slot in this frame
+     * @throws UnexpectedResultException if the current value is not of type double
+     * @since 24.2
+     */
+    @SuppressWarnings("unused")
+    default double expectDouble(int slot) throws UnexpectedResultException {
         CompilerDirectives.transferToInterpreterAndInvalidate();
         throw new UnsupportedOperationException();
     }
@@ -552,6 +435,8 @@ public interface Frame {
 
     /**
      * Check whether the given indexed slot is of type object.
+     * <p>
+     * This method should not be used with static slots.
      *
      * @param slot the slot of the local variable
      * @since 22.0
@@ -563,6 +448,8 @@ public interface Frame {
 
     /**
      * Check whether the given indexed slot is of type byte.
+     * <p>
+     * This method should not be used with static slots.
      *
      * @param slot the slot of the local variable
      * @since 22.0
@@ -574,6 +461,8 @@ public interface Frame {
 
     /**
      * Check whether the given indexed slot is of type boolean.
+     * <p>
+     * This method should not be used with static slots.
      *
      * @param slot the slot of the local variable
      * @since 22.0
@@ -585,6 +474,8 @@ public interface Frame {
 
     /**
      * Check whether the given indexed slot is of type int.
+     * <p>
+     * This method should not be used with static slots.
      *
      * @param slot the slot of the local variable
      * @since 22.0
@@ -596,6 +487,8 @@ public interface Frame {
 
     /**
      * Check whether the given indexed slot is of type long.
+     * <p>
+     * This method should not be used with static slots.
      *
      * @param slot the slot of the local variable
      * @since 22.0
@@ -607,6 +500,8 @@ public interface Frame {
 
     /**
      * Check whether the given indexed slot is of type float.
+     * <p>
+     * This method should not be used with static slots.
      *
      * @param slot the slot of the local variable
      * @since 22.0
@@ -618,11 +513,26 @@ public interface Frame {
 
     /**
      * Check whether the given indexed slot is of type double.
+     * <p>
+     * This method should not be used with static slots.
      *
      * @param slot the slot of the local variable
      * @since 22.0
      */
     default boolean isDouble(int slot) {
+        CompilerDirectives.transferToInterpreterAndInvalidate();
+        throw new UnsupportedOperationException();
+    }
+
+    /**
+     * Checks whether the given indexed slot is static.
+     * <p>
+     * This method should not be used with static slots.
+     *
+     * @param slot the slot of the local variable
+     * @since 22.2
+     */
+    default boolean isStatic(int slot) {
         CompilerDirectives.transferToInterpreterAndInvalidate();
         throw new UnsupportedOperationException();
     }
@@ -666,6 +576,370 @@ public interface Frame {
      * @since 22.0
      */
     default void setAuxiliarySlot(int slot, Object value) {
+        CompilerDirectives.transferToInterpreterAndInvalidate();
+        throw new UnsupportedOperationException();
+    }
+
+    /**
+     * Static read access to a local variable of type {@link Object}. Requires the given slot to use
+     * {@link FrameSlotKind#Static}. Since this method does not perform any type checks, language
+     * implementations have to guarantee that the variable in the given slot is of type
+     * {@link Object}.
+     *
+     * @param slot the slot of the local variable
+     * @return the current value of the local variable, or {@code null} if slot is uninitialized.
+     * @since 22.2
+     */
+    default Object getObjectStatic(int slot) {
+        CompilerDirectives.transferToInterpreterAndInvalidate();
+        throw new UnsupportedOperationException();
+    }
+
+    /**
+     * Static write access to a local variable of type {@link Object}. Requires the given slot to
+     * use {@link FrameSlotKind#Static}. Since this method does not update the internal slot type,
+     * language implementations have to track this information.
+     *
+     * @param slot the slot of the local variable
+     * @param value the new value of the local variable
+     * @since 22.2
+     */
+    default void setObjectStatic(int slot, Object value) {
+        CompilerDirectives.transferToInterpreterAndInvalidate();
+        throw new UnsupportedOperationException();
+    }
+
+    /**
+     * Static read access to a local variable of type byte. Requires the given slot to use
+     * {@link FrameSlotKind#Static}. Since this method does not perform any type checks, language
+     * implementations have to guarantee that the variable in the given slot is of type byte.
+     *
+     * @param slot the slot of the local variable
+     * @return the current value of the local variable, or {@code 0} if slot is uninitialized.
+     * @since 22.2
+     */
+    default byte getByteStatic(int slot) {
+        CompilerDirectives.transferToInterpreterAndInvalidate();
+        throw new UnsupportedOperationException();
+    }
+
+    /**
+     * Static write access to a local variable of type byte. Requires the given slot to use
+     * {@link FrameSlotKind#Static}. Since this method does not update the internal slot type,
+     * language implementations have to track this information.
+     *
+     * @param slot the slot of the local variable
+     * @param value the new value of the local variable
+     * @since 22.2
+     */
+    default void setByteStatic(int slot, byte value) {
+        CompilerDirectives.transferToInterpreterAndInvalidate();
+        throw new UnsupportedOperationException();
+    }
+
+    /**
+     * Static read access to a local variable of type boolean. Requires the given slot to use
+     * {@link FrameSlotKind#Static}. Since this method does not perform any type checks, language
+     * implementations have to guarantee that the variable in the given slot is of type boolean.
+     *
+     * @param slot the slot of the local variable
+     * @return the current value of the local variable, or {@code false} if slot is uninitialized.
+     * @since 22.2
+     */
+    default boolean getBooleanStatic(int slot) {
+        CompilerDirectives.transferToInterpreterAndInvalidate();
+        throw new UnsupportedOperationException();
+    }
+
+    /**
+     * Static write access to a local variable of type boolean. Requires the given slot to use
+     * {@link FrameSlotKind#Static}. Since this method does not update the internal slot type,
+     * language implementations have to track this information.
+     *
+     * @param slot the slot of the local variable
+     * @param value the new value of the local variable
+     * @since 22.2
+     */
+    default void setBooleanStatic(int slot, boolean value) {
+        CompilerDirectives.transferToInterpreterAndInvalidate();
+        throw new UnsupportedOperationException();
+    }
+
+    /**
+     * Static read access to a local variable of type int. Requires the given slot to use
+     * {@link FrameSlotKind#Static}. Since this method does not perform any type checks, language
+     * implementations have to guarantee that the variable in the given slot can is of type int.
+     *
+     * @param slot the slot of the local variable
+     * @return the current value of the local variable, or {@code 0} if slot is uninitialized.
+     * @since 22.2
+     */
+    default int getIntStatic(int slot) {
+        CompilerDirectives.transferToInterpreterAndInvalidate();
+        throw new UnsupportedOperationException();
+    }
+
+    /**
+     * Static write access to a local variable of type int. Requires the given slot to use
+     * {@link FrameSlotKind#Static}. Since this method does not update the internal slot type,
+     * language implementations have to track this information.
+     *
+     * @param slot the slot of the local variable
+     * @param value the new value of the local variable
+     * @since 22.2
+     */
+    default void setIntStatic(int slot, int value) {
+        CompilerDirectives.transferToInterpreterAndInvalidate();
+        throw new UnsupportedOperationException();
+    }
+
+    /**
+     * Static read access to a local variable of type long. Requires the given slot to use
+     * {@link FrameSlotKind#Static}. Since this method does not perform any type checks, language
+     * implementations have to guarantee that the variable in the given slot is of type long.
+     *
+     * @param slot the slot of the local variable
+     * @return the current value of the local variable, or {@code 0} if slot is uninitialized.
+     * @since 22.2
+     */
+    default long getLongStatic(int slot) {
+        CompilerDirectives.transferToInterpreterAndInvalidate();
+        throw new UnsupportedOperationException();
+    }
+
+    /**
+     * Static write access to a local variable of type long. Requires the given slot to use
+     * {@link FrameSlotKind#Static}. Since this method does not update the internal slot type,
+     * language implementations have to track this information.
+     *
+     * @param slot the slot of the local variable
+     * @param value the new value of the local variable
+     * @since 22.2
+     */
+    default void setLongStatic(int slot, long value) {
+        CompilerDirectives.transferToInterpreterAndInvalidate();
+        throw new UnsupportedOperationException();
+    }
+
+    /**
+     * Static read access to a local variable of type float. Requires the given slot to use
+     * {@link FrameSlotKind#Static}. Since this method does not perform any type checks, language
+     * implementations have to guarantee that the variable in the given slot is of type float.
+     *
+     * @param slot the slot of the local variable
+     * @return the current value of the local variable, or {@code 0} if slot is uninitialized.
+     * @since 22.2
+     */
+    default float getFloatStatic(int slot) {
+        CompilerDirectives.transferToInterpreterAndInvalidate();
+        throw new UnsupportedOperationException();
+    }
+
+    /**
+     * Static write access to a local variable of type float. Requires the given slot to use
+     * {@link FrameSlotKind#Static}. Since this method does not update the internal slot type,
+     * language implementations have to track this information.
+     *
+     * @param slot the slot of the local variable
+     * @param value the new value of the local variable
+     * @since 22.2
+     */
+    default void setFloatStatic(int slot, float value) {
+        CompilerDirectives.transferToInterpreterAndInvalidate();
+        throw new UnsupportedOperationException();
+    }
+
+    /**
+     * Static read access to a local variable of type double. Requires the given slot to use
+     * {@link FrameSlotKind#Static}. Since this method does not perform any type checks, language
+     * implementations have to guarantee that the variable in the given slot is of type double.
+     *
+     * @param slot the slot of the local variable
+     * @return the current value of the local variable, or {@code 0} if slot is uninitialized.
+     * @since 22.2
+     */
+    default double getDoubleStatic(int slot) {
+        CompilerDirectives.transferToInterpreterAndInvalidate();
+        throw new UnsupportedOperationException();
+    }
+
+    /**
+     * Static write access to a local variable of type double. Requires the given slot to use
+     * {@link FrameSlotKind#Static}. Since this method does not update the internal slot type,
+     * language implementations have to track this information.
+     *
+     * @param slot the slot of the local variable
+     * @param value the new value of the local variable
+     * @since 22.2
+     */
+    default void setDoubleStatic(int slot, double value) {
+        CompilerDirectives.transferToInterpreterAndInvalidate();
+        throw new UnsupportedOperationException();
+    }
+
+    /**
+     * Copies a primitive value from one slot to another. Requires both slots to use
+     * {@link FrameSlotKind#Static}. Since this method does not perform any type checks, language
+     * implementations have to guarantee that the variable at the source slot is a primitive value.
+     *
+     * @param srcSlot the slot of the source local variable
+     * @param destSlot the slot of the target local variable
+     * @since 22.2
+     */
+    default void copyPrimitiveStatic(int srcSlot, int destSlot) {
+        CompilerDirectives.transferToInterpreterAndInvalidate();
+        throw new UnsupportedOperationException();
+    }
+
+    /**
+     * Copies an object value from one slot to another. Requires both slots to use
+     * {@link FrameSlotKind#Static}. Since this method does not perform any type checks, language
+     * implementations have to guarantee that the variable at the source slot is an {@link Object}.
+     *
+     * @param srcSlot the slot of the source local variable
+     * @param destSlot the slot of the target local variable
+     * @since 22.2
+     */
+    default void copyObjectStatic(int srcSlot, int destSlot) {
+        CompilerDirectives.transferToInterpreterAndInvalidate();
+        throw new UnsupportedOperationException();
+    }
+
+    /**
+     * Copies from one slot to another. Requires both slots to use {@link FrameSlotKind#Static}. In
+     * cases where the underlying slot type is known, {@link Frame#copyPrimitiveStatic} and
+     * {@link Frame#copyObjectStatic} should be used for performance reasons.
+     *
+     * @param srcSlot the slot of the source local variable
+     * @param destSlot the slot of the target local variable
+     * @since 22.3
+     */
+    default void copyStatic(int srcSlot, int destSlot) {
+        CompilerDirectives.transferToInterpreterAndInvalidate();
+        throw new UnsupportedOperationException();
+    }
+
+    /**
+     * Swaps the primitive values of two slots. Requires both slots to use
+     * {@link FrameSlotKind#Static}. Since this method does not perform any type checks, language
+     * implementations have to guarantee that the variables in both slots are primitive values.
+     *
+     * @param first the slot of the first local variable
+     * @param second the slot of the second local variable
+     * @since 22.3
+     */
+    default void swapPrimitiveStatic(int first, int second) {
+        CompilerDirectives.transferToInterpreterAndInvalidate();
+        throw new UnsupportedOperationException();
+    }
+
+    /**
+     * Swaps the object values of two slots. Requires both slots to use
+     * {@link FrameSlotKind#Static}. Since this method does not perform any type checks, language
+     * implementations have to guarantee that the variables in both slots are {@link Object}s.
+     *
+     * @param first the slot of the first local variable
+     * @param second the slot of the second local variable
+     * @since 22.3
+     */
+    default void swapObjectStatic(int first, int second) {
+        CompilerDirectives.transferToInterpreterAndInvalidate();
+        throw new UnsupportedOperationException();
+    }
+
+    /**
+     * Swaps the contents of two slots. Requires both slots to use {@link FrameSlotKind#Static}. In
+     * cases where the underlying slot type is known, {@link Frame#swapPrimitiveStatic} and
+     * {@link Frame#swapObjectStatic} should be used for performance reasons.
+     *
+     * @param first the slot of the first local variable
+     * @param second the slot of the second local variable
+     * @since 22.3
+     */
+    default void swapStatic(int first, int second) {
+        CompilerDirectives.transferToInterpreterAndInvalidate();
+        throw new UnsupportedOperationException();
+    }
+
+    /**
+     * Clears the primitive value at the given slot in the frame. Requires the given slot to use
+     * {@link FrameSlotKind#Static}. Writing over a previously cleared slot is still allowed.
+     * Subsequent reads to the slot, unless re-written to, are not allowed and will fail with an
+     * {@link AssertionError} if assertions are enabled. Since this method does not perform any type
+     * checks, language implementations have to guarantee that the variable at the given slot is a
+     * primitive value.
+     *
+     * <p>
+     * This method is intended to be used for implementations of liveness analysis. As such, the
+     * compiler will find and report any inconsistency with respect to liveness analysis when using
+     * this method, such as clearing a slot in a branch, but not on another one, and their execution
+     * merge.
+     * </p>
+     * Liveness analysis implementations are expected to clear unused slots on method entry.
+     *
+     * @param slot the slot of the local variable
+     * @since 22.2
+     */
+    default void clearPrimitiveStatic(int slot) {
+        CompilerDirectives.transferToInterpreterAndInvalidate();
+        throw new UnsupportedOperationException();
+    }
+
+    /**
+     * Clears the object value at the given slot in the frame. Requires the given slot to use
+     * {@link FrameSlotKind#Static}. Writing over a previously cleared slot is still allowed.
+     * Subsequent reads to the slot, unless re-written to, are not allowed and will fail with an
+     * {@link AssertionError} if assertions are enabled. Since this method does not perform any type
+     * checks, language implementations have to guarantee that the variable at the given slot is an
+     * {@link Object}.
+     *
+     * <p>
+     * This method is intended to be used for implementations of liveness analysis. As such, the
+     * compiler will find and report any inconsistency with respect to liveness analysis when using
+     * this method, such as clearing a slot in a branch, but not on another one, and their execution
+     * merge.
+     * </p>
+     * Liveness analysis implementations are expected to clear unused slots on method entry.
+     *
+     * @param slot the slot of the local variable
+     * @since 22.2
+     */
+    default void clearObjectStatic(int slot) {
+        CompilerDirectives.transferToInterpreterAndInvalidate();
+        throw new UnsupportedOperationException();
+    }
+
+    /**
+     * Clears the value at the given slot in the frame. Requires the given slot to use
+     * {@link FrameSlotKind#Static}. Writing over a previously cleared slot is still allowed.
+     * Subsequent reads to the slot, unless re-written to, are not allowed and will fail with an
+     * {@link AssertionError} if assertions are enabled. In cases where the underlying slot type is
+     * known, {@link Frame#clearPrimitiveStatic} and {@link Frame#clearObjectStatic} should be used
+     * for performance reasons.
+     *
+     * @param slot The slot of the local variable
+     * @since 22.3
+     */
+    default void clearStatic(int slot) {
+        CompilerDirectives.transferToInterpreterAndInvalidate();
+        throw new UnsupportedOperationException();
+    }
+
+    /**
+     * Copies values from this frame to the given frame. The frames are required to have the same
+     * {@link Frame#getFrameDescriptor() frame descriptors}.
+     *
+     * @param sourceOffset the slot of the first local variable
+     * @param destination the destination frame
+     * @param destinationOffset the first slot to copy locals into
+     * @param length the number of slots to copy
+     * @throws IllegalArgumentException if a frame using a different {@link FrameDescriptor} is
+     *             passed.
+     * @throws IndexOutOfBoundsException if an invalid offset or length was passed.
+     * @since 24.2
+     */
+    @SuppressWarnings("unused")
+    default void copyTo(int sourceOffset, Frame destination, int destinationOffset, int length) {
         CompilerDirectives.transferToInterpreterAndInvalidate();
         throw new UnsupportedOperationException();
     }

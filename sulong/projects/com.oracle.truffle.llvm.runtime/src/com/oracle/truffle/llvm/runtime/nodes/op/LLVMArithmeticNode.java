@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2016, 2021, Oracle and/or its affiliates.
+ * Copyright (c) 2016, 2026, Oracle and/or its affiliates.
  *
  * All rights reserved.
  *
@@ -29,6 +29,7 @@
  */
 package com.oracle.truffle.llvm.runtime.nodes.op;
 
+import com.oracle.truffle.api.CompilerDirectives.TruffleBoundary;
 import com.oracle.truffle.api.dsl.Cached;
 import com.oracle.truffle.api.dsl.CreateCast;
 import com.oracle.truffle.api.dsl.NodeChild;
@@ -38,9 +39,13 @@ import com.oracle.truffle.api.nodes.UnexpectedResultException;
 import com.oracle.truffle.api.profiles.ValueProfile;
 import com.oracle.truffle.llvm.runtime.ArithmeticOperation;
 import com.oracle.truffle.llvm.runtime.LLVMIVarBit;
+import com.oracle.truffle.llvm.runtime.LLVMLanguage;
+import com.oracle.truffle.llvm.runtime.floating.LLVM128BitFloat;
 import com.oracle.truffle.llvm.runtime.floating.LLVM80BitFloat;
+import com.oracle.truffle.llvm.runtime.floating.LLVMLongDoubleFloatingPoint;
+import com.oracle.truffle.llvm.runtime.floating.LLVMLongDoubleNode;
+import com.oracle.truffle.llvm.runtime.floating.LLVMLongDoubleNode.LongDoubleKinds;
 import com.oracle.truffle.llvm.runtime.interop.LLVMNegatedForeignObject;
-import com.oracle.truffle.llvm.runtime.nodes.api.LLVMArithmetic.LLVMArithmeticOpNode;
 import com.oracle.truffle.llvm.runtime.nodes.api.LLVMExpressionNode;
 import com.oracle.truffle.llvm.runtime.nodes.api.LLVMNode;
 import com.oracle.truffle.llvm.runtime.nodes.api.LLVMTypesGen;
@@ -52,7 +57,6 @@ import com.oracle.truffle.llvm.runtime.nodes.op.LLVMArithmeticNodeFactory.Manage
 import com.oracle.truffle.llvm.runtime.nodes.op.LLVMArithmeticNodeFactory.ManagedSubNodeGen;
 import com.oracle.truffle.llvm.runtime.nodes.op.LLVMArithmeticNodeFactory.ManagedXorNodeGen;
 import com.oracle.truffle.llvm.runtime.nodes.op.LLVMArithmeticNodeFactory.PointerToI64NodeGen;
-import com.oracle.truffle.llvm.runtime.nodes.op.arith.floating.LLVMArithmeticFactory;
 import com.oracle.truffle.llvm.runtime.nodes.util.LLVMSameObjectNode;
 import com.oracle.truffle.llvm.runtime.pointer.LLVMManagedPointer;
 import com.oracle.truffle.llvm.runtime.pointer.LLVMPointer;
@@ -95,7 +99,15 @@ public abstract class LLVMArithmeticNode extends LLVMExpressionNode {
 
         abstract double doDouble(double left, double right);
 
-        abstract LLVMArithmeticOpNode createFP80Node();
+        @TruffleBoundary
+        abstract float correctRounding(float left, float right, float result, int roundingMode);
+
+        @TruffleBoundary
+        abstract double correctRounding(double left, double right, double result, int roundingMode);
+
+        abstract LLVMLongDoubleNode createFP80Node();
+
+        abstract LLVMLongDoubleNode createFP128Node();
     }
 
     abstract static class ManagedArithmeticNode extends LLVMNode {
@@ -391,6 +403,99 @@ public abstract class LLVMArithmeticNode extends LLVMExpressionNode {
         LLVMFPArithmeticOp fpOp() {
             return (LLVMFPArithmeticOp) op;
         }
+
+        int getRoundingMode() {
+            return getLanguage().getRoundingMode();
+        }
+
+        public static float adjustRounding(float nearest, double exact, int roundingMode) {
+            if (roundingMode == LLVMLanguage.ROUNDING_MODE_NEAREST_TIES_TO_EVEN || Double.isNaN(exact)) {
+                return nearest;
+            }
+            if (roundingMode == LLVMLanguage.ROUNDING_MODE_NEAREST_TIES_AWAY) {
+                if (nearest == exact || !Double.isFinite(exact)) {
+                    return nearest;
+                }
+                float adjacent = exact > nearest ? Math.nextUp(nearest) : Math.nextDown(nearest);
+                double midpoint = ((double) nearest + adjacent) / 2;
+                return exact == midpoint && Math.abs(adjacent) > Math.abs(nearest) ? adjacent : nearest;
+            }
+            if (nearest == exact || !Double.isFinite(exact)) {
+                return nearest;
+            }
+            boolean exactIsGreater = exact > nearest;
+            switch (roundingMode) {
+                case LLVMLanguage.ROUNDING_MODE_TOWARD_ZERO:
+                    if ((nearest > 0 && !exactIsGreater) || (nearest < 0 && exactIsGreater)) {
+                        return exactIsGreater ? Math.nextUp(nearest) : Math.nextDown(nearest);
+                    }
+                    return nearest;
+                case LLVMLanguage.ROUNDING_MODE_TOWARD_POSITIVE:
+                    return exactIsGreater ? Math.nextUp(nearest) : nearest;
+                case LLVMLanguage.ROUNDING_MODE_TOWARD_NEGATIVE:
+                    return exactIsGreater ? nearest : Math.nextDown(nearest);
+                default:
+                    return nearest;
+            }
+        }
+
+        public static double adjustRounding(double nearest, double error, int roundingMode) {
+            if (roundingMode == LLVMLanguage.ROUNDING_MODE_NEAREST_TIES_TO_EVEN || Double.isNaN(error)) {
+                return nearest;
+            }
+            if (roundingMode == LLVMLanguage.ROUNDING_MODE_NEAREST_TIES_AWAY) {
+                if (error == 0 || !Double.isFinite(nearest)) {
+                    return nearest;
+                }
+                double adjacent = error > 0 ? Math.nextUp(nearest) : Math.nextDown(nearest);
+                double distance = Math.abs(adjacent - nearest);
+                return Math.abs(error) == distance / 2 && Math.abs(adjacent) > Math.abs(nearest) ? adjacent : nearest;
+            }
+            if (error == 0) {
+                return nearest;
+            }
+            boolean exactIsGreater = error > 0;
+            switch (roundingMode) {
+                case LLVMLanguage.ROUNDING_MODE_TOWARD_ZERO:
+                    if ((nearest > 0 && !exactIsGreater) || (nearest < 0 && exactIsGreater)) {
+                        return exactIsGreater ? Math.nextUp(nearest) : Math.nextDown(nearest);
+                    }
+                    return nearest;
+                case LLVMLanguage.ROUNDING_MODE_TOWARD_POSITIVE:
+                    return exactIsGreater ? Math.nextUp(nearest) : nearest;
+                case LLVMLanguage.ROUNDING_MODE_TOWARD_NEGATIVE:
+                    return exactIsGreater ? nearest : Math.nextDown(nearest);
+                default:
+                    return nearest;
+            }
+        }
+
+        public static double addError(double left, double right, double result) {
+            double rightVirtual = result - left;
+            return (left - (result - rightVirtual)) + (right - rightVirtual);
+        }
+
+        public static float exactZero(float result, int roundingMode) {
+            return result == 0 && roundingMode == LLVMLanguage.ROUNDING_MODE_TOWARD_NEGATIVE ? -0.0f : result;
+        }
+
+        public static double exactZero(double result, int roundingMode) {
+            return result == 0 && roundingMode == LLVMLanguage.ROUNDING_MODE_TOWARD_NEGATIVE ? -0.0d : result;
+        }
+
+        static double divisionError(double left, double right, double result) {
+            double remainder = Math.fma(-result, right, left);
+            return Math.copySign(Math.abs(remainder), remainder * right);
+        }
+
+        public static double adjustOverflow(double result, int roundingMode) {
+            if (result == Double.POSITIVE_INFINITY && (roundingMode == LLVMLanguage.ROUNDING_MODE_TOWARD_NEGATIVE || roundingMode == LLVMLanguage.ROUNDING_MODE_TOWARD_ZERO)) {
+                return Double.MAX_VALUE;
+            } else if (result == Double.NEGATIVE_INFINITY && (roundingMode == LLVMLanguage.ROUNDING_MODE_TOWARD_POSITIVE || roundingMode == LLVMLanguage.ROUNDING_MODE_TOWARD_ZERO)) {
+                return -Double.MAX_VALUE;
+            }
+            return result;
+        }
     }
 
     public abstract static class LLVMFloatArithmeticNode extends LLVMFloatingArithmeticNode {
@@ -401,7 +506,11 @@ public abstract class LLVMArithmeticNode extends LLVMExpressionNode {
 
         @Specialization
         float doFloat(float left, float right) {
-            return fpOp().doFloat(left, right);
+            float result = fpOp().doFloat(left, right);
+            if (!getLanguage().getDefaultRoundingModeAssumption().isValid()) {
+                return fpOp().correctRounding(left, right, result, getRoundingMode());
+            }
+            return result;
         }
     }
 
@@ -413,7 +522,11 @@ public abstract class LLVMArithmeticNode extends LLVMExpressionNode {
 
         @Specialization
         double doDouble(double left, double right) {
-            return fpOp().doDouble(left, right);
+            double result = fpOp().doDouble(left, right);
+            if (!getLanguage().getDefaultRoundingModeAssumption().isValid()) {
+                return fpOp().correctRounding(left, right, result, getRoundingMode());
+            }
+            return result;
         }
     }
 
@@ -423,14 +536,31 @@ public abstract class LLVMArithmeticNode extends LLVMExpressionNode {
             super(op);
         }
 
-        LLVMArithmeticOpNode createFP80Node() {
+        LLVMLongDoubleNode createFP80Node() {
             return fpOp().createFP80Node();
         }
 
         @Specialization
-        LLVM80BitFloat do80BitFloat(LLVM80BitFloat left, LLVM80BitFloat right,
-                        @Cached("createFP80Node()") LLVMArithmeticOpNode node) {
-            return (LLVM80BitFloat) node.execute(left, right);
+        LLVMLongDoubleFloatingPoint do80BitFloat(LLVM80BitFloat left, LLVM80BitFloat right,
+                        @Cached("createFP80Node()") LLVMLongDoubleNode node) {
+            return node.execute(left, right);
+        }
+    }
+
+    public abstract static class LLVMFP128ArithmeticNode extends LLVMFloatingArithmeticNode {
+
+        LLVMFP128ArithmeticNode(ArithmeticOperation op) {
+            super(op);
+        }
+
+        LLVMLongDoubleNode createFP128Node() {
+            return fpOp().createFP128Node();
+        }
+
+        @Specialization
+        LLVMLongDoubleFloatingPoint do128BitFloat(LLVM128BitFloat left, LLVM128BitFloat right,
+                        @Cached("createFP128Node()") LLVMLongDoubleNode node) {
+            return node.execute(left, right);
         }
     }
 
@@ -495,8 +625,35 @@ public abstract class LLVMArithmeticNode extends LLVMExpressionNode {
         }
 
         @Override
-        LLVMArithmeticOpNode createFP80Node() {
-            return LLVMArithmeticFactory.createAddNode();
+        @TruffleBoundary
+        float correctRounding(float left, float right, float result, int roundingMode) {
+            double exact = (double) left + right;
+            return exact == 0 ? LLVMFloatingArithmeticNode.exactZero(result, roundingMode) : LLVMFloatingArithmeticNode.adjustRounding(result, exact, roundingMode);
+        }
+
+        @Override
+        @TruffleBoundary
+        double correctRounding(double left, double right, double result, int roundingMode) {
+            if (left == -right) {
+                return LLVMFloatingArithmeticNode.exactZero(result, roundingMode);
+            }
+            return Double.isInfinite(result) && Double.isFinite(left) && Double.isFinite(right) ? LLVMFloatingArithmeticNode.adjustOverflow(result, roundingMode)
+                            : LLVMFloatingArithmeticNode.adjustRounding(result, LLVMFloatingArithmeticNode.addError(left, right, result), roundingMode);
+        }
+
+        @Override
+        LLVMLongDoubleNode createFP80Node() {
+            return LLVMLongDoubleNode.createAddNode(LongDoubleKinds.FP80);
+        }
+
+        @Override
+        LLVMLongDoubleNode createFP128Node() {
+            return LLVMLongDoubleNode.createAddNode(LongDoubleKinds.FP128);
+        }
+
+        @Override
+        public String toString() {
+            return "ADD";
         }
     };
 
@@ -581,8 +738,38 @@ public abstract class LLVMArithmeticNode extends LLVMExpressionNode {
         }
 
         @Override
-        LLVMArithmeticOpNode createFP80Node() {
-            return LLVMArithmeticFactory.createMulNode();
+        @TruffleBoundary
+        float correctRounding(float left, float right, float result, int roundingMode) {
+            return LLVMFloatingArithmeticNode.adjustRounding(result, (double) left * right, roundingMode);
+        }
+
+        @Override
+        @TruffleBoundary
+        double correctRounding(double left, double right, double result, int roundingMode) {
+            if (!Double.isFinite(left) || !Double.isFinite(right)) {
+                return result;
+            }
+            double error = Math.fma(left, right, -result);
+            if (error == 0 && result == 0 && left != 0 && right != 0 && roundingMode != LLVMLanguage.ROUNDING_MODE_NEAREST_TIES_TO_EVEN &&
+                            roundingMode != LLVMLanguage.ROUNDING_MODE_NEAREST_TIES_AWAY) {
+                error = Math.copySign(Double.MIN_VALUE, left * right);
+            }
+            return Double.isInfinite(result) ? LLVMFloatingArithmeticNode.adjustOverflow(result, roundingMode) : LLVMFloatingArithmeticNode.adjustRounding(result, error, roundingMode);
+        }
+
+        @Override
+        LLVMLongDoubleNode createFP80Node() {
+            return LLVMLongDoubleNode.createMulNode(LongDoubleKinds.FP80);
+        }
+
+        @Override
+        LLVMLongDoubleNode createFP128Node() {
+            return LLVMLongDoubleNode.createMulNode(LongDoubleKinds.FP128);
+        }
+
+        @Override
+        public String toString() {
+            return "MUL";
         }
     };
 
@@ -656,8 +843,35 @@ public abstract class LLVMArithmeticNode extends LLVMExpressionNode {
         }
 
         @Override
-        LLVMArithmeticOpNode createFP80Node() {
-            return LLVMArithmeticFactory.createSubNode();
+        @TruffleBoundary
+        float correctRounding(float left, float right, float result, int roundingMode) {
+            double exact = (double) left - right;
+            return exact == 0 ? LLVMFloatingArithmeticNode.exactZero(result, roundingMode) : LLVMFloatingArithmeticNode.adjustRounding(result, exact, roundingMode);
+        }
+
+        @Override
+        @TruffleBoundary
+        double correctRounding(double left, double right, double result, int roundingMode) {
+            if (left == right) {
+                return LLVMFloatingArithmeticNode.exactZero(result, roundingMode);
+            }
+            return Double.isInfinite(result) && Double.isFinite(left) && Double.isFinite(right) ? LLVMFloatingArithmeticNode.adjustOverflow(result, roundingMode)
+                            : LLVMFloatingArithmeticNode.adjustRounding(result, LLVMFloatingArithmeticNode.addError(left, -right, result), roundingMode);
+        }
+
+        @Override
+        LLVMLongDoubleNode createFP80Node() {
+            return LLVMLongDoubleNode.createSubNode(LongDoubleKinds.FP80);
+        }
+
+        @Override
+        LLVMLongDoubleNode createFP128Node() {
+            return LLVMLongDoubleNode.createSubNode(LongDoubleKinds.FP128);
+        }
+
+        @Override
+        public String toString() {
+            return "SUB";
         }
     };
 
@@ -699,8 +913,37 @@ public abstract class LLVMArithmeticNode extends LLVMExpressionNode {
         }
 
         @Override
-        LLVMArithmeticOpNode createFP80Node() {
-            return LLVMArithmeticFactory.createDivNode();
+        @TruffleBoundary
+        float correctRounding(float left, float right, float result, int roundingMode) {
+            if (!Float.isFinite(left) || !Float.isFinite(right) || right == 0) {
+                return result;
+            }
+            return LLVMFloatingArithmeticNode.adjustRounding(result, (double) left / right, roundingMode);
+        }
+
+        @Override
+        @TruffleBoundary
+        double correctRounding(double left, double right, double result, int roundingMode) {
+            if (!Double.isFinite(left) || !Double.isFinite(right) || right == 0) {
+                return result;
+            }
+            return Double.isInfinite(result) ? LLVMFloatingArithmeticNode.adjustOverflow(result, roundingMode)
+                            : LLVMFloatingArithmeticNode.adjustRounding(result, LLVMFloatingArithmeticNode.divisionError(left, right, result), roundingMode);
+        }
+
+        @Override
+        LLVMLongDoubleNode createFP80Node() {
+            return LLVMLongDoubleNode.createDivNode(LongDoubleKinds.FP80);
+        }
+
+        @Override
+        LLVMLongDoubleNode createFP128Node() {
+            return LLVMLongDoubleNode.createDivNode(LongDoubleKinds.FP128);
+        }
+
+        @Override
+        public String toString() {
+            return "DIV";
         }
     };
 
@@ -729,6 +972,11 @@ public abstract class LLVMArithmeticNode extends LLVMExpressionNode {
         @Override
         LLVMIVarBit doVarBit(LLVMIVarBit left, LLVMIVarBit right) {
             return left.unsignedDiv(right);
+        }
+
+        @Override
+        public String toString() {
+            return "UDIV";
         }
     };
 
@@ -770,8 +1018,30 @@ public abstract class LLVMArithmeticNode extends LLVMExpressionNode {
         }
 
         @Override
-        LLVMArithmeticOpNode createFP80Node() {
-            return LLVMArithmeticFactory.createRemNode();
+        @TruffleBoundary
+        float correctRounding(@SuppressWarnings("unused") float left, @SuppressWarnings("unused") float right, float result, @SuppressWarnings("unused") int roundingMode) {
+            return result;
+        }
+
+        @Override
+        @TruffleBoundary
+        double correctRounding(@SuppressWarnings("unused") double left, @SuppressWarnings("unused") double right, double result, @SuppressWarnings("unused") int roundingMode) {
+            return result;
+        }
+
+        @Override
+        LLVMLongDoubleNode createFP80Node() {
+            return LLVMLongDoubleNode.createRemNode(LongDoubleKinds.FP80);
+        }
+
+        @Override
+        LLVMLongDoubleNode createFP128Node() {
+            return LLVMLongDoubleNode.createRemNode(LongDoubleKinds.FP128);
+        }
+
+        @Override
+        public String toString() {
+            return "REM";
         }
     };
 
@@ -800,6 +1070,11 @@ public abstract class LLVMArithmeticNode extends LLVMExpressionNode {
         @Override
         LLVMIVarBit doVarBit(LLVMIVarBit left, LLVMIVarBit right) {
             return left.unsignedRem(right);
+        }
+
+        @Override
+        public String toString() {
+            return "UREM";
         }
     };
 
@@ -878,6 +1153,11 @@ public abstract class LLVMArithmeticNode extends LLVMExpressionNode {
         LLVMIVarBit doVarBit(LLVMIVarBit left, LLVMIVarBit right) {
             return left.and(right);
         }
+
+        @Override
+        public String toString() {
+            return "ADD";
+        }
     };
 
     private static final LLVMArithmeticOp OR = new LLVMArithmeticOp() {
@@ -910,6 +1190,11 @@ public abstract class LLVMArithmeticNode extends LLVMExpressionNode {
         @Override
         LLVMIVarBit doVarBit(LLVMIVarBit left, LLVMIVarBit right) {
             return left.or(right);
+        }
+
+        @Override
+        public String toString() {
+            return "OR";
         }
     };
 
@@ -970,6 +1255,11 @@ public abstract class LLVMArithmeticNode extends LLVMExpressionNode {
         LLVMIVarBit doVarBit(LLVMIVarBit left, LLVMIVarBit right) {
             return left.xor(right);
         }
+
+        @Override
+        public String toString() {
+            return "XOR";
+        }
     };
 
     private static final LLVMArithmeticOp SHL = new LLVMArithmeticOp() {
@@ -1002,6 +1292,11 @@ public abstract class LLVMArithmeticNode extends LLVMExpressionNode {
         @Override
         LLVMIVarBit doVarBit(LLVMIVarBit left, LLVMIVarBit right) {
             return left.leftShift(right);
+        }
+
+        @Override
+        public String toString() {
+            return "SHL";
         }
     };
 
@@ -1036,6 +1331,11 @@ public abstract class LLVMArithmeticNode extends LLVMExpressionNode {
         LLVMIVarBit doVarBit(LLVMIVarBit left, LLVMIVarBit right) {
             return left.logicalRightShift(right);
         }
+
+        @Override
+        public String toString() {
+            return "LSHL";
+        }
     };
 
     private static final LLVMArithmeticOp ASHR = new LLVMArithmeticOp() {
@@ -1068,6 +1368,11 @@ public abstract class LLVMArithmeticNode extends LLVMExpressionNode {
         @Override
         LLVMIVarBit doVarBit(LLVMIVarBit left, LLVMIVarBit right) {
             return left.arithmeticRightShift(right);
+        }
+
+        @Override
+        public String toString() {
+            return "ASHR";
         }
     };
 }

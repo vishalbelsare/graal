@@ -22,26 +22,54 @@
  */
 package com.oracle.truffle.espresso.impl;
 
+import java.util.Set;
+
 import com.oracle.truffle.api.Assumption;
 import com.oracle.truffle.api.CompilerDirectives;
 import com.oracle.truffle.api.CompilerDirectives.CompilationFinal;
 import com.oracle.truffle.api.CompilerDirectives.TruffleBoundary;
 import com.oracle.truffle.api.Truffle;
-import com.oracle.truffle.api.staticobject.StaticShape;
+import com.oracle.truffle.api.dsl.Bind;
+import com.oracle.truffle.api.dsl.Cached;
+import com.oracle.truffle.api.dsl.Fallback;
+import com.oracle.truffle.api.dsl.Specialization;
+import com.oracle.truffle.api.interop.ArityException;
+import com.oracle.truffle.api.interop.InteropLibrary;
+import com.oracle.truffle.api.interop.TruffleObject;
+import com.oracle.truffle.api.interop.UnknownIdentifierException;
+import com.oracle.truffle.api.interop.UnsupportedTypeException;
+import com.oracle.truffle.api.library.ExportLibrary;
+import com.oracle.truffle.api.library.ExportMessage;
+import com.oracle.truffle.api.nodes.Node;
+import com.oracle.truffle.api.profiles.InlinedBranchProfile;
+import com.oracle.truffle.api.utilities.TriState;
+import com.oracle.truffle.espresso.EspressoLanguage;
+import com.oracle.truffle.espresso.EspressoOptions;
+import com.oracle.truffle.espresso.classfile.ClassfileParser;
 import com.oracle.truffle.espresso.classfile.Constants;
-import com.oracle.truffle.espresso.classfile.RuntimeConstantPool;
+import com.oracle.truffle.espresso.classfile.JavaKind;
+import com.oracle.truffle.espresso.classfile.attributes.Attribute;
+import com.oracle.truffle.espresso.classfile.attributes.AttributedElement;
+import com.oracle.truffle.espresso.classfile.attributes.ConstantValueAttribute;
 import com.oracle.truffle.espresso.classfile.attributes.SignatureAttribute;
-import com.oracle.truffle.espresso.descriptors.Symbol;
-import com.oracle.truffle.espresso.descriptors.Symbol.ModifiedUTF8;
-import com.oracle.truffle.espresso.descriptors.Symbol.Name;
-import com.oracle.truffle.espresso.descriptors.Symbol.Type;
+import com.oracle.truffle.espresso.classfile.descriptors.ModifiedUTF8;
+import com.oracle.truffle.espresso.classfile.descriptors.Name;
+import com.oracle.truffle.espresso.classfile.descriptors.Symbol;
+import com.oracle.truffle.espresso.classfile.descriptors.Type;
+import com.oracle.truffle.espresso.constantpool.RuntimeConstantPool;
+import com.oracle.truffle.espresso.descriptors.EspressoSymbols.Names;
+import com.oracle.truffle.espresso.impl.LinkedKlassFieldLayout.HiddenField;
 import com.oracle.truffle.espresso.jdwp.api.FieldBreakpoint;
 import com.oracle.truffle.espresso.jdwp.api.FieldRef;
+import com.oracle.truffle.espresso.jdwp.api.TagConstants;
 import com.oracle.truffle.espresso.meta.EspressoError;
-import com.oracle.truffle.espresso.meta.JavaKind;
 import com.oracle.truffle.espresso.meta.Meta;
-import com.oracle.truffle.espresso.runtime.Attribute;
-import com.oracle.truffle.espresso.runtime.StaticObject;
+import com.oracle.truffle.espresso.runtime.EspressoException;
+import com.oracle.truffle.espresso.runtime.staticobject.FieldStorageObject;
+import com.oracle.truffle.espresso.runtime.staticobject.StaticObject;
+import com.oracle.truffle.espresso.shared.meta.FieldAccess;
+import com.oracle.truffle.espresso.substitutions.JavaType;
+import com.oracle.truffle.espresso.substitutions.standard.Target_sun_misc_Unsafe;
 
 /**
  * Represents a resolved Espresso field.
@@ -57,13 +85,12 @@ import com.oracle.truffle.espresso.runtime.StaticObject;
  * 2. A {@link RedefineAddedField} which represents a field that was added by a
  * {@link com.oracle.truffle.espresso.redefinition.ClassRedefinition}. Management of Redefine Added
  * Fields is done through {@link ExtensionFieldsMetadata}. Accessing a Redefined Added Field
- * {@link LinkedField#isRedefineAdded()} normally happens through the associated
- * {@link ExtensionFieldObject instance} unless the Redefine Added Field has a Compatible Field
- * {@link #hasCompatibleField()}. A Compatible field is always an Original Field that has the same
- * name and type as the associated Redefine Added Field. A Redefine Added field can be assigned a
- * Compatible Field if e.g. the field access modifiers changed. The state of the field is thus
- * maintained by the Compatible (Original) Field. In this case the Redefine Added Field serves only
- * as an up-to-date representative of the field in the runtime.
+ * normally happens through the associated {@link FieldStorageObject instance} unless the Redefine
+ * Added Field has a Compatible Field {@link #hasCompatibleField()}. A Compatible field is always an
+ * Original Field that has the same name and type as the associated Redefine Added Field. A Redefine
+ * Added field can be assigned a Compatible Field if e.g. the field access modifiers changed. The
+ * state of the field is thus maintained by the Compatible (Original) Field. In this case the
+ * Redefine Added Field serves only as an up-to-date representative of the field in the runtime.
  *
  * 3. A Delegation Field is a special field that is created whenever a certain field requires to be
  * re-resolved due to class redefinition. It allows obsolete code that uses a field to continue
@@ -73,12 +100,13 @@ import com.oracle.truffle.espresso.runtime.StaticObject;
  * value (this could be either an Original Field or a Redefine Added Field) a Delegation field is
  * assigned the underlying field as a Compatible Field.
  */
-public class Field extends Member<Type> implements FieldRef {
+@ExportLibrary(InteropLibrary.class)
+public class Field extends Member<Type> implements FieldRef, TruffleObject, FieldAccess<Klass, Method, Field>, AttributedElement {
 
     public static final Field[] EMPTY_ARRAY = new Field[0];
 
     final LinkedField linkedField;
-    private final ObjectKlass.KlassVersion holder;
+    protected final ObjectKlass.KlassVersion holder;
 
     protected final RuntimeConstantPool pool;
     @CompilationFinal private volatile Klass typeKlassCache;
@@ -101,7 +129,7 @@ public class Field extends Member<Type> implements FieldRef {
         return linkedField.getType();
     }
 
-    public void removeByRedefintion() {
+    public void removeByRedefinition() {
         removedByRedefinition = true;
     }
 
@@ -113,22 +141,34 @@ public class Field extends Member<Type> implements FieldRef {
         return !holder.getAssumption().isValid();
     }
 
+    @Override
     public final Attribute[] getAttributes() {
         return linkedField.getParserField().getAttributes();
     }
 
     public final Symbol<ModifiedUTF8> getGenericSignature() {
         if (genericSignature == null) {
-            SignatureAttribute attr = (SignatureAttribute) linkedField.getAttribute(SignatureAttribute.NAME);
-            if (attr == null) {
-                genericSignature = ModifiedUTF8.fromSymbol(getType());
-            } else {
-                genericSignature = pool.symbolAt(attr.getSignatureIndex());
-            }
+            Symbol<ModifiedUTF8> rawSignature = getRawGenericSignature();
+            genericSignature = rawSignature != null ? rawSignature : ModifiedUTF8.fromSymbol(getType());
         }
         return genericSignature;
     }
 
+    /**
+     * Returns the Signature attribute value, or {@code null} when the attribute is absent. Unlike
+     * {@link #getGenericSignature()}, this method does not substitute the field descriptor.
+     * Reflection mirrors require the nullable raw value to match HotSpot semantics and distinguish
+     * an absent Signature attribute from an explicitly present signature equal to the descriptor.
+     */
+    @SuppressWarnings("unchecked")
+    public final Symbol<ModifiedUTF8> getRawGenericSignature() {
+        SignatureAttribute attr = getAttribute(SignatureAttribute.NAME, SignatureAttribute.class);
+        return attr == null ? null : (Symbol<ModifiedUTF8>) pool.utf8At(attr.getSignatureIndex(), "generic signature");
+    }
+
+    /**
+     * @see HiddenField
+     */
     public final boolean isHidden() {
         return linkedField.isHidden();
     }
@@ -144,7 +184,11 @@ public class Field extends Member<Type> implements FieldRef {
 
     @Override
     public final int getModifiers() {
-        return linkedField.getFlags() & Constants.JVM_RECOGNIZED_FIELD_MODIFIERS;
+        return getFlags() & Constants.JVM_RECOGNIZED_FIELD_MODIFIERS;
+    }
+
+    public final int getFlags() {
+        return linkedField.getFlags();
     }
 
     @Override
@@ -190,26 +234,44 @@ public class Field extends Member<Type> implements FieldRef {
         }
     }
 
-    public final Attribute getAttribute(Symbol<Name> attrName) {
-        return linkedField.getAttribute(attrName);
-    }
-
-    public static Field getReflectiveFieldRoot(StaticObject seed, Meta meta) {
-        StaticObject curField = seed;
-        Field target = null;
-        while (target == null) {
-            target = (Field) meta.HIDDEN_FIELD_KEY.getHiddenObject(curField);
-            if (target == null) {
-                curField = meta.java_lang_reflect_Field_root.getObject(curField);
+    //@formatter:off
+    /// Gets the [Field] value associated with `reflectField`.
+    ///
+    /// ```
+    /// while (reflectField.0vmField == null) {
+    ///     reflectField = reflectField.root;
+    /// }
+    /// reflectField.0vmField
+    /// ```
+    //@formatter:on
+    public static Field getVMField(@JavaType(java.lang.reflect.Field.class) StaticObject reflectField, Meta meta) {
+        StaticObject curField = reflectField;
+        do {
+            Field target = (Field) meta.java_lang_reflect_Field_0vmField.getHiddenObject(curField);
+            if (target != null) {
+                return target;
             }
-        }
-        return target;
+            curField = meta.java_lang_reflect_Field_root.getObject(curField);
+        } while (StaticObject.notNull(curField));
+        CompilerDirectives.transferToInterpreterAndInvalidate();
+        throw EspressoError.shouldNotReachHere("Could not find non-null Field.0vmField");
     }
 
-    @TruffleBoundary
+    @Override
     public final void checkLoadingConstraints(StaticObject loader1, StaticObject loader2) {
         getDeclaringKlass().getContext().getRegistries().checkLoadingConstraint(getType(), loader1, loader2);
     }
+
+    // region FieldAccess impl
+
+    @Override
+    public final boolean shouldEnforceInitializerCheck() {
+        return (getDeclaringKlass().getMeta().getLanguage().getSpecComplianceMode() == EspressoOptions.SpecComplianceMode.STRICT) ||
+                        // HotSpot enforces this only for >= Java 9 (v53) .class files.
+                        getDeclaringClass().getMajorVersion() >= ClassfileParser.JAVA_9_VERSION;
+    }
+
+    // endregion FieldAccess impl
 
     // region Field accesses
 
@@ -230,7 +292,9 @@ public class Field extends Member<Type> implements FieldRef {
             case Long: return getLong(obj, forceVolatile);
             case Double: return getDouble(obj, forceVolatile);
             case Object: return getObject(obj, forceVolatile);
-            default: throw EspressoError.shouldNotReachHere();
+            default:
+                CompilerDirectives.transferToInterpreterAndInvalidate();
+                throw EspressoError.shouldNotReachHere();
         }
         // @formatter:on
     }
@@ -251,7 +315,9 @@ public class Field extends Member<Type> implements FieldRef {
             case Long: setLong(obj, (long) value, forceVolatile); break;
             case Double: setDouble(obj, (double) value, forceVolatile); break;
             case Object: setObject(obj, value, forceVolatile); break;
-            default: throw EspressoError.shouldNotReachHere();
+            default:
+                CompilerDirectives.transferToInterpreterAndInvalidate();
+                throw EspressoError.shouldNotReachHere();
         }
         // @formatter:on
     }
@@ -341,7 +407,7 @@ public class Field extends Member<Type> implements FieldRef {
     // region Object
 
     // region helper methods
-    private Object getObjectHelper(StaticObject obj, boolean forceVolatile) {
+    private Object getHiddenObjectHelper(StaticObject obj, boolean forceVolatile) {
         obj.checkNotForeign();
         assert getDeclaringKlass().isAssignableFrom(obj.getKlass()) : this + " does not exist in " + obj.getKlass();
         if (isVolatile() || forceVolatile) {
@@ -351,13 +417,71 @@ public class Field extends Member<Type> implements FieldRef {
         }
     }
 
+    private Object getObjectHelper(StaticObject obj, boolean forceVolatile) {
+        obj.checkNotForeign();
+        assert getDeclaringKlass().isAssignableFrom(obj.getKlass()) : this + " does not exist in " + obj.getKlass();
+
+        if (!getDeclaringKlass().getContext().anyHierarchyChanged()) {
+            if (isVolatile() || forceVolatile) {
+                return linkedField.getObjectVolatile(obj);
+            } else {
+                return linkedField.getObject(obj);
+            }
+        } else {
+            // class hierarchy changes have been made, so enable
+            // additional type checks to guard against reading
+            // a now invalid value
+            StaticObject result;
+            if (isVolatile() || forceVolatile) {
+                result = (StaticObject) linkedField.getObjectVolatile(obj);
+            } else {
+                result = (StaticObject) linkedField.getObject(obj);
+            }
+            if (result == StaticObject.NULL) {
+                return result;
+            }
+            return checkGetValueValidity(result);
+        }
+    }
+
+    protected StaticObject checkGetValueValidity(StaticObject object) {
+        StaticObject result = object;
+        try {
+            Klass klass = resolveTypeKlass();
+            if (klass != null && !klass.isAssignableFrom((result).getKlass())) {
+                result = StaticObject.NULL;
+            }
+        } catch (EspressoException e) {
+            // ignore if type klass cannot be resolved
+        }
+        return result;
+    }
+
     private void setObjectHelper(StaticObject obj, Object value, boolean forceVolatile) {
         obj.checkNotForeign();
         assert getDeclaringKlass().isAssignableFrom(obj.getKlass()) : this + " does not exist in " + obj.getKlass();
+
+        if (getDeclaringKlass().getContext().anyHierarchyChanged()) {
+            checkSetValueValidity(value);
+        }
         if (isVolatile() || forceVolatile) {
             linkedField.setObjectVolatile(obj, value);
         } else {
             linkedField.setObject(obj, value);
+        }
+    }
+
+    protected void checkSetValueValidity(Object value) {
+        if (value != StaticObject.NULL && value instanceof StaticObject) {
+            Klass klass = null;
+            try {
+                klass = resolveTypeKlass();
+            } catch (EspressoException e) {
+                // ignore if type klass cannot be resolved
+            }
+            if (klass != null && !klass.isAssignableFrom(((StaticObject) value).getKlass())) {
+                throw getDeclaringKlass().getMeta().throwException(getDeclaringKlass().getMeta().java_lang_IncompatibleClassChangeError);
+            }
         }
     }
     // endregion helper methods
@@ -367,79 +491,39 @@ public class Field extends Member<Type> implements FieldRef {
         return getObject(obj, false);
     }
 
-    private StaticObject getObject(StaticObject obj, boolean forceVolatile) {
+    public StaticObject getObject(StaticObject obj, boolean forceVolatile) {
         assert !isHidden() : this + " is hidden, use getHiddenObject";
-        if (linkedField.isRedefineAdded()) {
-            if (hasCompatibleField()) {
-                return getCompatibleField().getObject(obj, forceVolatile);
-            } else {
-                return getExtensionObject(obj).getObject(this, forceVolatile);
-            }
-        } else {
-            return (StaticObject) getObjectHelper(obj, forceVolatile);
-        }
+        return (StaticObject) getObjectHelper(obj, forceVolatile);
     }
 
     public final void setObject(StaticObject obj, Object value) {
         setObject(obj, value, false);
     }
 
-    public final void setObject(StaticObject obj, Object value, boolean forceVolatile) {
+    public void setObject(StaticObject obj, Object value, boolean forceVolatile) {
         assert !isHidden() : this + " is hidden, use setHiddenObject";
-        if (linkedField.isRedefineAdded()) {
-            if (hasCompatibleField()) {
-                getCompatibleField().setObject(obj, value, forceVolatile);
-            } else {
-                getExtensionObject(obj).setObject(this, value, forceVolatile);
-            }
-        } else {
-            setObjectHelper(obj, value, forceVolatile);
-        }
+        setObjectHelper(obj, value, forceVolatile);
     }
 
-    public final StaticObject getAndSetObject(StaticObject obj, StaticObject value) {
+    public StaticObject getAndSetObject(StaticObject obj, StaticObject value) {
         obj.checkNotForeign();
         assert !isHidden() : this + " is hidden";
         assert getDeclaringKlass().isAssignableFrom(obj.getKlass()) : this + " does not exist in " + obj.getKlass();
-        if (linkedField.isRedefineAdded()) {
-            if (hasCompatibleField()) {
-                return getCompatibleField().getAndSetObject(obj, value);
-            } else {
-                return getExtensionObject(obj).getAndSetObject(this, value);
-            }
-        } else {
-            return (StaticObject) linkedField.getAndSetObject(obj, value);
-        }
+        return (StaticObject) linkedField.getAndSetObject(obj, value);
     }
 
-    public final boolean compareAndSwapObject(StaticObject obj, Object before, Object after) {
+    public boolean compareAndSwapObject(StaticObject obj, Object before, Object after) {
         obj.checkNotForeign();
         assert !isHidden() : this + " is hidden";
         assert getDeclaringKlass().isAssignableFrom(obj.getKlass()) : this + " does not exist in " + obj.getKlass();
-        if (linkedField.isRedefineAdded()) {
-            if (hasCompatibleField()) {
-                return getCompatibleField().compareAndSwapObject(obj, before, after);
-            } else {
-                return getExtensionObject(obj).compareAndSwapObject(this, before, after);
-            }
-        } else {
-            return linkedField.compareAndSwapObject(obj, before, after);
-        }
+        return linkedField.compareAndSwapObject(obj, before, after);
     }
 
-    public final StaticObject compareAndExchangeObject(StaticObject obj, Object before, Object after) {
+    public StaticObject compareAndExchangeObject(StaticObject obj, Object before, Object after) {
         obj.checkNotForeign();
         assert !isHidden() : this + " is hidden";
         assert getDeclaringKlass().isAssignableFrom(obj.getKlass()) : this + " does not exist in " + obj.getKlass();
-        if (linkedField.isRedefineAdded()) {
-            if (hasCompatibleField()) {
-                return getCompatibleField().compareAndExchangeObject(obj, before, after);
-            } else {
-                return getExtensionObject(obj).compareAndExchangeObject(this, before, after);
-            }
-        } else {
-            return (StaticObject) linkedField.compareAndExchangeObject(obj, before, after);
-        }
+        return (StaticObject) linkedField.compareAndExchangeObject(obj, before, after);
     }
 
     // region hidden Object
@@ -449,7 +533,7 @@ public class Field extends Member<Type> implements FieldRef {
 
     public final Object getHiddenObject(StaticObject obj, boolean forceVolatile) {
         assert isHidden() : this + " is not hidden, use getObject";
-        return getObjectHelper(obj, forceVolatile);
+        return getHiddenObjectHelper(obj, forceVolatile);
     }
 
     public final void setHiddenObject(StaticObject obj, Object value) {
@@ -460,6 +544,29 @@ public class Field extends Member<Type> implements FieldRef {
         assert isHidden() : this + " is not hidden, use setObject";
         setObjectHelper(obj, value, forceVolatile);
     }
+
+    public final void setMaybeHiddenObject(StaticObject obj, StaticObject value) {
+        setMaybeHiddenObject(obj, value, false);
+    }
+
+    public final void setMaybeHiddenObject(StaticObject obj, StaticObject value, boolean forceVolatile) {
+        setObjectHelper(obj, value, forceVolatile);
+    }
+
+    public final StaticObject getMaybeHiddenObject(StaticObject obj) {
+        return getMaybeHiddenObject(obj, false);
+    }
+
+    public final StaticObject getMaybeHiddenObject(StaticObject obj, boolean forceVolatile) {
+        return (StaticObject) getObjectHelper(obj, forceVolatile);
+    }
+
+    public Object compareAndExchangeHiddenObject(StaticObject obj, Object before, Object after) {
+        obj.checkNotForeign();
+        assert isHidden() : this + " is not hidden";
+        assert getDeclaringKlass().isAssignableFrom(obj.getKlass()) : this + " does not exist in " + obj.getKlass();
+        return linkedField.compareAndExchangeObject(obj, before, after);
+    }
     // endregion Hidden Object
     // endregion Object
 
@@ -468,21 +575,13 @@ public class Field extends Member<Type> implements FieldRef {
         return getBoolean(obj, false);
     }
 
-    public final boolean getBoolean(StaticObject obj, boolean forceVolatile) {
+    public boolean getBoolean(StaticObject obj, boolean forceVolatile) {
         obj.checkNotForeign();
         assert getDeclaringKlass().isAssignableFrom(obj.getKlass()) : this + " does not exist in " + obj.getKlass();
-        if (linkedField.isRedefineAdded()) {
-            if (hasCompatibleField()) {
-                return getCompatibleField().getBoolean(obj, forceVolatile);
-            } else {
-                return getExtensionObject(obj).getBoolean(this, forceVolatile);
-            }
+        if (isVolatile() || forceVolatile) {
+            return linkedField.getBooleanVolatile(obj);
         } else {
-            if (isVolatile() || forceVolatile) {
-                return linkedField.getBooleanVolatile(obj);
-            } else {
-                return linkedField.getBoolean(obj);
-            }
+            return linkedField.getBoolean(obj);
         }
     }
 
@@ -490,48 +589,26 @@ public class Field extends Member<Type> implements FieldRef {
         setBoolean(obj, value, false);
     }
 
-    public final void setBoolean(StaticObject obj, boolean value, boolean forceVolatile) {
+    public void setBoolean(StaticObject obj, boolean value, boolean forceVolatile) {
         obj.checkNotForeign();
         assert getDeclaringKlass().isAssignableFrom(obj.getKlass()) : this + " does not exist in " + obj.getKlass();
-        if (linkedField.isRedefineAdded()) {
-            if (hasCompatibleField()) {
-                getCompatibleField().setBoolean(obj, value, forceVolatile);
-            } else {
-                getExtensionObject(obj).setBoolean(this, value, forceVolatile);
-            }
-        } else if (isVolatile() || forceVolatile) {
+        if (isVolatile() || forceVolatile) {
             linkedField.setBooleanVolatile(obj, value);
         } else {
             linkedField.setBoolean(obj, value);
         }
     }
 
-    public final boolean compareAndSwapBoolean(StaticObject obj, boolean before, boolean after) {
+    public boolean compareAndSwapBoolean(StaticObject obj, boolean before, boolean after) {
         obj.checkNotForeign();
         assert getDeclaringKlass().isAssignableFrom(obj.getKlass()) : this + " does not exist in " + obj.getKlass();
-        if (linkedField.isRedefineAdded()) {
-            if (hasCompatibleField()) {
-                return getCompatibleField().compareAndSwapBoolean(obj, before, after);
-            } else {
-                return getExtensionObject(obj).compareAndSwapBoolean(this, before, after);
-            }
-        } else {
-            return linkedField.compareAndSwapBoolean(obj, before, after);
-        }
+        return linkedField.compareAndSwapBoolean(obj, before, after);
     }
 
-    public final boolean compareAndExchangeBoolean(StaticObject obj, boolean before, boolean after) {
+    public boolean compareAndExchangeBoolean(StaticObject obj, boolean before, boolean after) {
         obj.checkNotForeign();
         assert getDeclaringKlass().isAssignableFrom(obj.getKlass()) : this + " does not exist in " + obj.getKlass();
-        if (linkedField.isRedefineAdded()) {
-            if (hasCompatibleField()) {
-                return getCompatibleField().compareAndExchangeBoolean(obj, before, after);
-            } else {
-                return getExtensionObject(obj).compareAndExchangeBoolean(this, before, after);
-            }
-        } else {
-            return linkedField.compareAndExchangeBoolean(obj, before, after);
-        }
+        return linkedField.compareAndExchangeBoolean(obj, before, after);
     }
     // endregion boolean
 
@@ -540,21 +617,13 @@ public class Field extends Member<Type> implements FieldRef {
         return getByte(obj, false);
     }
 
-    public final byte getByte(StaticObject obj, boolean forceVolatile) {
+    public byte getByte(StaticObject obj, boolean forceVolatile) {
         obj.checkNotForeign();
         assert getDeclaringKlass().isAssignableFrom(obj.getKlass()) : this + " does not exist in " + obj.getKlass();
-        if (linkedField.isRedefineAdded()) {
-            if (hasCompatibleField()) {
-                return getCompatibleField().getByte(obj, forceVolatile);
-            } else {
-                return getExtensionObject(obj).getByte(this, forceVolatile);
-            }
+        if (isVolatile() || forceVolatile) {
+            return linkedField.getByteVolatile(obj);
         } else {
-            if (isVolatile() || forceVolatile) {
-                return linkedField.getByteVolatile(obj);
-            } else {
-                return linkedField.getByte(obj);
-            }
+            return linkedField.getByte(obj);
         }
     }
 
@@ -562,48 +631,26 @@ public class Field extends Member<Type> implements FieldRef {
         setByte(obj, value, false);
     }
 
-    public final void setByte(StaticObject obj, byte value, boolean forceVolatile) {
+    public void setByte(StaticObject obj, byte value, boolean forceVolatile) {
         obj.checkNotForeign();
         assert getDeclaringKlass().isAssignableFrom(obj.getKlass()) : this + " does not exist in " + obj.getKlass();
-        if (linkedField.isRedefineAdded()) {
-            if (hasCompatibleField()) {
-                getCompatibleField().setByte(obj, value, forceVolatile);
-            } else {
-                getExtensionObject(obj).setByte(this, value, forceVolatile);
-            }
-        } else if (isVolatile() || forceVolatile) {
+        if (isVolatile() || forceVolatile) {
             linkedField.setByteVolatile(obj, value);
         } else {
             linkedField.setByte(obj, value);
         }
     }
 
-    public final boolean compareAndSwapByte(StaticObject obj, byte before, byte after) {
+    public boolean compareAndSwapByte(StaticObject obj, byte before, byte after) {
         obj.checkNotForeign();
         assert getDeclaringKlass().isAssignableFrom(obj.getKlass()) : this + " does not exist in " + obj.getKlass();
-        if (linkedField.isRedefineAdded()) {
-            if (hasCompatibleField()) {
-                return getCompatibleField().compareAndSwapByte(obj, before, after);
-            } else {
-                return getExtensionObject(obj).compareAndSwapByte(this, before, after);
-            }
-        } else {
-            return linkedField.compareAndSwapByte(obj, before, after);
-        }
+        return linkedField.compareAndSwapByte(obj, before, after);
     }
 
-    public final byte compareAndExchangeByte(StaticObject obj, byte before, byte after) {
+    public byte compareAndExchangeByte(StaticObject obj, byte before, byte after) {
         obj.checkNotForeign();
         assert getDeclaringKlass().isAssignableFrom(obj.getKlass()) : this + " does not exist in " + obj.getKlass();
-        if (linkedField.isRedefineAdded()) {
-            if (hasCompatibleField()) {
-                return getCompatibleField().compareAndExchangeByte(obj, before, after);
-            } else {
-                return getExtensionObject(obj).compareAndExchangeByte(this, before, after);
-            }
-        } else {
-            return linkedField.compareAndExchangeByte(obj, before, after);
-        }
+        return linkedField.compareAndExchangeByte(obj, before, after);
     }
     // endregion byte
 
@@ -612,21 +659,13 @@ public class Field extends Member<Type> implements FieldRef {
         return getChar(obj, false);
     }
 
-    public final char getChar(StaticObject obj, boolean forceVolatile) {
+    public char getChar(StaticObject obj, boolean forceVolatile) {
         obj.checkNotForeign();
         assert getDeclaringKlass().isAssignableFrom(obj.getKlass()) : this + " does not exist in " + obj.getKlass();
-        if (linkedField.isRedefineAdded()) {
-            if (hasCompatibleField()) {
-                return getCompatibleField().getChar(obj, forceVolatile);
-            } else {
-                return getExtensionObject(obj).getChar(this, forceVolatile);
-            }
+        if (isVolatile() || forceVolatile) {
+            return linkedField.getCharVolatile(obj);
         } else {
-            if (isVolatile() || forceVolatile) {
-                return linkedField.getCharVolatile(obj);
-            } else {
-                return linkedField.getChar(obj);
-            }
+            return linkedField.getChar(obj);
         }
     }
 
@@ -634,48 +673,26 @@ public class Field extends Member<Type> implements FieldRef {
         setChar(obj, value, false);
     }
 
-    public final void setChar(StaticObject obj, char value, boolean forceVolatile) {
+    public void setChar(StaticObject obj, char value, boolean forceVolatile) {
         obj.checkNotForeign();
         assert getDeclaringKlass().isAssignableFrom(obj.getKlass()) : this + " does not exist in " + obj.getKlass();
-        if (linkedField.isRedefineAdded()) {
-            if (hasCompatibleField()) {
-                getCompatibleField().setChar(obj, value, forceVolatile);
-            } else {
-                getExtensionObject(obj).setChar(this, value, forceVolatile);
-            }
-        } else if (isVolatile() || forceVolatile) {
+        if (isVolatile() || forceVolatile) {
             linkedField.setCharVolatile(obj, value);
         } else {
             linkedField.setChar(obj, value);
         }
     }
 
-    public final boolean compareAndSwapChar(StaticObject obj, char before, char after) {
+    public boolean compareAndSwapChar(StaticObject obj, char before, char after) {
         obj.checkNotForeign();
         assert getDeclaringKlass().isAssignableFrom(obj.getKlass()) : this + " does not exist in " + obj.getKlass();
-        if (linkedField.isRedefineAdded()) {
-            if (hasCompatibleField()) {
-                return getCompatibleField().compareAndSwapChar(obj, before, after);
-            } else {
-                return getExtensionObject(obj).compareAndSwapChar(this, before, after);
-            }
-        } else {
-            return linkedField.compareAndSwapChar(obj, before, after);
-        }
+        return linkedField.compareAndSwapChar(obj, before, after);
     }
 
-    public final char compareAndExchangeChar(StaticObject obj, char before, char after) {
+    public char compareAndExchangeChar(StaticObject obj, char before, char after) {
         obj.checkNotForeign();
         assert getDeclaringKlass().isAssignableFrom(obj.getKlass()) : this + " does not exist in " + obj.getKlass();
-        if (linkedField.isRedefineAdded()) {
-            if (hasCompatibleField()) {
-                return getCompatibleField().compareAndExchangeChar(obj, before, after);
-            } else {
-                return getExtensionObject(obj).compareAndExchangeChar(this, before, after);
-            }
-        } else {
-            return linkedField.compareAndExchangeChar(obj, before, after);
-        }
+        return linkedField.compareAndExchangeChar(obj, before, after);
     }
     // endregion char
 
@@ -684,21 +701,13 @@ public class Field extends Member<Type> implements FieldRef {
         return getDouble(obj, false);
     }
 
-    public final double getDouble(StaticObject obj, boolean forceVolatile) {
+    public double getDouble(StaticObject obj, boolean forceVolatile) {
         obj.checkNotForeign();
         assert getDeclaringKlass().isAssignableFrom(obj.getKlass()) : this + " does not exist in " + obj.getKlass();
-        if (linkedField.isRedefineAdded()) {
-            if (hasCompatibleField()) {
-                return getCompatibleField().getDouble(obj, forceVolatile);
-            } else {
-                return getExtensionObject(obj).getDouble(this, forceVolatile);
-            }
+        if (isVolatile() || forceVolatile) {
+            return linkedField.getDoubleVolatile(obj);
         } else {
-            if (isVolatile() || forceVolatile) {
-                return linkedField.getDoubleVolatile(obj);
-            } else {
-                return linkedField.getDouble(obj);
-            }
+            return linkedField.getDouble(obj);
         }
     }
 
@@ -706,48 +715,26 @@ public class Field extends Member<Type> implements FieldRef {
         setDouble(obj, value, false);
     }
 
-    public final void setDouble(StaticObject obj, double value, boolean forceVolatile) {
+    public void setDouble(StaticObject obj, double value, boolean forceVolatile) {
         obj.checkNotForeign();
         assert getDeclaringKlass().isAssignableFrom(obj.getKlass()) : this + " does not exist in " + obj.getKlass();
-        if (linkedField.isRedefineAdded()) {
-            if (hasCompatibleField()) {
-                getCompatibleField().setDouble(obj, value, forceVolatile);
-            } else {
-                getExtensionObject(obj).setDouble(this, value, forceVolatile);
-            }
-        } else if (isVolatile() || forceVolatile) {
+        if (isVolatile() || forceVolatile) {
             linkedField.setDoubleVolatile(obj, value);
         } else {
             linkedField.setDouble(obj, value);
         }
     }
 
-    public final boolean compareAndSwapDouble(StaticObject obj, double before, double after) {
+    public boolean compareAndSwapDouble(StaticObject obj, double before, double after) {
         obj.checkNotForeign();
         assert getDeclaringKlass().isAssignableFrom(obj.getKlass()) : this + " does not exist in " + obj.getKlass();
-        if (linkedField.isRedefineAdded()) {
-            if (hasCompatibleField()) {
-                return getCompatibleField().compareAndSwapDouble(obj, before, after);
-            } else {
-                return getExtensionObject(obj).compareAndSwapDouble(this, before, after);
-            }
-        } else {
-            return linkedField.compareAndSwapDouble(obj, before, after);
-        }
+        return linkedField.compareAndSwapDouble(obj, before, after);
     }
 
-    public final double compareAndExchangeDouble(StaticObject obj, double before, double after) {
+    public double compareAndExchangeDouble(StaticObject obj, double before, double after) {
         obj.checkNotForeign();
         assert getDeclaringKlass().isAssignableFrom(obj.getKlass()) : this + " does not exist in " + obj.getKlass();
-        if (linkedField.isRedefineAdded()) {
-            if (hasCompatibleField()) {
-                return getCompatibleField().compareAndExchangeDouble(obj, before, after);
-            } else {
-                return getExtensionObject(obj).compareAndExchangeDouble(this, before, after);
-            }
-        } else {
-            return linkedField.compareAndExchangeDouble(obj, before, after);
-        }
+        return linkedField.compareAndExchangeDouble(obj, before, after);
     }
     // endregion double
 
@@ -756,21 +743,13 @@ public class Field extends Member<Type> implements FieldRef {
         return getFloat(obj, false);
     }
 
-    public final float getFloat(StaticObject obj, boolean forceVolatile) {
+    public float getFloat(StaticObject obj, boolean forceVolatile) {
         obj.checkNotForeign();
         assert getDeclaringKlass().isAssignableFrom(obj.getKlass()) : this + " does not exist in " + obj.getKlass();
-        if (linkedField.isRedefineAdded()) {
-            if (hasCompatibleField()) {
-                return getCompatibleField().getFloat(obj, forceVolatile);
-            } else {
-                return getExtensionObject(obj).getFloat(this, forceVolatile);
-            }
+        if (isVolatile() || forceVolatile) {
+            return linkedField.getFloatVolatile(obj);
         } else {
-            if (isVolatile() || forceVolatile) {
-                return linkedField.getFloatVolatile(obj);
-            } else {
-                return linkedField.getFloat(obj);
-            }
+            return linkedField.getFloat(obj);
         }
     }
 
@@ -778,48 +757,26 @@ public class Field extends Member<Type> implements FieldRef {
         setFloat(obj, value, false);
     }
 
-    public final void setFloat(StaticObject obj, float value, boolean forceVolatile) {
+    public void setFloat(StaticObject obj, float value, boolean forceVolatile) {
         obj.checkNotForeign();
         assert getDeclaringKlass().isAssignableFrom(obj.getKlass()) : this + " does not exist in " + obj.getKlass();
-        if (linkedField.isRedefineAdded()) {
-            if (hasCompatibleField()) {
-                getCompatibleField().setFloat(obj, value, forceVolatile);
-            } else {
-                getExtensionObject(obj).setFloat(this, value, forceVolatile);
-            }
-        } else if (isVolatile() || forceVolatile) {
+        if (isVolatile() || forceVolatile) {
             linkedField.setFloatVolatile(obj, value);
         } else {
             linkedField.setFloat(obj, value);
         }
     }
 
-    public final boolean compareAndSwapFloat(StaticObject obj, float before, float after) {
+    public boolean compareAndSwapFloat(StaticObject obj, float before, float after) {
         obj.checkNotForeign();
         assert getDeclaringKlass().isAssignableFrom(obj.getKlass()) : this + " does not exist in " + obj.getKlass();
-        if (linkedField.isRedefineAdded()) {
-            if (hasCompatibleField()) {
-                return getCompatibleField().compareAndSwapFloat(obj, before, after);
-            } else {
-                return getExtensionObject(obj).compareAndSwapFloat(this, before, after);
-            }
-        } else {
-            return linkedField.compareAndSwapFloat(obj, before, after);
-        }
+        return linkedField.compareAndSwapFloat(obj, before, after);
     }
 
-    public final float compareAndExchangeFloat(StaticObject obj, float before, float after) {
+    public float compareAndExchangeFloat(StaticObject obj, float before, float after) {
         obj.checkNotForeign();
         assert getDeclaringKlass().isAssignableFrom(obj.getKlass()) : this + " does not exist in " + obj.getKlass();
-        if (linkedField.isRedefineAdded()) {
-            if (hasCompatibleField()) {
-                return getCompatibleField().compareAndExchangeFloat(obj, before, after);
-            } else {
-                return getExtensionObject(obj).compareAndExchangeFloat(this, before, after);
-            }
-        } else {
-            return linkedField.compareAndExchangeFloat(obj, before, after);
-        }
+        return linkedField.compareAndExchangeFloat(obj, before, after);
     }
     // endregion float
 
@@ -828,21 +785,13 @@ public class Field extends Member<Type> implements FieldRef {
         return getInt(obj, false);
     }
 
-    public final int getInt(StaticObject obj, boolean forceVolatile) {
+    public int getInt(StaticObject obj, boolean forceVolatile) {
         obj.checkNotForeign();
         assert getDeclaringKlass().isAssignableFrom(obj.getKlass()) : this + " does not exist in " + obj.getKlass();
-        if (linkedField.isRedefineAdded()) {
-            if (hasCompatibleField()) {
-                return getCompatibleField().getInt(obj, forceVolatile);
-            } else {
-                return getExtensionObject(obj).getInt(this, forceVolatile);
-            }
+        if (isVolatile() || forceVolatile) {
+            return linkedField.getIntVolatile(obj);
         } else {
-            if (isVolatile() || forceVolatile) {
-                return linkedField.getIntVolatile(obj);
-            } else {
-                return linkedField.getInt(obj);
-            }
+            return linkedField.getInt(obj);
         }
     }
 
@@ -850,48 +799,32 @@ public class Field extends Member<Type> implements FieldRef {
         setInt(obj, value, false);
     }
 
-    public final void setInt(StaticObject obj, int value, boolean forceVolatile) {
+    public void setInt(StaticObject obj, int value, boolean forceVolatile) {
         obj.checkNotForeign();
         assert getDeclaringKlass().isAssignableFrom(obj.getKlass()) : this + " does not exist in " + obj.getKlass();
-        if (linkedField.isRedefineAdded()) {
-            if (hasCompatibleField()) {
-                getCompatibleField().setInt(obj, value, forceVolatile);
-            } else {
-                getExtensionObject(obj).setInt(this, value, forceVolatile);
-            }
-        } else if (isVolatile() || forceVolatile) {
+        if (isVolatile() || forceVolatile) {
             linkedField.setIntVolatile(obj, value);
         } else {
             linkedField.setInt(obj, value);
         }
     }
 
-    public final boolean compareAndSwapInt(StaticObject obj, int before, int after) {
+    public int getAndSetInt(StaticObject obj, int value) {
         obj.checkNotForeign();
         assert getDeclaringKlass().isAssignableFrom(obj.getKlass()) : this + " does not exist in " + obj.getKlass();
-        if (linkedField.isRedefineAdded()) {
-            if (hasCompatibleField()) {
-                return getCompatibleField().compareAndSwapInt(obj, before, after);
-            } else {
-                return getExtensionObject(obj).compareAndSwapInt(this, before, after);
-            }
-        } else {
-            return linkedField.compareAndSwapInt(obj, before, after);
-        }
+        return linkedField.getAndSetInt(obj, value);
     }
 
-    public final int compareAndExchangeInt(StaticObject obj, int before, int after) {
+    public boolean compareAndSwapInt(StaticObject obj, int before, int after) {
         obj.checkNotForeign();
         assert getDeclaringKlass().isAssignableFrom(obj.getKlass()) : this + " does not exist in " + obj.getKlass();
-        if (linkedField.isRedefineAdded()) {
-            if (hasCompatibleField()) {
-                return getCompatibleField().compareAndExchangeInt(obj, before, after);
-            } else {
-                return getExtensionObject(obj).compareAndExchangeInt(this, before, after);
-            }
-        } else {
-            return linkedField.compareAndExchangeInt(obj, before, after);
-        }
+        return linkedField.compareAndSwapInt(obj, before, after);
+    }
+
+    public int compareAndExchangeInt(StaticObject obj, int before, int after) {
+        obj.checkNotForeign();
+        assert getDeclaringKlass().isAssignableFrom(obj.getKlass()) : this + " does not exist in " + obj.getKlass();
+        return linkedField.compareAndExchangeInt(obj, before, after);
     }
     // endregion int
 
@@ -900,22 +833,14 @@ public class Field extends Member<Type> implements FieldRef {
         return getLong(obj, false);
     }
 
-    public final long getLong(StaticObject obj, boolean forceVolatile) {
+    public long getLong(StaticObject obj, boolean forceVolatile) {
         obj.checkNotForeign();
         assert getDeclaringKlass().isAssignableFrom(obj.getKlass()) : this + " does not exist in " + obj.getKlass();
         assert getKind().needsTwoSlots();
-        if (linkedField.isRedefineAdded()) {
-            if (hasCompatibleField()) {
-                return getCompatibleField().getLong(obj, forceVolatile);
-            } else {
-                return getExtensionObject(obj).getLong(this, forceVolatile);
-            }
+        if (isVolatile() || forceVolatile) {
+            return linkedField.getLongVolatile(obj);
         } else {
-            if (isVolatile() || forceVolatile) {
-                return linkedField.getLongVolatile(obj);
-            } else {
-                return linkedField.getLong(obj);
-            }
+            return linkedField.getLong(obj);
         }
     }
 
@@ -923,50 +848,35 @@ public class Field extends Member<Type> implements FieldRef {
         setLong(obj, value, false);
     }
 
-    public final void setLong(StaticObject obj, long value, boolean forceVolatile) {
+    public void setLong(StaticObject obj, long value, boolean forceVolatile) {
         obj.checkNotForeign();
         assert getDeclaringKlass().isAssignableFrom(obj.getKlass()) : this + " does not exist in " + obj.getKlass();
         assert getKind().needsTwoSlots();
-        if (linkedField.isRedefineAdded()) {
-            if (hasCompatibleField()) {
-                getCompatibleField().setLong(obj, value, forceVolatile);
-            } else {
-                getExtensionObject(obj).setLong(this, value, forceVolatile);
-            }
-        } else if (isVolatile() || forceVolatile) {
+        if (isVolatile() || forceVolatile) {
             linkedField.setLongVolatile(obj, value);
         } else {
             linkedField.setLong(obj, value);
         }
     }
 
-    public final boolean compareAndSwapLong(StaticObject obj, long before, long after) {
+    public long getAndSetLong(StaticObject obj, long value) {
         obj.checkNotForeign();
         assert getDeclaringKlass().isAssignableFrom(obj.getKlass()) : this + " does not exist in " + obj.getKlass();
         assert getKind().needsTwoSlots();
-        if (linkedField.isRedefineAdded()) {
-            if (hasCompatibleField()) {
-                return getCompatibleField().compareAndSwapLong(obj, before, after);
-            } else {
-                return getExtensionObject(obj).compareAndSwapLong(this, before, after);
-            }
-        } else {
-            return linkedField.compareAndSwapLong(obj, before, after);
-        }
+        return linkedField.getAndSetLong(obj, value);
     }
 
-    public final long compareAndExchangeLong(StaticObject obj, long before, long after) {
+    public boolean compareAndSwapLong(StaticObject obj, long before, long after) {
         obj.checkNotForeign();
         assert getDeclaringKlass().isAssignableFrom(obj.getKlass()) : this + " does not exist in " + obj.getKlass();
-        if (linkedField.isRedefineAdded()) {
-            if (hasCompatibleField()) {
-                return getCompatibleField().compareAndExchangeLong(obj, before, after);
-            } else {
-                return getExtensionObject(obj).compareAndExchangeLong(this, before, after);
-            }
-        } else {
-            return linkedField.compareAndExchangeLong(obj, before, after);
-        }
+        assert getKind().needsTwoSlots();
+        return linkedField.compareAndSwapLong(obj, before, after);
+    }
+
+    public long compareAndExchangeLong(StaticObject obj, long before, long after) {
+        obj.checkNotForeign();
+        assert getDeclaringKlass().isAssignableFrom(obj.getKlass()) : this + " does not exist in " + obj.getKlass();
+        return linkedField.compareAndExchangeLong(obj, before, after);
     }
     // endregion long
 
@@ -975,21 +885,13 @@ public class Field extends Member<Type> implements FieldRef {
         return getShort(obj, false);
     }
 
-    public final short getShort(StaticObject obj, boolean forceVolatile) {
+    public short getShort(StaticObject obj, boolean forceVolatile) {
         obj.checkNotForeign();
         assert getDeclaringKlass().isAssignableFrom(obj.getKlass()) : this + " does not exist in " + obj.getKlass();
-        if (linkedField.isRedefineAdded()) {
-            if (hasCompatibleField()) {
-                return getCompatibleField().getShort(obj, forceVolatile);
-            } else {
-                return getExtensionObject(obj).getShort(this, forceVolatile);
-            }
+        if (isVolatile() || forceVolatile) {
+            return linkedField.getShortVolatile(obj);
         } else {
-            if (isVolatile() || forceVolatile) {
-                return linkedField.getShortVolatile(obj);
-            } else {
-                return linkedField.getShort(obj);
-            }
+            return linkedField.getShort(obj);
         }
     }
 
@@ -997,82 +899,35 @@ public class Field extends Member<Type> implements FieldRef {
         setShort(obj, value, false);
     }
 
-    public final void setShort(StaticObject obj, short value, boolean forceVolatile) {
+    public void setShort(StaticObject obj, short value, boolean forceVolatile) {
         obj.checkNotForeign();
         assert getDeclaringKlass().isAssignableFrom(obj.getKlass()) : this + " does not exist in " + obj.getKlass();
-        if (linkedField.isRedefineAdded()) {
-            if (hasCompatibleField()) {
-                getCompatibleField().setShort(obj, value, forceVolatile);
-            } else {
-                getExtensionObject(obj).setShort(this, value, forceVolatile);
-            }
-        } else if (isVolatile() || forceVolatile) {
+        if (isVolatile() || forceVolatile) {
             linkedField.setShortVolatile(obj, value);
         } else {
             linkedField.setShort(obj, value);
         }
     }
 
-    public final boolean compareAndSwapShort(StaticObject obj, short before, short after) {
+    public boolean compareAndSwapShort(StaticObject obj, short before, short after) {
         obj.checkNotForeign();
         assert getDeclaringKlass().isAssignableFrom(obj.getKlass()) : this + " does not exist in " + obj.getKlass();
-        if (linkedField.isRedefineAdded()) {
-            if (hasCompatibleField()) {
-                return getCompatibleField().compareAndSwapShort(obj, before, after);
-            } else {
-                return getExtensionObject(obj).compareAndSwapShort(this, before, after);
-            }
-        } else {
-            return linkedField.compareAndSwapShort(obj, before, after);
-        }
+        return linkedField.compareAndSwapShort(obj, before, after);
     }
 
-    public final short compareAndExchangeShort(StaticObject obj, short before, short after) {
+    public short compareAndExchangeShort(StaticObject obj, short before, short after) {
         obj.checkNotForeign();
         assert getDeclaringKlass().isAssignableFrom(obj.getKlass()) : this + " does not exist in " + obj.getKlass();
-        if (linkedField.isRedefineAdded()) {
-            if (hasCompatibleField()) {
-                return getCompatibleField().compareAndExchangeShort(obj, before, after);
-            } else {
-                return getExtensionObject(obj).compareAndExchangeShort(this, before, after);
-            }
-        } else {
-            return linkedField.compareAndExchangeShort(obj, before, after);
-        }
+        return linkedField.compareAndExchangeShort(obj, before, after);
     }
     // endregion short
-
-    private ExtensionFieldObject getExtensionObject(StaticObject instance) {
-        ExtensionFieldObject extensionFieldObject;
-        if (isStatic()) {
-            extensionFieldObject = getDeclaringKlass().getStaticExtensionFieldObject();
-        } else {
-            Field extensionField = holder.getKlass().getMeta().HIDDEN_OBJECT_EXTENSION_FIELD;
-            Object object = extensionField.getHiddenObject(instance);
-            if (object == null) {
-                // create new instance Extension field object
-                synchronized (instance) {
-                    object = extensionField.getHiddenObject(instance);
-                    if (object == null) {
-                        extensionFieldObject = new ExtensionFieldObject();
-                        extensionField.setHiddenObject(instance, extensionFieldObject);
-                    } else {
-                        extensionFieldObject = (ExtensionFieldObject) object;
-                    }
-                }
-            } else {
-                extensionFieldObject = (ExtensionFieldObject) object;
-            }
-        }
-        return extensionFieldObject;
-    }
 
     // endregion Field accesses
 
     // region jdwp-specific
     @Override
     public final byte getTagConstant() {
-        return getKind().toTagConstant();
+        return TagConstants.toTagConstant(getKind());
     }
 
     @Override
@@ -1156,9 +1011,14 @@ public class Field extends Member<Type> implements FieldRef {
                     // remove index 1, but keep info at index 0
                     temp[0] = infos[0];
                     infos = temp;
-                    return;
                 }
         }
+    }
+
+    @Override
+    public void disposeFieldBreakpoint() {
+        hasActiveBreakpoints.set(false);
+        infos = null;
     }
 
     public void setCompatibleField(@SuppressWarnings("unused") Field field) {
@@ -1173,8 +1033,54 @@ public class Field extends Member<Type> implements FieldRef {
         return null;
     }
 
-    public StaticShape<ExtensionFieldObject.ExtensionFieldObjectFactory> getExtensionShape() {
-        return null;
+    @TruffleBoundary
+    public StaticObject makeMirror(Meta meta) {
+        StaticObject instance = meta.java_lang_reflect_Field.allocateInstance(meta.getContext());
+
+        Attribute rawRuntimeVisibleAnnotations = getAttribute(Names.RuntimeVisibleAnnotations);
+        StaticObject runtimeVisibleAnnotations = rawRuntimeVisibleAnnotations != null
+                        ? StaticObject.wrap(rawRuntimeVisibleAnnotations.getData(), meta)
+                        : StaticObject.NULL;
+
+        Attribute rawRuntimeVisibleTypeAnnotations = getAttribute(Names.RuntimeVisibleTypeAnnotations);
+        StaticObject runtimeVisibleTypeAnnotations = rawRuntimeVisibleTypeAnnotations != null
+                        ? StaticObject.wrap(rawRuntimeVisibleTypeAnnotations.getData(), meta)
+                        : StaticObject.NULL;
+        if (meta.getJavaVersion().java15OrLater()) {
+            meta.java_lang_reflect_Field_init.invokeDirectSpecial(
+                            /* this */ instance,
+                            /* declaringKlass */ getDeclaringKlass().mirror(),
+                            /* name */ meta.getStrings().intern(getName()),
+                            /* type */ resolveTypeKlass().mirror(),
+                            /* modifiers */ getModifiers(),
+                            /* trustedFinal */ isTrustedFinal(),
+                            /* slot */ getSlot(),
+                            /* signature */ meta.toGuestString(getRawGenericSignature()),
+                            /* annotations */ runtimeVisibleAnnotations);
+        } else {
+            meta.java_lang_reflect_Field_init.invokeDirectSpecial(
+                            /* this */ instance,
+                            /* declaringKlass */ getDeclaringKlass().mirror(),
+                            /* name */ meta.getStrings().intern(getName()),
+                            /* type */ resolveTypeKlass().mirror(),
+                            /* modifiers */ getModifiers(),
+                            /* slot */ getSlot(),
+                            /* signature */ meta.toGuestString(getRawGenericSignature()),
+                            /* annotations */ runtimeVisibleAnnotations);
+        }
+        meta.java_lang_reflect_Field_0vmField.setHiddenObject(instance, this);
+        meta.java_lang_reflect_Field_0runtimeVisibleTypeAnnotations.setHiddenObject(instance, runtimeVisibleTypeAnnotations);
+        return instance;
+    }
+
+    public int getConstantValueIndex() {
+        ConstantValueAttribute a = getAttribute(ConstantValueAttribute.NAME, ConstantValueAttribute.class);
+        if (a == null) {
+            return 0;
+        }
+        int constantValueIndex = a.getConstantValueIndex();
+        assert constantValueIndex != 0;
+        return constantValueIndex;
     }
 
     /**
@@ -1214,5 +1120,152 @@ public class Field extends Member<Type> implements FieldRef {
             }
         }
     }
+
     // endregion jdwp-specific
+    private static final KeysArray<String> ALL_MEMBERS;
+    private static final Set<String> READABLE_MEMBERS_SET;
+    private static final Set<String> INVOCABLE_MEMBERS_SET;
+
+    static {
+        String[] readableMembers = {
+                        ReadMember.FLAGS,
+                        ReadMember.OFFSET,
+                        ReadMember.NAME,
+                        ReadMember.TYPE,
+                        ReadMember.HOLDER,
+                        ReadMember.CONSTANT_VALUE_INDEX,
+        };
+        String[] invocableMembers = {
+                        InvokeMember.READ,
+        };
+        READABLE_MEMBERS_SET = Set.of(readableMembers);
+        INVOCABLE_MEMBERS_SET = Set.of(invocableMembers);
+        String[] allMembers = new String[readableMembers.length + invocableMembers.length];
+        System.arraycopy(readableMembers, 0, allMembers, 0, readableMembers.length);
+        System.arraycopy(invocableMembers, 0, allMembers, readableMembers.length, invocableMembers.length);
+        ALL_MEMBERS = new KeysArray<>(allMembers);
+    }
+
+    @ExportMessage
+    abstract static class ReadMember {
+        static final String FLAGS = "flags";
+        static final String OFFSET = "offset";
+        static final String NAME = "name";
+        static final String TYPE = "type";
+        static final String HOLDER = "holder";
+        static final String CONSTANT_VALUE_INDEX = "constantValueIndex";
+
+        @Specialization(guards = "FLAGS.equals(member)")
+        static int getFlags(Field receiver, @SuppressWarnings("unused") String member) {
+            assert EspressoLanguage.get(null).isExternalJVMCIEnabled();
+            return receiver.getFlags();
+        }
+
+        @Specialization(guards = "OFFSET.equals(member)")
+        static int getOffset(Field receiver, @SuppressWarnings("unused") String member,
+                        @Bind Node node) {
+            assert EspressoLanguage.get(node).isExternalJVMCIEnabled();
+            return Target_sun_misc_Unsafe.getGuestFieldOffset(receiver, EspressoLanguage.get(node));
+        }
+
+        @Specialization(guards = "NAME.equals(member)")
+        static String getName(Field receiver, @SuppressWarnings("unused") String member) {
+            assert EspressoLanguage.get(null).isExternalJVMCIEnabled();
+            return receiver.getNameAsString();
+        }
+
+        @Specialization(guards = "TYPE.equals(member)")
+        static String getType(Field receiver, @SuppressWarnings("unused") String member) {
+            assert EspressoLanguage.get(null).isExternalJVMCIEnabled();
+            return receiver.getType().toString();
+        }
+
+        @Specialization(guards = "HOLDER.equals(member)")
+        static ObjectKlass holder(Field receiver, @SuppressWarnings("unused") String member) {
+            assert EspressoLanguage.get(null).isExternalJVMCIEnabled();
+            return receiver.getDeclaringKlass();
+        }
+
+        @Specialization(guards = "CONSTANT_VALUE_INDEX.equals(member)")
+        static int getConstantValueIndex(Field receiver, @SuppressWarnings("unused") String member) {
+            assert EspressoLanguage.get(null).isExternalJVMCIEnabled();
+            return receiver.getConstantValueIndex();
+        }
+
+        @Fallback
+        @SuppressWarnings("unused")
+        public static Object doUnknown(Field receiver, String member) throws UnknownIdentifierException {
+            throw UnknownIdentifierException.create(member);
+        }
+    }
+
+    @ExportMessage
+    abstract static class InvokeMember {
+        static final String READ = "read";
+
+        @Specialization(guards = "READ.equals(member)")
+        static Object read(Field field, @SuppressWarnings("unused") String member, Object[] arguments,
+                        @Bind Node node,
+                        @Cached InlinedBranchProfile typeError,
+                        @Cached InlinedBranchProfile arityError) throws ArityException, UnsupportedTypeException {
+            assert field != null;
+            assert EspressoLanguage.get(node).isExternalJVMCIEnabled();
+            if (arguments.length != 1) {
+                arityError.enter(node);
+                throw ArityException.create(1, 1, arguments.length);
+            }
+            StaticObject receiver;
+            if (field.isStatic()) {
+                receiver = field.getDeclaringKlass().getStatics();
+            } else if (arguments[0] instanceof StaticObject providedReceiver) {
+                receiver = providedReceiver;
+            } else {
+                typeError.enter(node);
+                throw UnsupportedTypeException.create(arguments, "Expected an espresso object");
+            }
+            return field.get(receiver);
+        }
+
+        @Fallback
+        @SuppressWarnings("unused")
+        static Object doUnknown(Field receiver, String member, Object[] arguments) throws UnknownIdentifierException {
+            throw UnknownIdentifierException.create(member);
+        }
+    }
+
+    @ExportMessage
+    @TruffleBoundary
+    @SuppressWarnings("static-method")
+    public boolean isMemberReadable(String member) {
+        return READABLE_MEMBERS_SET.contains(member);
+    }
+
+    @ExportMessage
+    @TruffleBoundary
+    @SuppressWarnings("static-method")
+    public boolean isMemberInvocable(String member) {
+        return INVOCABLE_MEMBERS_SET.contains(member);
+    }
+
+    @ExportMessage
+    @SuppressWarnings("static-method")
+    public boolean hasMembers() {
+        return true;
+    }
+
+    @ExportMessage
+    @SuppressWarnings("static-method")
+    public Object getMembers(@SuppressWarnings("unused") boolean includeInternal) {
+        return ALL_MEMBERS;
+    }
+
+    @ExportMessage
+    public TriState isIdenticalOrUndefined(Object other) {
+        return TriState.valueOf(this == other);
+    }
+
+    @ExportMessage
+    public int identityHashCode() {
+        return System.identityHashCode(this);
+    }
 }

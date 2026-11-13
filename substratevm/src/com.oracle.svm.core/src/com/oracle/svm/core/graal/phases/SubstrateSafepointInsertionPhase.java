@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2015, 2020, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2015, 2026, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -24,30 +24,37 @@
  */
 package com.oracle.svm.core.graal.phases;
 
-import org.graalvm.compiler.nodes.ReturnNode;
-import org.graalvm.compiler.nodes.SafepointNode;
-import org.graalvm.compiler.nodes.StructuredGraph;
-import org.graalvm.compiler.phases.common.LoopSafepointInsertionPhase;
-import org.graalvm.compiler.phases.tiers.MidTierContext;
+import org.graalvm.nativeimage.ImageInfo;
+import org.graalvm.nativeimage.Platform;
+import org.graalvm.nativeimage.Platforms;
 import org.graalvm.nativeimage.c.function.CFunction;
 import org.graalvm.nativeimage.c.function.InvokeCFunctionPointer;
-import org.graalvm.util.DirectAnnotationAccess;
 
-import com.oracle.svm.core.annotate.Uninterruptible;
+import com.oracle.svm.core.SkipEpilogueSafepointCheck;
+import com.oracle.svm.core.UninterruptibleAnnotationUtils;
 import com.oracle.svm.core.graal.code.SubstrateBackend;
-import com.oracle.svm.core.meta.SharedMethod;
+import com.oracle.svm.jvmci.shared.meta.SharedMethod;
+import com.oracle.svm.util.GuestAnnotationAccess;
+
+import jdk.graal.compiler.nodes.ReturnNode;
+import jdk.graal.compiler.nodes.SafepointNode;
+import jdk.graal.compiler.nodes.StructuredGraph;
+import jdk.graal.compiler.phases.common.LoopSafepointInsertionPhase;
+import jdk.graal.compiler.phases.tiers.MidTierContext;
+import jdk.vm.ci.meta.ResolvedJavaMethod;
 
 /**
  * Adds safepoints to loops and at method ends.
  */
 public class SubstrateSafepointInsertionPhase extends LoopSafepointInsertionPhase {
 
-    public static boolean needSafepointCheck(SharedMethod method) {
-        if (Uninterruptible.Utils.isUninterruptible(method)) {
+    @Platforms(Platform.HOSTED_ONLY.class)
+    public static boolean needSafepointCheck(ResolvedJavaMethod method) {
+        if (UninterruptibleAnnotationUtils.isUninterruptible(method)) {
             /* Uninterruptible methods must not have a safepoint inserted. */
             return false;
         }
-        if (DirectAnnotationAccess.isAnnotationPresent(method, CFunction.class) || DirectAnnotationAccess.isAnnotationPresent(method, InvokeCFunctionPointer.class)) {
+        if (GuestAnnotationAccess.isAnnotationPresent(method, CFunction.class) || GuestAnnotationAccess.isAnnotationPresent(method, InvokeCFunctionPointer.class)) {
             /*
              * Methods transferring from Java to C have an implicit safepoint check as part of the
              * transition from C back to Java. So no explicit end-of-method safepoint check needs to
@@ -59,20 +66,35 @@ public class SubstrateSafepointInsertionPhase extends LoopSafepointInsertionPhas
         return true;
     }
 
-    @Override
-    protected void run(StructuredGraph graph, MidTierContext context) {
+    /**
+     * Determines if this (potentially special) method needs safepoint checks.
+     */
+    public static boolean needsSafepointCheck(StructuredGraph graph) {
         SharedMethod method = (SharedMethod) graph.method();
-        if (!needSafepointCheck(method)) {
-            return;
-        }
+        return method.needSafepointCheck();
+    }
 
-        if (!((SubstrateBackend) context.getTargetProvider()).safepointCheckedInEpilogue(method)) {
+    /**
+     * Insert SVM specific safepoints at the method end if necessary.
+     */
+    public static void insertMethodEndSafepoints(StructuredGraph graph, MidTierContext context) {
+        SharedMethod method = (SharedMethod) graph.method();
+        if (!((SubstrateBackend) context.getTargetProvider()).safepointCheckedInEpilogue(method) &&
+                        (ImageInfo.inImageRuntimeCode() || !GuestAnnotationAccess.isAnnotationPresent(method, SkipEpilogueSafepointCheck.class))) {
             /* Insert method-end safepoints. */
             for (ReturnNode returnNode : graph.getNodes(ReturnNode.TYPE)) {
                 SafepointNode safepointNode = graph.add(new SafepointNode());
                 graph.addBeforeFixed(returnNode, safepointNode);
             }
         }
+    }
+
+    @Override
+    protected void run(StructuredGraph graph, MidTierContext context) {
+        if (!needsSafepointCheck(graph)) {
+            return;
+        }
+        insertMethodEndSafepoints(graph, context);
 
         /* Insert loop safepoints. */
         super.run(graph, context);

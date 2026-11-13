@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2021, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2021, 2026, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * The Universal Permissive License (UPL), Version 1.0
@@ -60,29 +60,26 @@ import org.junit.AfterClass;
 import org.junit.BeforeClass;
 import org.junit.Test;
 
+import com.oracle.truffle.api.CallTarget;
 import com.oracle.truffle.api.CompilerDirectives;
 import com.oracle.truffle.api.CompilerDirectives.TruffleBoundary;
 import com.oracle.truffle.api.TruffleLanguage;
 import com.oracle.truffle.api.TruffleLanguage.Env;
 import com.oracle.truffle.api.TruffleLanguage.Registration;
 import com.oracle.truffle.api.exception.AbstractTruffleException;
+import com.oracle.truffle.api.frame.VirtualFrame;
 import com.oracle.truffle.api.interop.InteropLibrary;
 import com.oracle.truffle.api.interop.TruffleObject;
 import com.oracle.truffle.api.library.ExportLibrary;
 import com.oracle.truffle.api.library.ExportMessage;
+import com.oracle.truffle.api.nodes.RootNode;
 import com.oracle.truffle.api.utilities.TriState;
 import com.oracle.truffle.tck.tests.ValueAssert;
-import com.oracle.truffle.tck.tests.TruffleTestAssumptions;
 
 public class ContextSharingTest {
 
     private static Context context;
     private static Context secondaryContext;
-
-    @BeforeClass
-    public static void runWithWeakEncapsulationOnly() {
-        TruffleTestAssumptions.assumeWeakEncapsulation();
-    }
 
     @BeforeClass
     public static void setUp() {
@@ -96,9 +93,19 @@ public class ContextSharingTest {
 
     @AfterClass
     public static void tearDown() {
-        if (context != null) {
-            context.close();
-            secondaryContext.close();
+        try {
+            if (context != null) {
+                context.close();
+            }
+        } finally {
+            try {
+                if (secondaryContext != null) {
+                    secondaryContext.close();
+                }
+            } finally {
+                context = null;
+                secondaryContext = null;
+            }
         }
     }
 
@@ -243,6 +250,31 @@ public class ContextSharingTest {
         }
     }
 
+    @ExportLibrary(InteropLibrary.class)
+    @SuppressWarnings("static-method")
+    static final class GetGuestReference implements TruffleObject {
+
+        @ExportMessage
+        @TruffleBoundary
+        Object execute(Object[] args) {
+            return new RelayObject((TruffleObject) args[0]);
+        }
+
+        @ExportMessage
+        boolean isExecutable() {
+            return true;
+        }
+    }
+
+    @ExportLibrary(value = InteropLibrary.class, delegateTo = "delegate")
+    static final class RelayObject implements TruffleObject {
+        final TruffleObject delegate;
+
+        RelayObject(TruffleObject delegate) {
+            this.delegate = delegate;
+        }
+    }
+
     @Test
     public void testThreadCheck() throws InterruptedException, ExecutionException {
         ExecutorService service = Executors.newCachedThreadPool();
@@ -252,7 +284,15 @@ public class ContextSharingTest {
         Context multiThread = createContext(true);
         multiThread.initialize(MULTI_THREAD);
         ExecutableWaits executable = new ExecutableWaits();
-        Value stValue = singleThread.asValue(executable);
+        /*
+         * We have to make sure stValue is a guest value. singleThread.asValue(executable) produces
+         * a guest value only in case of a non-isolated context. In case of an isolated context, the
+         * returned value is just a host value with no relation to the guest, so executing it would
+         * not add to the thread count of the guest language. Going through the GetGuestReference
+         * makes stValue a guest RelayObject to the host value which is exactly what we need.
+         */
+        Value getGuestReference = singleThread.eval(SINGLE_THREAD, "");
+        Value stValue = getGuestReference.execute(singleThread.asValue(executable));
         Value mtStValue = multiThread.asValue(stValue);
 
         assertTrue(stValue.canExecute());
@@ -265,7 +305,9 @@ public class ContextSharingTest {
         // wait until execute is entered.
         executable.enterLatch.await();
 
-        AbstractPolyglotTest.assertFails(() -> stValue.canExecute(), IllegalStateException.class);
+        AbstractPolyglotTest.assertFails(() -> stValue.canExecute(), IllegalStateException.class, (e) -> {
+            assertTrue(e.getMessage(), e.getMessage().startsWith("Multi threaded access requested by thread "));
+        });
         AbstractPolyglotTest.assertFails(() -> mtStValue.canExecute(), PolyglotException.class, (e) -> {
             assertTrue(e.isHostException());
             assertTrue(e.asHostException() instanceof IllegalStateException);
@@ -299,6 +341,16 @@ public class ContextSharingTest {
             return singleThreaded;
         }
 
+        @Override
+        protected CallTarget parse(ParsingRequest request) throws Exception {
+            RootNode rootNode = new RootNode(this) {
+                @Override
+                public Object execute(VirtualFrame frame) {
+                    return new GetGuestReference();
+                }
+            };
+            return rootNode.getCallTarget();
+        }
     }
 
     @Registration(id = MULTI_THREAD, name = MULTI_THREAD)
@@ -376,6 +428,20 @@ public class ContextSharingTest {
     }
 
     @Test
+    public void testTransitiveValueMigrationPreservesDelegateContext() {
+        try (Context c0 = createContext(true);
+                        Context c1 = createContext(true);
+                        Context c2 = createContext(true)) {
+            Value c0Value = c0.asValue(new IdentityExecutable(c0));
+            Value c1Value = c1.asValue(c0Value);
+            Value c2Value = c2.asValue(c1Value);
+
+            assertTrue(c2Value.canExecute());
+            assertEquals(42, c2Value.execute(42).asInt());
+        }
+    }
+
+    @Test
     public void testSharingDisabled() {
         try (Context c0 = createContext(true);
                         Context c1 = createContext(false);) {
@@ -407,6 +473,13 @@ public class ContextSharingTest {
             AbstractPolyglotTest.assertFails(() -> {
                 c1.asValue(c0ValueProxy);
             }, PolyglotException.class, ContextSharingTest::assertMigrationError);
+
+            Value identity = c1.asValue(new IdentityExecutable(c1));
+            assertEquals(42, identity.execute(c1.asValue(42)).asInt());
+            assertEquals(43L, identity.execute(c1.asValue(43L)).asLong());
+            for (Value argument : new Value[]{c0ValueInt, c0.asValue(43L), Value.asValue(42)}) {
+                AbstractPolyglotTest.assertFails(() -> identity.execute(argument), PolyglotException.class, ContextSharingTest::assertMigrationError);
+            }
         }
     }
 

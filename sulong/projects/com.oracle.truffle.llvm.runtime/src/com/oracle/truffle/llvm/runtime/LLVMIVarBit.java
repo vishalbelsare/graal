@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2016, 2021, Oracle and/or its affiliates.
+ * Copyright (c) 2016, 2026, Oracle and/or its affiliates.
  *
  * All rights reserved.
  *
@@ -133,8 +133,11 @@ public abstract class LLVMIVarBit {
     }
 
     public static LLVMIVarBit fromBigInteger(int bits, BigInteger from) {
-        assert bits > LLVMIVarBitSmall.MAX_SIZE;
-        return LLVMIVarBitLarge.asIVar(bits, from);
+        if (bits <= LLVMIVarBitSmall.MAX_SIZE) {
+            return LLVMIVarBitSmall.asIVar(bits, from);
+        } else {
+            return LLVMIVarBitLarge.asIVar(bits, from);
+        }
     }
 
     public static LLVMIVarBit fromByte(int bits, byte from) {
@@ -190,7 +193,7 @@ public abstract class LLVMIVarBit {
             byte[] value = new byte[(bits + 7) >> 3];
             for (int i = 0; i < bits; i++) {
                 if (from.getValue(i)) {
-                    value[value.length - 1 - (i >> 3)] |= 1 << (i & 7);
+                    value[value.length - 1 - (i >> 3)] |= (byte) (1 << (i & 7));
                 }
             }
             return LLVMIVarBitLarge.create(bits, value, bits, false);

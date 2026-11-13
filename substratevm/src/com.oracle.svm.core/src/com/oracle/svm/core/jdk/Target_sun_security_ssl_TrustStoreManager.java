@@ -30,21 +30,53 @@ import java.security.cert.X509Certificate;
 import java.util.Set;
 
 import org.graalvm.nativeimage.ImageSingletons;
-import org.graalvm.nativeimage.hosted.Feature;
-import org.graalvm.nativeimage.hosted.RuntimeClassInitialization;
+import com.oracle.svm.util.JVMCIRuntimeClassInitializationSupport;
 
+import com.oracle.svm.core.FutureDefaultsOptions;
 import com.oracle.svm.core.annotate.Alias;
-import com.oracle.svm.core.annotate.AutomaticFeature;
 import com.oracle.svm.core.annotate.Delete;
 import com.oracle.svm.core.annotate.RecomputeFieldValue;
 import com.oracle.svm.core.annotate.Substitute;
 import com.oracle.svm.core.annotate.TargetClass;
-import com.oracle.svm.core.util.VMError;
-import com.oracle.svm.util.ReflectionUtil;
+import com.oracle.svm.shared.feature.AutomaticallyRegisteredFeature;
+import com.oracle.svm.core.feature.InternalFeature;
+import com.oracle.svm.core.imagelayer.ImageLayerBuildingSupport;
+import com.oracle.svm.shared.singletons.traits.BuiltinTraits.RuntimeAccessOnly;
+import com.oracle.svm.shared.singletons.traits.BuiltinTraits.SingleLayer;
+import com.oracle.svm.shared.singletons.traits.SingletonLayeredInstallationKind.InitialLayerOnly;
+import com.oracle.svm.shared.singletons.traits.SingletonTraits;
+import com.oracle.svm.shared.util.VMError;
+import com.oracle.svm.shared.util.ReflectionUtil;
 
-// Checkstyle: stop
 import sun.security.ssl.SSLLogger;
-// Checkstyle: resume
+
+@TargetClass(className = TrustStoreManagerFeature.TRUST_STORE_MANAGER_CLASS_NAME)
+final class Target_sun_security_ssl_TrustStoreManager {
+    /*
+     * This singleton object caches the last retrieved trusted KeyStore and set of trusted
+     * certificates.
+     */
+    @Alias @RecomputeFieldValue(kind = RecomputeFieldValue.Kind.NewInstance, declClassName = TrustStoreManagerFeature.TRUST_STORE_MANAGER_CLASS_NAME +
+                    "$TrustAnchorManager") private static Target_sun_security_ssl_TrustStoreManager_TrustAnchorManager tam;
+
+    @Substitute
+    private static Set<X509Certificate> getTrustedCerts() throws Exception {
+        Target_sun_security_ssl_TrustStoreManager_TrustStoreDescriptor runtimeDescriptor = TrustStoreManagerSupport.getRuntimeTrustStoreDescriptor();
+        if (runtimeDescriptor == null) {
+            return ImageSingletons.lookup(TrustStoreManagerSupport.class).buildtimeTrustedCerts;
+        }
+        return tam.getTrustedCerts(runtimeDescriptor);
+    }
+
+    @Substitute
+    private static KeyStore getTrustedKeyStore() throws Exception {
+        Target_sun_security_ssl_TrustStoreManager_TrustStoreDescriptor runtimeDescriptor = TrustStoreManagerSupport.getRuntimeTrustStoreDescriptor();
+        if (runtimeDescriptor == null) {
+            return ImageSingletons.lookup(TrustStoreManagerSupport.class).buildtimeTrustedKeyStore;
+        }
+        return tam.getKeyStore(runtimeDescriptor);
+    }
+}
 
 /**
  * Root certificates in native image are fixed/embedded into the image, at image build time, based
@@ -55,29 +87,31 @@ import sun.security.ssl.SSLLogger;
  * Users are also allowed to override the embedded root certificate at run time by setting the
  * `javax.net.ssl.trustStore*` system properties. For more details about both buildtime and runtime
  * certificate management, please refer to <a href=
- * "https://www.graalvm.org/reference-manual/native-image/CertificateManagement/">CertificateManagement.md</a>.
+ * "https://www.graalvm.org/dev/reference-manual/native-image/dynamic-features/CertificateManagement/">CertificateManagement.md</a>.
  *
  * <p>
  * For embedding the build time root certificates, the implementation "freezes" the return values of
  * TrustStoreManager managers by invoking them at image build time (using reflection because the
  * class is non-public) and returning the frozen values using a substitution.
  */
-@AutomaticFeature
-final class TrustStoreManagerFeature implements Feature {
+@AutomaticallyRegisteredFeature
+final class TrustStoreManagerFeature implements InternalFeature {
 
     static final String TRUST_STORE_MANAGER_CLASS_NAME = "sun.security.ssl.TrustStoreManager";
 
     @Override
     public void afterRegistration(AfterRegistrationAccess access) {
-        try {
-            Class<?> trustStoreManagerClass = access.findClassByName(TRUST_STORE_MANAGER_CLASS_NAME);
-            @SuppressWarnings("unchecked")
-            Set<X509Certificate> trustedCerts = (Set<X509Certificate>) ReflectionUtil.lookupMethod(trustStoreManagerClass, "getTrustedCerts").invoke(null);
-            KeyStore trustedKeyStore = (KeyStore) ReflectionUtil.lookupMethod(trustStoreManagerClass, "getTrustedKeyStore").invoke(null);
+        if (ImageLayerBuildingSupport.firstImageBuild()) {
+            try {
+                Class<?> trustStoreManagerClass = access.findClassByName(TRUST_STORE_MANAGER_CLASS_NAME);
+                @SuppressWarnings("unchecked")
+                Set<X509Certificate> trustedCerts = (Set<X509Certificate>) ReflectionUtil.lookupMethod(trustStoreManagerClass, "getTrustedCerts").invoke(null);
+                KeyStore trustedKeyStore = (KeyStore) ReflectionUtil.lookupMethod(trustStoreManagerClass, "getTrustedKeyStore").invoke(null);
 
-            ImageSingletons.add(TrustStoreManagerSupport.class, new TrustStoreManagerSupport(trustedCerts, trustedKeyStore));
-        } catch (ReflectiveOperationException ex) {
-            throw VMError.shouldNotReachHere(ex);
+                ImageSingletons.add(TrustStoreManagerSupport.class, new TrustStoreManagerSupport(trustedCerts, trustedKeyStore));
+            } catch (ReflectiveOperationException ex) {
+                throw VMError.shouldNotReachHere(ex);
+            }
         }
 
         /*
@@ -89,16 +123,21 @@ final class TrustStoreManagerFeature implements Feature {
          * Note when a runtime certificate file is specified, we still honor/use the build time
          * lib/security/blacklisted.certs file
          */
-        RuntimeClassInitialization.initializeAtBuildTime(sun.security.util.UntrustedCertificates.class);
-        /*
-         * All security providers must be registered (and initialized) at buildtime (see
-         * SecuritySubstitutions.java). XMLDSigRI is used for validating XML Signatures from
-         * certificate files while generating X509Certificates.
-         */
-        RuntimeClassInitialization.initializeAtBuildTime(org.jcp.xml.dsig.internal.dom.XMLDSigRI.class);
+        JVMCIRuntimeClassInitializationSupport rci = JVMCIRuntimeClassInitializationSupport.singleton();
+        rci.initializeAtBuildTime("sun.security.util.UntrustedCertificates", "Required for TrustStoreManager");
+        if (!FutureDefaultsOptions.securityProvidersInitializedAtRunTime()) {
+            /*
+             * All security providers must be registered (and initialized) at buildtime (see
+             * SecuritySubstitutions.java). XMLDSigRI is used for validating XML Signatures from
+             * certificate files while generating X509Certificates.
+             */
+            rci.initializeAtBuildTime("org.jcp.xml.dsig.internal.dom.XMLDSigRI", "Required for TrustStoreManager");
+            rci.initializeAtBuildTime("org.jcp.xml.dsig.internal.dom.XMLDSigRI$ProviderService", "Required for TrustStoreManager");
+        }
     }
 }
 
+@SingletonTraits(access = RuntimeAccessOnly.class, layeredCallbacks = SingleLayer.class, layeredInstallationKind = InitialLayerOnly.class)
 final class TrustStoreManagerSupport {
 
     final Set<X509Certificate> buildtimeTrustedCerts;
@@ -131,7 +170,7 @@ final class TrustStoreManagerSupport {
         if (storePropName == null) {
             throw VMError.unsupportedFeature(
                             "System property javax.net.ssl.trustStore must be also set if any of javax.net.ssl.trustStore(Type|Provider|Password) are set." +
-                                            "See https://www.graalvm.org/reference-manual/native-image/CertificateManagement#runtime-options for more details about runtime certificate management.");
+                                            "See https://www.graalvm.org/dev/reference-manual/native-image/dynamic-features/CertificateManagement/#runtime-options for more details about runtime certificate management.");
         }
 
         /* Setting remaining properties to defaults if unset. */
@@ -154,7 +193,7 @@ final class TrustStoreManagerSupport {
          */
         if (descriptor == null) {
             throw VMError.unsupportedFeature("Inaccessible trust store: " + storePropName +
-                            " See https://www.graalvm.org/reference-manual/native-image/CertificateManagement#runtime-options for more details about runtime certificate management.");
+                            "See https://www.graalvm.org/dev/reference-manual/native-image/dynamic-features/CertificateManagement/#runtime-options for more details about runtime certificate management.");
         }
 
         return descriptor;
@@ -195,34 +234,6 @@ final class TrustStoreManagerSupport {
                         storePropPassword, temporaryFile, temporaryTime);
     }
 
-}
-
-@TargetClass(className = TrustStoreManagerFeature.TRUST_STORE_MANAGER_CLASS_NAME)
-final class Target_sun_security_ssl_TrustStoreManager {
-    /*
-     * This singleton object caches the last retrieved trusted KeyStore and set of trusted
-     * certificates.
-     */
-    @Alias @RecomputeFieldValue(kind = RecomputeFieldValue.Kind.NewInstance, declClassName = TrustStoreManagerFeature.TRUST_STORE_MANAGER_CLASS_NAME +
-                    "$TrustAnchorManager") private static Target_sun_security_ssl_TrustStoreManager_TrustAnchorManager tam;
-
-    @Substitute
-    private static Set<X509Certificate> getTrustedCerts() throws Exception {
-        Target_sun_security_ssl_TrustStoreManager_TrustStoreDescriptor runtimeDescriptor = TrustStoreManagerSupport.getRuntimeTrustStoreDescriptor();
-        if (runtimeDescriptor == null) {
-            return ImageSingletons.lookup(TrustStoreManagerSupport.class).buildtimeTrustedCerts;
-        }
-        return tam.getTrustedCerts(runtimeDescriptor);
-    }
-
-    @Substitute
-    private static KeyStore getTrustedKeyStore() throws Exception {
-        Target_sun_security_ssl_TrustStoreManager_TrustStoreDescriptor runtimeDescriptor = TrustStoreManagerSupport.getRuntimeTrustStoreDescriptor();
-        if (runtimeDescriptor == null) {
-            return ImageSingletons.lookup(TrustStoreManagerSupport.class).buildtimeTrustedKeyStore;
-        }
-        return tam.getKeyStore(runtimeDescriptor);
-    }
 }
 
 @TargetClass(className = TrustStoreManagerFeature.TRUST_STORE_MANAGER_CLASS_NAME, innerClass = "TrustStoreDescriptor")

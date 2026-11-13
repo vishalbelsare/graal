@@ -20,16 +20,15 @@
  * or visit www.oracle.com if you need additional information or have any
  * questions.
  */
-
 package com.oracle.truffle.espresso.nodes.quick.interop;
 
 import com.oracle.truffle.api.frame.VirtualFrame;
-import com.oracle.truffle.espresso.bytecode.Bytecodes;
-import com.oracle.truffle.espresso.nodes.BytecodeNode;
+import com.oracle.truffle.espresso.classfile.bytecode.Bytecodes;
+import com.oracle.truffle.espresso.nodes.EspressoFrame;
 import com.oracle.truffle.espresso.nodes.bytecodes.DoubleArrayStore;
 import com.oracle.truffle.espresso.nodes.bytecodes.DoubleArrayStoreNodeGen;
 import com.oracle.truffle.espresso.nodes.quick.QuickNode;
-import com.oracle.truffle.espresso.runtime.StaticObject;
+import com.oracle.truffle.espresso.runtime.staticobject.StaticObject;
 
 /**
  * @see DoubleArrayStore
@@ -46,10 +45,10 @@ public final class DoubleArrayStoreQuickNode extends QuickNode {
     }
 
     @Override
-    public int execute(VirtualFrame frame) {
-        double value = BytecodeNode.popDouble(frame, top - 1);
-        int index = BytecodeNode.popInt(frame, top - 3);
-        StaticObject array = nullCheck(BytecodeNode.popObject(frame, top - 4));
+    public int execute(VirtualFrame frame, boolean isContinuationResume) {
+        double value = EspressoFrame.popDouble(frame, top - 1);
+        int index = EspressoFrame.popInt(frame, top - 3);
+        StaticObject array = nullCheck(EspressoFrame.popObject(frame, top - 4));
         doubleArrayStore.execute(array, index, value);
         return stackEffectOf_DASTORE;
     }

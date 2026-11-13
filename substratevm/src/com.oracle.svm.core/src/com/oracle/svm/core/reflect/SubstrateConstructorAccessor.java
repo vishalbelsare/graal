@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2021, 2021, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2021, 2026, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -24,42 +24,79 @@
  */
 package com.oracle.svm.core.reflect;
 
-// Checkstyle: allow reflection
-
 import java.lang.reflect.Executable;
 
-import org.graalvm.nativeimage.c.function.CFunctionPointer;
+import org.graalvm.nativeimage.Platform;
+import org.graalvm.nativeimage.Platforms;
 
-import com.oracle.svm.core.annotate.InvokeJavaFunctionPointer;
-import com.oracle.svm.core.jdk.InternalVMMethod;
-import com.oracle.svm.core.util.VMError;
+import com.oracle.svm.core.classinitialization.EnsureClassInitializedNode;
+import com.oracle.svm.core.hub.DynamicHub;
+import com.oracle.svm.guest.staging.meta.MethodRef;
+import com.oracle.svm.core.meta.MethodRefUtils;
+import com.oracle.svm.core.reflect.ReflectionAccessorHolder.MethodInvokeFunctionPointer;
 
-@InternalVMMethod
-public abstract class SubstrateConstructorAccessor {
+import jdk.internal.reflect.ConstructorAccessor;
+import jdk.internal.vm.annotation.Hidden;
+import jdk.vm.ci.meta.ResolvedJavaMethod;
 
-    interface ConstructorNewInstanceFunctionPointer extends CFunctionPointer {
-        /** Must match the signature of {@link ReflectionAccessorHolder#newInstancePrototype}. */
-        @InvokeJavaFunctionPointer
-        Object invoke(Object[] args);
+public final class SubstrateConstructorAccessor extends SubstrateAccessor implements ConstructorAccessor {
+
+    private final Class<?> declaringClass;
+    private final MethodRef factoryMethodTarget;
+
+    @Platforms(Platform.HOSTED_ONLY.class) //
+    private final ResolvedJavaMethod factoryMethod;
+
+    public SubstrateConstructorAccessor(Executable member, MethodRef expandSignature, MethodRef directTarget, ResolvedJavaMethod targetMethod, MethodRef factoryMethodTarget,
+                    ResolvedJavaMethod factoryMethod, DynamicHub initializeBeforeInvoke) {
+        super(member, expandSignature, directTarget, targetMethod, initializeBeforeInvoke);
+        Class<?> constructorDeclaringClass = member.getDeclaringClass();
+        this.declaringClass = constructorDeclaringClass;
+        this.factoryMethodTarget = factoryMethodTarget;
+        this.factoryMethod = factoryMethod;
     }
 
-    private final Executable member;
-    private final CFunctionPointer newInstanceFunctionPointer;
-
-    protected SubstrateConstructorAccessor(Executable member, CFunctionPointer newInstanceFunctionPointer) {
-        this.member = member;
-        this.newInstanceFunctionPointer = newInstanceFunctionPointer;
+    @Platforms(Platform.HOSTED_ONLY.class)
+    public ResolvedJavaMethod getFactoryMethod() {
+        return factoryMethod;
     }
 
+    @Override
     public Object newInstance(Object[] args) {
-        ConstructorNewInstanceFunctionPointer functionPointer = (ConstructorNewInstanceFunctionPointer) this.newInstanceFunctionPointer;
-        if (functionPointer.isNull()) {
-            throw newInstanceError();
+        if (initializeBeforeInvoke != null) {
+            EnsureClassInitializedNode.ensureClassInitialized(DynamicHub.toClass(initializeBeforeInvoke));
         }
-        return functionPointer.invoke(args);
+        return ((MethodInvokeFunctionPointer) getExpandSignature()).invoke(null, args, MethodRefUtils.asCodePointer(factoryMethodTarget));
     }
 
-    private RuntimeException newInstanceError() {
-        throw VMError.shouldNotReachHere("No SubstrateConstructorAccessor.newInstanceFunctionPointer for " + member);
+    /**
+     * This variant of {@link #newInstance(Object[])} is @Hidden. This is important when this is
+     * called as part of the method handle implementation where this frame is not expected to
+     * appear.
+     */
+    @Hidden
+    public Object methodHandleNewInstance(Object[] args) {
+        if (initializeBeforeInvoke != null) {
+            EnsureClassInitializedNode.ensureClassInitialized(DynamicHub.toClass(initializeBeforeInvoke));
+        }
+        return ((MethodInvokeFunctionPointer) getExpandSignature()).invoke(null, args, MethodRefUtils.asCodePointer(factoryMethodTarget));
+    }
+
+    public static void checkReceiver(Class<?> declaringClass, Object obj) {
+        if (obj == null) {
+            throw new NullPointerException();
+        } else if (!declaringClass.isInstance(obj)) {
+            throw new IllegalArgumentException("Receiver type " + obj.getClass().getName() + " is not an instance of the constructor's declaring class " + declaringClass.getName());
+        }
+    }
+
+    @Override
+    @Hidden
+    public Object methodHandleInvokeSpecial(Object obj, Object[] args) {
+        if (initializeBeforeInvoke != null) {
+            EnsureClassInitializedNode.ensureClassInitialized(DynamicHub.toClass(initializeBeforeInvoke));
+        }
+        checkReceiver(declaringClass, obj);
+        return super.methodHandleInvokeSpecial(obj, args);
     }
 }

@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2021, 2021, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2021, 2026, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * The Universal Permissive License (UPL), Version 1.0
@@ -40,23 +40,27 @@
  */
 package com.oracle.truffle.regex.tregex.test;
 
-import com.oracle.truffle.regex.tregex.string.Encodings;
+import java.util.Map;
+
 import org.junit.Assert;
 import org.junit.Test;
 
+import com.oracle.truffle.regex.flavor.ruby.RbErrorMessages;
+import com.oracle.truffle.regex.tregex.string.Encoding;
+
 public class RubyTests extends RegexTestBase {
 
+    private static final Map<String, String> ENGINE_OPTIONS = Map.of("regexDummyLang.Flavor", "Ruby");
+    private static final Map<String, String> OPT_IGNORE_ATOMIC_GROUPS = Map.of("regexDummyLang.IgnoreAtomicGroups", "true");
+
     @Override
-    String getEngineOptions() {
-        return "Flavor=Ruby,IgnoreAtomicGroups=true";
+    Map<String, String> getEngineOptions() {
+        return ENGINE_OPTIONS;
     }
 
-    void testUTF8(String pattern, String flags, String input, int fromIndex, boolean isMatch, int... captureGroupBounds) {
-        testBytes(pattern, flags, Encodings.UTF_8, input, fromIndex, isMatch, captureGroupBounds);
-    }
-
-    void testLatin1(String pattern, String flags, String input, int fromIndex, boolean isMatch, int... captureGroupBounds) {
-        testBytes(pattern, flags, Encodings.LATIN_1, input, fromIndex, isMatch, captureGroupBounds);
+    @Override
+    Encoding getTRegexEncoding() {
+        return Encoding.UTF_16;
     }
 
     @Test
@@ -213,7 +217,7 @@ public class RubyTests extends RegexTestBase {
         test("f{2,2}", "i", "\ufb00", 0, false);
 
         // Test that we bail out on strings with complex unfoldings.
-        Assert.assertTrue(compileRegex(new String(new char[100]).replace('\0', 'f'), "i").isNull());
+        expectUnsupported(new String(new char[100]).replace('\0', 'f'), "i");
     }
 
     @Test
@@ -221,15 +225,15 @@ public class RubyTests extends RegexTestBase {
         // https://bugs.ruby-lang.org/issues/18009
         for (int i = 0; i < 26; i++) {
             String input = String.valueOf((char) ('a' + i));
-            testUTF8("\\W", "i", input, 0, false);
-            testUTF8("[^\\w]", "i", input, 0, false);
-            testUTF8("[[^\\w]]", "i", input, 0, false);
-            testUTF8("[^[^\\w]]", "i", input, 0, true, 0, 1);
+            test("\\W", "i", Encoding.UTF_8, input, 0, false);
+            test("[^\\w]", "i", Encoding.UTF_8, input, 0, false);
+            test("[[^\\w]]", "i", Encoding.UTF_8, input, 0, false);
+            test("[^[^\\w]]", "i", Encoding.UTF_8, input, 0, true, 0, 1);
         }
 
-        testUTF8("[\\w]", "i", "\u212a", 0, false);
-        testUTF8("[kx]", "i", "\u212a", 0, true, 0, 3);
-        testUTF8("[\\w&&kx]", "i", "\u212a", 0, true, 0, 3);
+        test("[\\w]", "i", Encoding.UTF_8, "\u212a", 0, false);
+        test("[kx]", "i", Encoding.UTF_8, "\u212a", 0, true, 0, 3);
+        test("[\\w&&kx]", "i", Encoding.UTF_8, "\u212a", 0, true, 0, 3);
     }
 
     @Test
@@ -299,7 +303,7 @@ public class RubyTests extends RegexTestBase {
     @Test
     public void caseClosureDoesntEscapeEncodingRange() {
         // This shouldn't throw an AssertionError because of encountering the 'st' ligature.
-        testLatin1("test", "i", "test", 0, true, 0, 4);
+        test("test", "i", Encoding.LATIN_1, "test", 0, true, 0, 4);
     }
 
     @Test
@@ -326,9 +330,9 @@ public class RubyTests extends RegexTestBase {
     public void inverseOfUnicodeCharClassInSmallerEncoding() {
         // check(eval('/\A[[:^alpha:]0]\z/'), %w(0 1 .), "a") from test_posix_bracket in
         // test/mri/tests/ruby/test_regexp.rb
-        testLatin1("\\A[[:^alpha:]0]\\z", "", "0", 0, true, 0, 1);
-        testLatin1("\\A[[:^alpha:]0]\\z", "", "1", 0, true, 0, 1);
-        testLatin1("\\A[[:^alpha:]0]\\z", "", "a", 0, false);
+        test("\\A[[:^alpha:]0]\\z", "", Encoding.LATIN_1, "0", 0, true, 0, 1);
+        test("\\A[[:^alpha:]0]\\z", "", Encoding.LATIN_1, "1", 0, true, 0, 1);
+        test("\\A[[:^alpha:]0]\\z", "", Encoding.LATIN_1, "a", 0, false);
     }
 
     @Test
@@ -342,7 +346,7 @@ public class RubyTests extends RegexTestBase {
 
     @Test
     public void ignoreAtomicGroups() {
-        test("(?>foo)", "", "foo", 0, true, 0, 3);
+        test("(?>foo)", "", OPT_IGNORE_ATOMIC_GROUPS, "foo", 0, true, 0, 3);
     }
 
     @Test
@@ -377,5 +381,316 @@ public class RubyTests extends RegexTestBase {
                         "              | (?-mix:(?<width>(?-mix:\\d+|(?-mix:\\*(?-mix:(\\d+)\\$)?))))? (?-mix:\\.(?<precision>(?-mix:\\d+|(?-mix:\\*(?-mix:(\\d+)\\$)?))))? (?-mix:\\{(?<name>\\w+)\\})\n" +
                         "            )", "x").getMember("groupCount").asInt());
         // Checkstyle: resume line length
+    }
+
+    @Test
+    public void github4435() {
+        // In extended mode, a newline always ends a comment, even when preceded by a backslash.
+        test("(a) # c\\\n(b)", "x", "ab", 0, true, 0, 2, 0, 1, 1, 2);
+        test("(x # c\\\n)", "x", "x", 0, true, 0, 1, 0, 1);
+    }
+
+    @Test
+    public void beginningAnchor() {
+        test("\\Ga", "", "a", 0, true, 0, 1);
+        test("\\Ga", "", "ba", 0, false);
+        test("\\Ga", "", "ba", 1, true, 1, 2);
+
+        test("\\Ga|\\Gb", "", "a", 0, true, 0, 1);
+        test("\\Ga|\\Gb", "", "b", 0, true, 0, 1);
+        test("\\Ga|\\Gb", "", "cab", 0, false);
+        test("\\Ga|\\Gb", "", "cab", 1, true, 1, 2);
+        test("\\Ga|\\Gb", "", "cab", 2, true, 2, 3);
+    }
+
+    @Test
+    public void nonRecursiveSubexpressionCalls() {
+        // numeric subexpression calls
+        test("(a)\\g<1>", "", "aa", 0, true, 0, 2, 1, 2);
+        // named subexpression calls
+        test("(?<foo>foo.)bar\\g<foo>", "", "foo1barfoo2", 0, true, 0, 11, 7, 11);
+        test("(?<three_digits>[0-9]{3})-\\g<three_digits>", "", "123-456", 0, true, 0, 7, 4, 7);
+        // chained calls
+        test("(?<digit>\\d)-(?<two_digits>\\g<digit>\\g<digit>)-(?<five_digits>\\g<two_digits>\\g<digit>\\g<two_digits>)", "", "1-23-45678", 0, true, 0, 10, 9, 10, 8, 10, 5, 10);
+        // with forward references
+        test("\\g<1>(a)", "", "aa", 0, true, 0, 2, 1, 2);
+        test("\\g<foo>bar(?<foo>foo.)", "", "foo1barfoo2", 0, true, 0, 11, 7, 11);
+        test("\\g<three_digits>-(?<three_digits>[0-9]{3})", "", "123-456", 0, true, 0, 7, 4, 7);
+        test("(?<five_digits>\\g<two_digits>\\g<digit>\\g<two_digits>)-(?<two_digits>\\g<digit>\\g<digit>)-(?<digit>\\d)", "", "12345-67-8", 0, true, 0, 10, 0, 5, 6, 8, 9, 10);
+        // quantifier of called group is not copied
+        test("(a)+b\\g<1>b", "", "aaabab", 0, true, 0, 6, 4, 5);
+        test("(a)+b\\g<1>b", "", "aaabaaab", 0, false);
+        // quantifier of subexpression call is preserved
+        test("(a)\\g<1>+", "", "aaaa", 0, true, 0, 4, 3, 4);
+        // quantifier of subexpression call replaced quantifier of called group
+        test("(a)?b\\g<1>+", "", "abaaa", 0, true, 0, 5, 4, 5);
+        test("(a)?b\\g<1>+", "", "ab", 0, false);
+    }
+
+    @Test
+    public void recursiveSubexpressionCalls() {
+        expectUnsupported("(a\\g<1>?)(b\\g<2>?)");
+        expectUnsupported("(?<a>a\\g<b>?)(?<b>b\\g<a>?)");
+        expectUnsupported("a\\g<0>?");
+    }
+
+    @Test
+    public void atomicGroups() {
+        test("(?>foo)(?>bar)", "", "foobar", 0, true, 0, 6);
+        test("(?>foo*)obar", "", "foooooooobar", 0, false);
+
+        // quantifiers on atomic groups
+        test("\\A\\s*([0-9]+(?>\\.[0-9a-zA-Z]+)*(-[0-9A-Za-z-]+(\\.[0-9A-Za-z-]+)*)?)?\\s*\\z", "", "0.a", 0, true, 0, 3, 0, 3, -1, -1, -1, -1);
+    }
+
+    @Test
+    public void quantifiersOnLookarounds() {
+        // CRuby doesn't rerun looped lookaround assertions, even though they could be updating the
+        // state on each run. Currently, TRegex does the same on the examples below.
+
+        // ?
+        // test("(?<=(a))?", "", "a", 1, true, 1, 1, 0, 1);
+        test("(?=(a))?", "", "a", 0, true, 0, 0, 0, 1);
+        test("(?=\\2()|(a))?", "", "a", 0, true, 0, 0, -1, -1, 0, 1);
+        test("(?=\\2()|\\3()|(a))?", "", "a", 0, true, 0, 0, -1, -1, -1, -1, 0, 1);
+
+        // *
+        test("(?<=(a))*", "", "a", 1, true, 1, 1, 0, 1);
+        test("(?=(a))*", "", "a", 0, true, 0, 0, 0, 1);
+        test("(?=\\2()|(a))*", "", "a", 0, true, 0, 0, -1, -1, 0, 1);
+        test("(?=\\2()|\\3()|(a))*", "", "a", 0, true, 0, 0, -1, -1, -1, -1, 0, 1);
+
+        // +
+        test("(?<=(a))*", "", "a", 1, true, 1, 1, 0, 1);
+        test("(?=(a))*", "", "a", 0, true, 0, 0, 0, 1);
+        test("(?=\\2()|(a))*", "", "a", 0, true, 0, 0, -1, -1, 0, 1);
+        test("(?=\\2()|\\3()|(a))*", "", "a", 0, true, 0, 0, -1, -1, -1, -1, 0, 1);
+
+        // {2}
+        test("(?<=(a)){2}", "", "a", 1, true, 1, 1, 0, 1);
+        test("(?=(a)){2}", "", "a", 0, true, 0, 0, 0, 1);
+        test("(?=\\2()|(a)){2}", "", "a", 0, true, 0, 0, -1, -1, 0, 1);
+        test("(?=\\2()|\\3()|(a)){2}", "", "a", 0, true, 0, 0, -1, -1, -1, -1, 0, 1);
+
+        // {3}
+        test("(?<=(a))*", "", "a", 1, true, 1, 1, 0, 1);
+        test("(?=(a))*", "", "a", 0, true, 0, 0, 0, 1);
+        test("(?=\\2()|(a))*", "", "a", 0, true, 0, 0, -1, -1, 0, 1);
+        test("(?=\\2()|\\3()|(a))*", "", "a", 0, true, 0, 0, -1, -1, -1, -1, 0, 1);
+    }
+
+    @Test
+    public void possessiveQuantifiers() {
+        test("fooA++bar", "", "fooAAAbar", 0, true, 0, 9);
+        test("fooA++Abar", "", "fooAAAbar", 0, false);
+        test("fooA?+Abar", "", "fooAAAbar", 0, false);
+        test("fooA*+Abar", "", "fooAAAbar", 0, false);
+
+        // Intervals cannot be possessive, the + is treated as another quantifier
+        test("foo(A{0,1}+)Abar", "", "fooAAAbar", 0, true, 0, 9, 3, 5);
+    }
+
+    @Test
+    public void backreferencesHomonymousCaptureGroups() {
+        // Homonymous capture groups can be referenced using backreferences.
+        test("(?<x>a)\\k<x>(?<x>a)", "", "aaa", 0, true, 0, 3, 0, 1, 2, 3);
+        // Named forward references are not allowed.
+        expectSyntaxError("(\\k<x>|(?<x>a))+", "", "undefined name <x> reference");
+        // A named backreference can only use the values matched by capture groups that precede
+        // it lexically (i.e. named forward references do not work).
+        test("(?<x>.)((?<y>\\k<x>)|(?<x>a))+", "", "-aa", 0, true, 0, 3, 0, 1, -1, -1, 2, 3);
+        // A named backreference can match the contents of any (preceding) capture groups that has
+        // the same name.
+        test("(?<x>a)?(?<x>b)?\\k<x>", "", "bb", 0, true, 0, 2, -1, -1, 0, 1);
+        test("(?<x>a)?(?<x>b)?\\k<x>", "", "aa", 0, true, 0, 2, 0, 1, -1, -1);
+        // Lexical order, not index of match nor length of match, determines the priority of
+        // choosing the referent.
+        test("(?=a(?<x>ab))(?<x>a)ab\\k<x>", "", "aabab", 0, true, 0, 4, 1, 3, 0, 1);
+        test("(?<x>a)ab(?<=a(?<x>ab))\\k<x>", "", "aabab", 0, true, 0, 5, 0, 1, 1, 3);
+        // When the higher priority referent cannot be matched, the next highest is tried.
+        // This is currently broken in CRuby (https://bugs.ruby-lang.org/issues/18631).
+        test("(?<x>a)ab(?<=a(?<x>ab))\\k<x>", "", "aaba", 0, true, 0, 4, 0, 1, 1, 3);
+    }
+
+    @Test
+    public void gr37962() {
+        // Minimal test case.
+        test("^(?>(aa)?)+$", "", "a", 0, false);
+        // Original test case.
+        String a1000 = new String(new char[1000]).replace('\0', 'a');
+        String a500 = new String(new char[500]).replace('\0', 'a');
+        test("^(?>(?=a)(" + a1000 + "|))++$", "", a500, 0, false);
+    }
+
+    @Test
+    public void nfaTraversalTests() {
+        // This relies on correctly maneuvering through the necessary capture groups in the
+        // NFATraversalRegexASTVisitor. Since Ruby's empty checks monitor capture groups, capture
+        // group updates are stored in quantifier guards and correctly pruning the traversal
+        // relies on respecting the quantifier guards.
+        test("(?:|())(?:|())(?:|())(?:|())(?:|())(?:|())(?:|())(?:|())\\3\\5\\7", "", "", 0, true, 0, 0, -1, -1, -1, -1, 0, 0, -1, -1, 0, 0, -1, -1, 0, 0, -1, -1);
+        // This tests that it is OK to not update a looping capture group on a transition that
+        // escapes from it. This should be fine, because the last iteration to match the empty
+        // string in the loop will update the capture group and therefore not use the escape
+        // transition. The escape transition will only be taken after the next iteration, because
+        // only then the empty check will fail. At that point, it is OK not to update the capture
+        // group data, because it was already updated by the previous iteration.
+        test("()*", "", "", 0, true, 0, 0, 0, 0);
+        test("(a|)*", "", "a", 0, true, 0, 1, 1, 1);
+    }
+
+    @Test
+    public void gr39214() {
+        // Compiling a Regexp with a backreference inside an atomic group should not crash.
+        test("()(?>\\1)", "", "", 0, true, 0, 0, 0, 0);
+    }
+
+    @Test
+    public void gr41489() {
+        expectUnsupported("\\((?>[^)(]+|\\g<0>)*\\)");
+    }
+
+    @Test
+    public void quantifierOverflow() {
+        long max = Integer.MAX_VALUE;
+        test(String.format("x{%d,%d}", max, max + 1), "", "x", 0, false);
+        test(String.format("x{%d,}", max), "", "x", 0, false);
+        test(String.format("x{%d,}", max + 1), "", "x", 0, false);
+        expectSyntaxError(String.format("x{%d,%d}", max + 1, max), "", RbErrorMessages.MIN_REPEAT_GREATER_THAN_MAX_REPEAT);
+    }
+
+    @Test
+    public void testConditionalBackReferencesWithLookArounds() {
+        /// Test temporal ordering of lookaround assertions and conditional back-references in DFAs.
+        test("(?=(?(1)a|b))(b)", "", "b", 0, true, 0, 1, 0, 1);
+        test("(?=x(?(1)a|b))(x)b", "", "xb", 0, true, 0, 2, 0, 1);
+        test("(?=xy(?(1)a|b))(x)yb", "", "xyb", 0, true, 0, 3, 0, 1);
+        test("(?=(a))(?(1)a|b)", "", "a", 0, true, 0, 1, 0, 1);
+        test("(?=a(x))(?(1)a|b)x", "", "ax", 0, true, 0, 2, 1, 2);
+        test("(?=ax(y))(?(1)a|b)xy", "", "axy", 0, true, 0, 3, 2, 3);
+        test("(?(1)a|b)(?<=(b))", "", "b", 0, true, 0, 1, 0, 1);
+        test("x(?(1)a|b)(?<=(x)b)", "", "xb", 0, true, 0, 2, 0, 1);
+        test("xy(?(1)a|b)(?<=(x)yb)", "", "xyb", 0, true, 0, 3, 0, 1);
+
+        // Conditional back-reference and capture group within lookahead.
+        test("(?=(a)(?(1)a|b))", "", "aa", 0, true, 0, 0, 0, 1);
+        test("(?=(a)x(?(1)a|b))", "", "axa", 0, true, 0, 0, 0, 1);
+        test("(?=(a)xy(?(1)a|b))", "", "axya", 0, true, 0, 0, 0, 1);
+        test("(?=(?(1)a|b)())", "", "b", 0, true, 0, 0, 1, 1);
+    }
+
+    @Test
+    public void gh3167() {
+        // https://github.com/oracle/truffleruby/issues/3167
+        String pattern = "\n" +
+                        "        (?<open>\\s*\\(\\s*) {0}\n" +
+                        "        (?<close>\\s*\\)\\s*) {0}\n" +
+                        "        (?<name>\\s*\"(?<class_name>\\w+)\") {0}\n" +
+                        "        (?<parent>\\s*(?:\n" +
+                        "          (?<parent_name>[\\w\\*\\s\\(\\)\\.\\->]+) |\n" +
+                        "          rb_path2class\\s*\\(\\s*\"(?<path>[\\w:]+)\"\\s*\\)\n" +
+                        "        )) {0}\n" +
+                        "        (?<under>\\w+) {0}\n" +
+                        "\n" +
+                        "        (?<var_name>[\\w\\.]+)\\s* =\n" +
+                        "        \\s*rb_(?:\n" +
+                        "          define_(?:\n" +
+                        "            class(?: # rb_define_class(name, parent_name)\n" +
+                        "              \\(\\s*\n" +
+                        "                \\g<name>,\n" +
+                        "                \\g<parent>\n" +
+                        "              \\s*\\)\n" +
+                        "            |\n" +
+                        "              _under\\g<open> # rb_define_class_under(under, name, parent_name...)\n" +
+                        "                \\g<under>,\n" +
+                        "                \\g<name>,\n" +
+                        "                \\g<parent>\n" +
+                        "              \\g<close>\n" +
+                        "            )\n" +
+                        "          |\n" +
+                        "            (?<module>)\n" +
+                        "            module(?: # rb_define_module(name)\n" +
+                        "              \\g<open>\n" +
+                        "                \\g<name>\n" +
+                        "              \\g<close>\n" +
+                        "            |\n" +
+                        "              _under\\g<open> # rb_define_module_under(under, name)\n" +
+                        "                \\g<under>,\n" +
+                        "                \\g<name>\n" +
+                        "              \\g<close>\n" +
+                        "            )\n" +
+                        "          )\n" +
+                        "      |\n" +
+                        "        (?<attributes>(?:\\s*\"\\w+\",)*\\s*NULL\\s*) {0}\n" +
+                        "        struct_define(?:\n" +
+                        "          \\g<open> # rb_struct_define(name, ...)\n" +
+                        "            \\g<name>,\n" +
+                        "        |\n" +
+                        "          _under\\g<open> # rb_struct_define_under(under, name, ...)\n" +
+                        "            \\g<under>,\n" +
+                        "            \\g<name>,\n" +
+                        "        |\n" +
+                        "          _without_accessor(?:\n" +
+                        "            \\g<open> # rb_struct_define_without_accessor(name, parent_name, ...)\n" +
+                        "          |\n" +
+                        "            _under\\g<open> # rb_struct_define_without_accessor_under(under, name, parent_name, ...)\n" +
+                        "              \\g<under>,\n" +
+                        "          )\n" +
+                        "            \\g<name>,\n" +
+                        "            \\g<parent>,\n" +
+                        "            \\s*\\w+,        # Allocation function\n" +
+                        "        )\n" +
+                        "          \\g<attributes>\n" +
+                        "        \\g<close>\n" +
+                        "      |\n" +
+                        "        singleton_class\\g<open> # rb_singleton_class(target_class_name)\n" +
+                        "          (?<target_class_name>\\w+)\n" +
+                        "        \\g<close>\n" +
+                        "        )\n" +
+                        "      ";
+        test(pattern, "mx", "abc", 0, false);
+    }
+
+    @Test
+    public void gr52472() {
+        test("(|a+?){0,4}b", "", "aaab", 0, true, 0, 4, 1, 3);
+    }
+
+    @Test
+    public void testForceLinearExecution() {
+        test("(a*)b\\1", "", "_aabaaa_", 0, true, 1, 6, 1, 3);
+        expectUnsupported("(a*)b\\1", "", OPT_FORCE_LINEAR_EXECUTION);
+        test(".*a{1,200000}.*", "", "_aabaaa_", 0, true, 0, 8);
+        expectUnsupported(".*a{1,200000}.*", "", OPT_FORCE_LINEAR_EXECUTION);
+        test(".*b(?!a_)", "", "_aabaaa_", 0, true, 0, 4);
+        expectUnsupported(".*b(?!a_)", "", OPT_FORCE_LINEAR_EXECUTION);
+    }
+
+    @Test
+    public void nestingLimit() {
+        int depth = 10_000;
+        String nestedGroups = "(".repeat(depth) + "a" + ")".repeat(depth);
+        expectUnsupported(nestedGroups, "");
+        String nestedCharClasses = "[".repeat(depth) + "a" + "]".repeat(depth);
+        expectUnsupported(nestedCharClasses, "");
+    }
+
+    @Test
+    public void subexpressionCallExpansionLimit() {
+        StringBuilder pattern = new StringBuilder("(a)");
+        for (int i = 1; i <= 30; i++) {
+            pattern.append("(\\g<").append(i).append(">\\g<").append(i).append(">)");
+        }
+        expectUnsupported(pattern.toString(), "", Map.of("regexDummyLang.MaxParserTreeSize", "10000"));
+    }
+
+    @Test
+    public void unicodePropertyNameMangling() {
+        test("\\p{private_use}", "", "\ue000", 0, true, 0, 1);
+        test("\\p{private-use}", "", "\ue000", 0, true, 0, 1);
+        test("\\p{PRIVATE use}", "", "\ue000", 0, true, 0, 1);
+        test("\\p{private use}", "", "\ue000", 0, true, 0, 1);
+        test("\\p{privateuse}", "", "\ue000", 0, true, 0, 1);
+        test("\\p{p R iV__-  --_aTe     Us   e___}", "", "\ue000", 0, true, 0, 1);
     }
 }

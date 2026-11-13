@@ -24,44 +24,28 @@
  */
 package com.oracle.svm.core.os;
 
-import java.util.EnumSet;
+import static com.oracle.svm.shared.Uninterruptible.CALLED_FROM_UNINTERRUPTIBLE_CODE;
 
-import com.oracle.svm.core.util.VMError;
-import org.graalvm.compiler.api.replacements.Fold;
 import org.graalvm.nativeimage.ImageSingletons;
 import org.graalvm.nativeimage.c.type.WordPointer;
 import org.graalvm.word.Pointer;
 import org.graalvm.word.PointerBase;
 import org.graalvm.word.UnsignedWord;
-import org.graalvm.word.WordFactory;
 
-import com.oracle.svm.core.annotate.Uninterruptible;
-import com.oracle.svm.core.c.function.CEntryPointCreateIsolateParameters;
-import com.oracle.svm.core.heap.Heap;
+import com.oracle.svm.guest.staging.IsolateArguments;
+import com.oracle.svm.shared.Uninterruptible;
+
+import jdk.graal.compiler.api.replacements.Fold;
 
 /**
  * A provider of ranges of committed memory, which is virtual memory that is backed by physical
  * memory or swap space.
  */
 public interface CommittedMemoryProvider {
-    /**
-     * Value for alignment parameters that indicates that no specific alignment is required (other
-     * than the {@linkplain #getGranularity() granularity} usually).
-     */
-    UnsignedWord UNALIGNED = WordFactory.unsigned(1);
-
     @Fold
     static CommittedMemoryProvider get() {
         return ImageSingletons.lookup(CommittedMemoryProvider.class);
     }
-
-    /**
-     * Returns whether this provider will always guarantee a heap address space alignment of
-     * {@link Heap#getPreferredAddressSpaceAlignment()} at image runtime, which may also depend on
-     * {@link ImageHeapProvider#guaranteesHeapPreferredAddressSpaceAlignment()}.
-     */
-    @Fold
-    boolean guaranteesHeapPreferredAddressSpaceAlignment();
 
     /**
      * Performs initializations <em>for the current isolate</em>, before any other methods of this
@@ -70,7 +54,7 @@ public interface CommittedMemoryProvider {
      * @return zero in case of success, non-zero in case of an error.
      */
     @Uninterruptible(reason = "Still being initialized.")
-    int initialize(WordPointer isolatePointer, CEntryPointCreateIsolateParameters parameters);
+    int initialize(WordPointer heapBasePointer, IsolateArguments arguments);
 
     /**
      * Tear down <em>for the current isolate</em>. This must be the last method of this interface
@@ -85,95 +69,23 @@ public interface CommittedMemoryProvider {
      * Returns the granularity of committed memory management, which is typically the same as that
      * of {@linkplain VirtualMemoryProvider#getGranularity() virtual memory management}.
      */
-    @Uninterruptible(reason = "Still being initialized.", mayBeInlined = true)
+    @Uninterruptible(reason = CALLED_FROM_UNINTERRUPTIBLE_CODE, mayBeInlined = true)
     default UnsignedWord getGranularity() {
         return VirtualMemoryProvider.get().getGranularity();
     }
 
     /**
-     * Allocate a block of committed memory.
-     *
-     * @param nbytes The number of bytes to allocate, which is rounded up to the next multiple of
-     *            the {@linkplain #getGranularity() granularity} if required.
-     * @param alignment The required alignment of the block start, or {@link #UNALIGNED}.
-     * @param executable Whether the block must be executable.
-     * @return The start of the allocated block, or {@link WordFactory#nullPointer()} in case of an
-     *         error.
+     * Returns the size of the address space that is reserved for the collected Java heap (i.e.,
+     * this explicitly excludes all other data, such as null regions, metaspace, image heap, or
+     * auxiliary images).
      */
-    default Pointer allocate(UnsignedWord nbytes, UnsignedWord alignment, boolean executable) {
-        // We need this default method temporarily so that we can remove the methods allocate and
-        // free from all subclasses in GR-34236.
-        throw VMError.shouldNotReachHere("Subclasses must overwrite this method");
-    }
+    UnsignedWord getCollectedHeapAddressSpaceSize();
 
-    Pointer allocateAlignedChunk(UnsignedWord nbytes, UnsignedWord alignment);
-
-    Pointer allocateUnalignedChunk(UnsignedWord nbytes);
+    @Uninterruptible(reason = CALLED_FROM_UNINTERRUPTIBLE_CODE, mayBeInlined = true)
+    boolean isInMetaspace(Pointer ptr);
 
     Pointer allocateExecutableMemory(UnsignedWord nbytes, UnsignedWord alignment);
 
-    /**
-     * This method returns {@code true} if the memory returned by {@link #allocateUnalignedChunk} is
-     * guaranteed to be zeroed.
-     */
-    boolean areUnalignedChunksZeroed();
-
-    /**
-     * Release a block of committed memory that was allocated with {@link #allocate}, requiring the
-     * exact same parameter values that were originally passed to {@link #allocate}.
-     *
-     * @param start The start of the memory block, as returned by {@link #allocate}.
-     * @param nbytes The originally requested size in bytes.
-     * @param alignment The originally requested alignment.
-     * @param executable Whether the block was requested to be executable.
-     * @return true on success, or false otherwise.
-     */
-    @Uninterruptible(reason = "Called from uninterruptible code.", mayBeInlined = true)
-    default boolean free(PointerBase start, UnsignedWord nbytes, UnsignedWord alignment, boolean executable) {
-        // We need this default method temporarily so that we can remove the methods allocate and
-        // free from all subclasses in GR-34236.
-        throw VMError.shouldNotReachHere("Subclasses must overwrite this method");
-    }
-
-    @Uninterruptible(reason = "Called from uninterruptible code.", mayBeInlined = true)
-    void freeAlignedChunk(PointerBase start, UnsignedWord nbytes, UnsignedWord alignment);
-
-    @Uninterruptible(reason = "Called from uninterruptible code.", mayBeInlined = true)
-    void freeUnalignedChunk(PointerBase start, UnsignedWord nbytes);
-
-    @Uninterruptible(reason = "Called from uninterruptible code.", mayBeInlined = true)
+    @Uninterruptible(reason = CALLED_FROM_UNINTERRUPTIBLE_CODE, mayBeInlined = true)
     void freeExecutableMemory(PointerBase start, UnsignedWord nbytes, UnsignedWord alignment);
-
-    /**
-     * Called by the garbage collector before a collection is started, as an opportunity to perform
-     * lazy operations, sanity checks or clean-ups.
-     */
-    default void beforeGarbageCollection() {
-    }
-
-    /**
-     * Called by the garbage collector after a collection has ended, as an opportunity to perform
-     * lazy operations, sanity checks or clean-ups.
-     */
-    default void afterGarbageCollection() {
-    }
-
-    enum Access {
-        READ,
-        WRITE,
-        EXECUTE
-    }
-
-    /**
-     * Change access permissions for a block of committed memory that was allocated with
-     * {@link #allocate}.
-     *
-     * @param start The start of the address range to be protected, which must be a multiple of the
-     *            {@linkplain #getGranularity() granularity}.
-     * @param nbytes The size in bytes of the address range to be protected, which will be rounded
-     *            up to a multiple of the {@linkplain #getGranularity() granularity}.
-     * @param access The modes in which the memory is permitted to be accessed, see {@link Access}.
-     * @return true on success, or false otherwise.
-     */
-    boolean protect(PointerBase start, UnsignedWord nbytes, EnumSet<Access> access);
 }

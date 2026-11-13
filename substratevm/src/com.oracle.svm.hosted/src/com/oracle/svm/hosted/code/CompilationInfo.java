@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2013, 2021, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2013, 2022, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -27,18 +27,23 @@ package com.oracle.svm.hosted.code;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
 
-import org.graalvm.compiler.graph.Node;
-import org.graalvm.compiler.nodes.ConstantNode;
-import org.graalvm.compiler.nodes.StructuredGraph;
-
-import com.oracle.svm.core.SubstrateOptions;
-import com.oracle.svm.core.annotate.DeoptTest;
-import com.oracle.svm.core.annotate.Specialize;
-import com.oracle.svm.core.graal.nodes.WriteCurrentVMThreadNode;
-import com.oracle.svm.core.graal.nodes.WriteHeapBaseNode;
+import com.oracle.graal.pointsto.flow.AnalysisParsedGraph;
+import com.oracle.svm.core.deopt.DeoptTest;
+import com.oracle.svm.core.deopt.Specialize;
 import com.oracle.svm.hosted.code.CompileQueue.CompileFunction;
 import com.oracle.svm.hosted.code.CompileQueue.ParseFunction;
+import com.oracle.svm.hosted.code.CompileQueue.ParseHooks;
 import com.oracle.svm.hosted.meta.HostedMethod;
+import com.oracle.svm.common.meta.MethodVariant;
+
+import jdk.graal.compiler.core.common.CompilationIdentifier;
+import jdk.graal.compiler.debug.DebugContext;
+import jdk.graal.compiler.nodes.ConstantNode;
+import jdk.graal.compiler.nodes.FrameState;
+import jdk.graal.compiler.nodes.GraphDecoder;
+import jdk.graal.compiler.nodes.GraphDecoder.DecodeContext;
+import jdk.graal.compiler.nodes.StructuredGraph;
+import jdk.graal.compiler.options.OptionValues;
 
 public class CompilationInfo {
 
@@ -51,13 +56,12 @@ public class CompilationInfo {
      */
     protected boolean inCompileQueue;
 
-    protected volatile StructuredGraph graph;
+    private volatile CompilationGraph compilationGraph;
 
     protected boolean isTrivialMethod;
+    protected boolean trivialInliningDisabled;
 
     protected boolean canDeoptForTesting;
-
-    protected boolean modifiesSpecialRegisters;
 
     /**
      * The constant arguments for a {@link DeoptTest} method called by a {@link Specialize} method.
@@ -65,23 +69,14 @@ public class CompilationInfo {
      */
     protected ConstantNode[] specializedArguments;
 
-    /**
-     * A link to the deoptimization target method if this method can deoptimize.
-     */
-    protected HostedMethod deoptTarget;
-
-    /**
-     * A link to the regular compiled method if this method is a deoptimization target.
-     *
-     * Note that it is important that this field is final: the {@link HostedMethod#getName() method
-     * name} depends on this field (to distinguish a regular method from a deoptimization target
-     * method), so mutating this field would mutate the name of a method.
-     */
-    protected final HostedMethod deoptOrigin;
-
     /* Custom parsing and compilation code that is executed instead of that of CompileQueue */
     protected ParseFunction customParseFunction;
     protected CompileFunction customCompileFunction;
+
+    /*
+     * Custom parsing hook which is called during the default parse method.
+     */
+    protected ParseHooks customParseHooks;
 
     /* Statistics collected before/during compilation. */
     protected long numNodesAfterParsing;
@@ -95,72 +90,74 @@ public class CompilationInfo {
     protected final AtomicLong numVirtualCalls = new AtomicLong();
     protected final AtomicLong numEntryPointCalls = new AtomicLong();
 
-    public CompilationInfo(HostedMethod method, HostedMethod deoptOrigin) {
+    public CompilationInfo(HostedMethod method) {
         this.method = method;
-        this.deoptOrigin = deoptOrigin;
-
-        if (deoptOrigin != null) {
-            assert deoptOrigin.compilationInfo.deoptTarget == null;
-            deoptOrigin.compilationInfo.deoptTarget = method;
-        }
     }
 
-    public boolean isDeoptTarget() {
-        return deoptOrigin != null;
-    }
-
-    public boolean isDeoptEntry(int bci, boolean duringCall, boolean rethrowException) {
-        return isDeoptTarget() && (deoptOrigin.compilationInfo.canDeoptForTesting || CompilationInfoSupport.singleton().isDeoptEntry(method, bci, duringCall, rethrowException));
-    }
-
-    /**
-     * Returns whether this bci was registered as a potential deoptimization entrypoint via
-     * {@link CompilationInfoSupport#registerDeoptEntry}.
-     */
-    public boolean isRegisteredDeoptEntry(int bci, boolean duringCall, boolean rethrowException) {
-        return isDeoptTarget() && CompilationInfoSupport.singleton().isDeoptTarget(method) && CompilationInfoSupport.singleton().isDeoptEntry(method, bci, duringCall, rethrowException);
+    public boolean isDeoptEntry(int bci, FrameState.StackState stackState) {
+        return method.isDeoptTarget() && (method.getMethodVariant(MethodVariant.ORIGINAL_METHOD).compilationInfo.canDeoptForTesting ||
+                        SubstrateCompilationDirectives.singleton().isRegisteredDeoptEntry(method, bci, stackState));
     }
 
     public boolean canDeoptForTesting() {
         return canDeoptForTesting;
     }
 
-    public HostedMethod getDeoptTargetMethod() {
-        return deoptTarget;
+    public CompilationGraph getCompilationGraph() {
+        return compilationGraph;
     }
 
-    public void setGraph(StructuredGraph graph) {
-        this.graph = graph;
-        if (SubstrateOptions.useLLVMBackend()) {
-            this.modifiesSpecialRegisters = false;
-            for (Node node : graph.getNodes()) {
-                if (node instanceof WriteCurrentVMThreadNode || node instanceof WriteHeapBaseNode) {
-                    this.modifiesSpecialRegisters = true;
-                }
+    public StructuredGraph createGraph(DebugContext debug, OptionValues options, CompilationIdentifier compilationId, boolean decode) {
+        return createGraph(debug, options, compilationId, decode, DecodeContext.DEFAULT);
+    }
+
+    public StructuredGraph createGraph(DebugContext debug, OptionValues options, CompilationIdentifier compilationId, boolean decode, DecodeContext decodeContext) {
+        var encodedGraph = getCompilationGraph().getEncodedGraph();
+        var graph = new StructuredGraph.Builder(options, debug)
+                        .method(method)
+                        .trackNodeSourcePosition(encodedGraph.trackNodeSourcePosition())
+                        .recordInlinedMethods(encodedGraph.isRecordingInlinedMethods())
+                        .compilationId(compilationId)
+                        .build();
+
+        if (decode) {
+            try (var _ = debug.scope("CreateGraph", graph, method)) {
+                var decoder = new GraphDecoder(AnalysisParsedGraph.HOST_ARCHITECTURE, graph);
+                decoder.decode(encodedGraph, decodeContext);
+            } catch (Throwable ex) {
+                throw debug.handle(ex);
             }
         }
-    }
-
-    public void clear() {
-        graph = null;
-        specializedArguments = null;
-    }
-
-    public StructuredGraph getGraph() {
         return graph;
     }
 
-    public boolean modifiesSpecialRegisters() {
-        assert SubstrateOptions.useLLVMBackend();
-        return modifiesSpecialRegisters;
+    public void encodeGraph(StructuredGraph graph) {
+        compilationGraph = CompilationGraph.encode(graph);
+    }
+
+    public void setCompilationGraph(CompilationGraph graph) {
+        compilationGraph = graph;
+    }
+
+    public void clear() {
+        compilationGraph = null;
+        specializedArguments = null;
     }
 
     public boolean isTrivialMethod() {
         return isTrivialMethod;
     }
 
-    public void setTrivialMethod(boolean trivial) {
-        isTrivialMethod = trivial;
+    public void setTrivialMethod() {
+        isTrivialMethod = true;
+    }
+
+    public boolean isTrivialInliningDisabled() {
+        return trivialInliningDisabled;
+    }
+
+    public void setTrivialInliningDisabled() {
+        trivialInliningDisabled = true;
     }
 
     public void setCustomParseFunction(ParseFunction parseFunction) {
@@ -179,7 +176,11 @@ public class CompilationInfo {
         return customCompileFunction;
     }
 
-    public boolean hasDefaultParseFunction() {
-        return customCompileFunction == null;
+    public void setCustomParseHooks(ParseHooks parseHooks) {
+        this.customParseHooks = parseHooks;
+    }
+
+    public ParseHooks getCustomParseHooks() {
+        return customParseHooks;
     }
 }

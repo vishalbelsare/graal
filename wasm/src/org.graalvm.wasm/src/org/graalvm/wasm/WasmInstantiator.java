@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2021, 2021, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2021, 2026, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * The Universal Permissive License (UPL), Version 1.0
@@ -41,44 +41,40 @@
 
 package org.graalvm.wasm;
 
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.List;
+
+import org.graalvm.collections.EconomicMap;
+import org.graalvm.collections.MapCursor;
+import org.graalvm.wasm.constants.BytecodeBitEncoding;
+import org.graalvm.wasm.constants.SegmentMode;
+import org.graalvm.wasm.memory.WasmMemory;
+import org.graalvm.wasm.memory.WasmMemoryFactory;
+import org.graalvm.wasm.nodes.WasmFixedMemoryImplFunctionNode;
+import org.graalvm.wasm.nodes.WasmFunctionRootNode;
+import org.graalvm.wasm.nodes.WasmIndirectCallNode;
+import org.graalvm.wasm.nodes.WasmMemoryOverheadModeFunctionRootNode;
+import org.graalvm.wasm.nodes.WasmRootNode;
+import org.graalvm.wasm.parser.bytecode.BytecodeParser;
+import org.graalvm.wasm.parser.ir.CodeEntry;
+import org.graalvm.wasm.types.DefinedType;
+import org.graalvm.wasm.types.ReferenceType;
+import org.graalvm.wasm.types.ValueType;
+
+import com.oracle.truffle.api.CallTarget;
+import com.oracle.truffle.api.CompilerDirectives;
 import com.oracle.truffle.api.CompilerDirectives.TruffleBoundary;
-import com.oracle.truffle.api.Truffle;
+import com.oracle.truffle.api.RootCallTarget;
 import com.oracle.truffle.api.frame.FrameDescriptor;
 import com.oracle.truffle.api.frame.FrameSlotKind;
 import com.oracle.truffle.api.nodes.Node;
-import org.graalvm.wasm.exception.Failure;
-import org.graalvm.wasm.exception.WasmException;
-import org.graalvm.wasm.nodes.WasmBlockNode;
-import org.graalvm.wasm.nodes.WasmCallStubNode;
-import org.graalvm.wasm.nodes.WasmIndirectCallNode;
-import org.graalvm.wasm.nodes.WasmRootNode;
-import org.graalvm.wasm.parser.ir.BlockNode;
-import org.graalvm.wasm.parser.ir.CallNode;
-import org.graalvm.wasm.parser.ir.CodeEntry;
-import org.graalvm.wasm.parser.ir.IfNode;
-import org.graalvm.wasm.parser.ir.LoopNode;
-import org.graalvm.wasm.parser.ir.ParserNode;
-
-import java.util.List;
 
 /**
  * Creates wasm instances by converting parser nodes into Truffle nodes.
  */
 public class WasmInstantiator {
-    private static final int MIN_DEFAULT_STACK_SIZE = 1_000_000;
-    private static final int MAX_DEFAULT_ASYNC_STACK_SIZE = 10_000_000;
-
-    private static class ParsingExceptionHandler implements Thread.UncaughtExceptionHandler {
-        private Throwable parsingException = null;
-
-        @Override
-        public void uncaughtException(Thread t, Throwable e) {
-            this.parsingException = e;
-        }
-
-        public Throwable parsingException() {
-            return parsingException;
-        }
+    private record CallNodes(WasmFunctionRootNode[] directCallTargets, Node[] nodes) {
     }
 
     private final WasmLanguage language;
@@ -89,129 +85,503 @@ public class WasmInstantiator {
     }
 
     @TruffleBoundary
-    public WasmInstance createInstance(WasmContext context, WasmModule module) {
-        WasmInstance instance = new WasmInstance(context, module);
-        int binarySize = instance.module().data().length;
-        final int asyncParsingBinarySize = WasmOptions.AsyncParsingBinarySize.getValue(context.environment().getOptions());
-        if (binarySize < asyncParsingBinarySize) {
-            instantiateCodeEntries(context, instance);
-        } else {
-            final Runnable parsing = new Runnable() {
-                @Override
-                public void run() {
-                    instantiateCodeEntries(context, instance);
-                }
-            };
-            final String name = "wasm-parsing-thread(" + instance.name() + ")";
-            final int requestedSize = WasmOptions.AsyncParsingStackSize.getValue(context.environment().getOptions()) * 1000;
-            final int defaultSize = Math.max(MIN_DEFAULT_STACK_SIZE, Math.min(2 * binarySize, MAX_DEFAULT_ASYNC_STACK_SIZE));
-            final int stackSize = requestedSize != 0 ? requestedSize : defaultSize;
-            final Thread parsingThread = new Thread(null, parsing, name, stackSize);
-            final ParsingExceptionHandler handler = new ParsingExceptionHandler();
-            parsingThread.setUncaughtExceptionHandler(handler);
-            parsingThread.start();
-            try {
-                parsingThread.join();
-                if (handler.parsingException() != null) {
-                    throw WasmException.create(Failure.UNSPECIFIED_INVALID, "Asynchronous parsing failed.");
-                }
-            } catch (InterruptedException e) {
-                throw WasmException.create(Failure.UNSPECIFIED_INVALID, "Asynchronous parsing interrupted.");
-            }
-        }
+    public WasmInstance createInstance(WasmStore store, WasmModule module) {
+        WasmInstance instance = new WasmInstance(store, module);
+        instance.createLinkActions();
+        instantiateCodeEntries(store, instance);
         return instance;
     }
 
-    private void instantiateCodeEntries(WasmContext context, WasmInstance instance) {
-        final CodeEntry[] codeEntries = instance.module().getCodeEntries();
-        if (codeEntries == null) {
+    static List<LinkAction> recreateLinkActions(WasmModule module) {
+        List<LinkAction> linkActions = new ArrayList<>();
+
+        for (int i = 0; i < module.numFunctions(); i++) {
+            final WasmFunction function = module.function(i);
+            if (function.isImported()) {
+                linkActions.add((context, store, instance, imports) -> {
+                    store.linker().resolveFunctionImport(store, instance, function, imports);
+                });
+            }
+            final String exportName = module.exportedFunctionName(i);
+            if (exportName != null) {
+                final int functionIndex = i;
+                linkActions.add((context, store, instance, imports) -> {
+                    store.linker().resolveFunctionExport(instance.module(), functionIndex, exportName);
+                });
+            }
+        }
+
+        final EconomicMap<Integer, ImportDescriptor> importedGlobals = module.importedGlobals();
+        for (int i = 0; i < module.numGlobals(); i++) {
+            final int globalIndex = i;
+            final int globalValueType = module.globalValueType(globalIndex);
+            final byte globalMutability = module.globalMutability(globalIndex);
+            if (importedGlobals.containsKey(globalIndex)) {
+                final ImportDescriptor globalDescriptor = importedGlobals.get(globalIndex);
+                linkActions.add((context, store, instance, imports) -> {
+                    store.linker().resolveGlobalImport(store, instance, globalDescriptor, globalIndex, globalValueType, globalMutability, imports);
+                });
+            } else {
+                final byte[] initBytecode = module.globalInitializerBytecode(globalIndex);
+                final Object initialValue = module.globalInitialValue(globalIndex);
+                linkActions.add((context, store, instance, imports) -> {
+                    store.linker().resolveGlobalInitialization(instance, globalIndex, initBytecode, initialValue);
+                });
+            }
+        }
+        final MapCursor<String, Integer> exportedGlobals = module.exportedGlobals().getEntries();
+        while (exportedGlobals.advance()) {
+            final String globalName = exportedGlobals.getKey();
+            final int globalIndex = exportedGlobals.getValue();
+            linkActions.add((context, store, instance, imports) -> {
+                store.linker().resolveGlobalExport(instance.module(), globalName, globalIndex);
+            });
+        }
+
+        for (int i = 0; i < module.tableCount(); i++) {
+            final int tableIndex = i;
+            final long tableMinSize = module.tableInitialSize(tableIndex);
+            final long tableMaxSize = module.tableMaximumSize(tableIndex);
+            final boolean tableIndexType64 = module.tableHasIndexType64(tableIndex);
+            final int tableElemType = module.tableElementType(tableIndex);
+            ValueType tableElementValueType = module.closedTypeOf(tableElemType);
+            assert tableElementValueType.isReferenceType();
+            ReferenceType tableElementType = (ReferenceType) tableElementValueType;
+            final ImportDescriptor tableDescriptor = module.importedTable(tableIndex);
+            if (tableDescriptor != null) {
+                linkActions.add((context, store, instance, imports) -> {
+                    instance.setTable(tableIndex, null);
+                    store.linker().resolveTableImport(store, instance, tableDescriptor, tableIndex, tableMinSize, tableMaxSize, tableIndexType64, tableElementType, imports);
+                });
+            } else {
+                linkActions.add((context, store, instance, imports) -> {
+                    final ModuleLimits limits = instance.module().limits();
+                    final int maxAllowedSize = (int) WasmMath.minUnsigned(tableMaxSize, limits.tableInstanceSizeLimit());
+                    limits.checkTableInstanceSize(tableMinSize);
+                    final WasmTable wasmTable = new WasmTable(tableMinSize, tableMaxSize, maxAllowedSize, tableElementType, tableIndexType64);
+                    instance.setTable(tableIndex, wasmTable);
+
+                    final byte[] initBytecode = module.tableInitializerBytecode(tableIndex);
+                    final Object initValue = module.tableInitialValue(tableIndex);
+                    store.linker().resolveTableInitialization(instance, tableIndex, initBytecode, initValue);
+                });
+            }
+        }
+        final MapCursor<String, Integer> exportedTables = module.exportedTables().getEntries();
+        while (exportedTables.advance()) {
+            final String tableName = exportedTables.getKey();
+            final int tableIndex = exportedTables.getValue();
+            linkActions.add((context, store, instance, imports) -> {
+                store.linker().resolveTableExport(instance.module(), tableIndex, tableName);
+            });
+        }
+
+        for (int i = 0; i < module.memoryCount(); i++) {
+            final int memoryIndex = i;
+            final long memoryMinSize = module.memoryInitialSize(memoryIndex);
+            final long memoryMaxSize = module.memoryDeclaredMaximumSize(memoryIndex);
+            final boolean memoryIndexType64 = module.memoryHasIndexType64(memoryIndex);
+            final boolean memoryShared = module.memoryIsShared(memoryIndex);
+            final ImportDescriptor memoryDescriptor = module.importedMemory(memoryIndex);
+            if (memoryDescriptor != null) {
+                linkActions.add((context, store, instance, imports) -> {
+                    store.linker().resolveMemoryImport(store, instance, memoryDescriptor, memoryIndex, memoryMinSize, memoryMaxSize, memoryIndexType64, memoryShared, imports);
+                });
+            } else {
+                linkActions.add((context, store, instance, imports) -> {
+                    final ModuleLimits limits = instance.module().limits();
+                    limits.checkMemoryInstanceSize(memoryMinSize, memoryIndexType64);
+                    final WasmMemory wasmMemory = WasmMemoryFactory.createMemory(memoryMinSize, memoryMaxSize, memoryIndexType64, memoryShared,
+                                    context.getContextOptions().useUnsafeMemory(), context.getContextOptions().directByteBufferMemoryAccess(), context);
+                    instance.setMemory(memoryIndex, wasmMemory);
+                });
+            }
+        }
+        final MapCursor<String, Integer> exportedMemories = module.exportedMemories().getEntries();
+        while (exportedMemories.advance()) {
+            final String memoryName = exportedMemories.getKey();
+            final int memoryIndex = exportedMemories.getValue();
+            linkActions.add((context, store, instance, imports) -> {
+                store.linker().resolveMemoryExport(instance, memoryIndex, memoryName);
+            });
+        }
+
+        for (int i = 0; i < module.tagCount(); i++) {
+            final int tagIndex = i;
+            final int typeIndex = module.tagTypeIndex(tagIndex);
+            final DefinedType type = module.closedTypeAt(typeIndex);
+            final ImportDescriptor tagDescriptor = module.importedTag(tagIndex);
+            if (tagDescriptor != null) {
+                linkActions.add((context, store, instance, imports) -> {
+                    store.linker().resolveTagImport(store, instance, tagDescriptor, tagIndex, type, imports);
+                });
+            } else {
+                linkActions.add((context, store, instance, imports) -> {
+                    final WasmTag tag = new WasmTag(type);
+                    instance.setTag(tagIndex, tag);
+                });
+            }
+        }
+        final MapCursor<String, Integer> exportedTags = module.exportedTags().getEntries();
+        while (exportedTags.advance()) {
+            final String tagName = exportedTags.getKey();
+            final int tagIndex = exportedTags.getValue();
+            linkActions.add((context, store, instance, imports) -> {
+                store.linker().resolveTagExport(instance, tagIndex, tagName);
+            });
+        }
+
+        final byte[] bytecode = module.bytecode();
+
+        for (int i = 0; i < module.elemInstanceCount(); i++) {
+            final int elemIndex = i;
+            final int elemOffset = module.elemInstanceOffset(elemIndex);
+            final int encoding = bytecode[elemOffset];
+            final int typeLengthAndMode = bytecode[elemOffset + 1];
+            int effectiveOffset = elemOffset + 2;
+
+            final int elemMode = typeLengthAndMode & BytecodeBitEncoding.ELEM_SEG_MODE_VALUE;
+
+            switch (typeLengthAndMode & BytecodeBitEncoding.ELEM_SEG_TYPE_MASK) {
+                case BytecodeBitEncoding.ELEM_SEG_TYPE_I8:
+                    effectiveOffset++;
+                    break;
+                case BytecodeBitEncoding.ELEM_SEG_TYPE_I16:
+                    effectiveOffset += 2;
+                    break;
+                case BytecodeBitEncoding.ELEM_SEG_TYPE_I32:
+                    effectiveOffset += 4;
+                    break;
+            }
+            final int elemCount;
+            switch (encoding & BytecodeBitEncoding.ELEM_SEG_COUNT_MASK) {
+                case BytecodeBitEncoding.ELEM_SEG_COUNT_U8:
+                    elemCount = BinaryStreamParser.rawPeekU8(bytecode, effectiveOffset);
+                    effectiveOffset++;
+                    break;
+                case BytecodeBitEncoding.ELEM_SEG_COUNT_U16:
+                    elemCount = BinaryStreamParser.rawPeekU16(bytecode, effectiveOffset);
+                    effectiveOffset += 2;
+                    break;
+                case BytecodeBitEncoding.ELEM_SEG_COUNT_I32:
+                    elemCount = BinaryStreamParser.rawPeekI32(bytecode, effectiveOffset);
+                    effectiveOffset += 4;
+                    break;
+                default:
+                    throw CompilerDirectives.shouldNotReachHere();
+            }
+            if (elemMode == SegmentMode.ACTIVE) {
+                final int tableIndex;
+                switch (encoding & BytecodeBitEncoding.ELEM_SEG_TABLE_INDEX_MASK) {
+                    case BytecodeBitEncoding.ELEM_SEG_TABLE_INDEX_ZERO:
+                        tableIndex = 0;
+                        break;
+                    case BytecodeBitEncoding.ELEM_SEG_TABLE_INDEX_U8:
+                        tableIndex = BinaryStreamParser.rawPeekU8(bytecode, effectiveOffset);
+                        effectiveOffset++;
+                        break;
+                    case BytecodeBitEncoding.ELEM_SEG_TABLE_INDEX_U16:
+                        tableIndex = BinaryStreamParser.rawPeekU16(bytecode, effectiveOffset);
+                        effectiveOffset += 2;
+                        break;
+                    case BytecodeBitEncoding.ELEM_SEG_TABLE_INDEX_I32:
+                        tableIndex = BinaryStreamParser.rawPeekI32(bytecode, effectiveOffset);
+                        effectiveOffset += 4;
+                        break;
+                    default:
+                        throw CompilerDirectives.shouldNotReachHere();
+                }
+                final long value;
+                switch (encoding & BytecodeBitEncoding.ELEM_SEG_VALUE_MASK) {
+                    case BytecodeBitEncoding.ELEM_SEG_VALUE_UNDEFINED:
+                        value = -1;
+                        break;
+                    case BytecodeBitEncoding.ELEM_SEG_VALUE_U8:
+                        value = BinaryStreamParser.rawPeekU8(bytecode, effectiveOffset);
+                        effectiveOffset++;
+                        break;
+                    case BytecodeBitEncoding.ELEM_SEG_VALUE_U16:
+                        value = BinaryStreamParser.rawPeekU16(bytecode, effectiveOffset);
+                        effectiveOffset += 2;
+                        break;
+                    case BytecodeBitEncoding.ELEM_SEG_VALUE_U32:
+                        value = BinaryStreamParser.rawPeekU32(bytecode, effectiveOffset);
+                        effectiveOffset += 4;
+                        break;
+                    case BytecodeBitEncoding.ELEM_SEG_VALUE_I64:
+                        value = BinaryStreamParser.rawPeekI64(bytecode, effectiveOffset);
+                        effectiveOffset += 8;
+                        break;
+                    default:
+                        throw CompilerDirectives.shouldNotReachHere();
+                }
+                final byte[] elemOffsetBytecode;
+                final long elemOffsetAddress;
+                if ((encoding & BytecodeBitEncoding.ELEM_SEG_BYTECODE_OR_OFFSET_MASK) == BytecodeBitEncoding.ELEM_SEG_BYTECODE &&
+                                ((encoding & BytecodeBitEncoding.ELEM_SEG_VALUE_MASK) != BytecodeBitEncoding.ELEM_SEG_VALUE_UNDEFINED)) {
+                    int elemOffsetBytecodeLength = (int) value;
+                    elemOffsetBytecode = Arrays.copyOfRange(bytecode, effectiveOffset, effectiveOffset + elemOffsetBytecodeLength);
+                    effectiveOffset += elemOffsetBytecodeLength;
+                    elemOffsetAddress = -1;
+                } else {
+                    elemOffsetBytecode = null;
+                    elemOffsetAddress = value;
+                }
+                final int bytecodeOffset = effectiveOffset;
+                linkActions.add((context, store, instance, imports) -> {
+                    store.linker().resolveElemSegment(store, instance, tableIndex, elemIndex, elemOffsetAddress, elemOffsetBytecode, bytecodeOffset, elemCount);
+                });
+            } else if (elemMode == SegmentMode.PASSIVE) {
+                final int bytecodeOffset = effectiveOffset;
+                linkActions.add((context, store, instance, imports) -> {
+                    store.linker().resolvePassiveElemSegment(store, instance, elemIndex, bytecodeOffset, elemCount);
+                });
+            }
+        }
+
+        for (int i = 0; i < module.dataInstanceCount(); i++) {
+            final int dataIndex = i;
+            final int dataOffset = module.dataInstanceOffset(dataIndex);
+            final int encoding = bytecode[dataOffset];
+            int effectiveOffset = dataOffset + 1;
+
+            final int dataMode = encoding & BytecodeBitEncoding.DATA_SEG_MODE_VALUE;
+            final int dataLength;
+            switch (encoding & BytecodeBitEncoding.DATA_SEG_LENGTH_MASK) {
+                case BytecodeBitEncoding.DATA_SEG_LENGTH_U8:
+                    dataLength = BinaryStreamParser.rawPeekU8(bytecode, effectiveOffset);
+                    effectiveOffset++;
+                    break;
+                case BytecodeBitEncoding.DATA_SEG_LENGTH_U16:
+                    dataLength = BinaryStreamParser.rawPeekU16(bytecode, effectiveOffset);
+                    effectiveOffset += 2;
+                    break;
+                case BytecodeBitEncoding.DATA_SEG_LENGTH_I32:
+                    dataLength = BinaryStreamParser.rawPeekI32(bytecode, effectiveOffset);
+                    effectiveOffset += 4;
+                    break;
+                default:
+                    throw CompilerDirectives.shouldNotReachHere();
+            }
+            if (dataMode == SegmentMode.ACTIVE) {
+                final long value;
+                switch (encoding & BytecodeBitEncoding.DATA_SEG_VALUE_MASK) {
+                    case BytecodeBitEncoding.DATA_SEG_VALUE_UNDEFINED:
+                        value = -1;
+                        break;
+                    case BytecodeBitEncoding.DATA_SEG_VALUE_U8:
+                        value = BinaryStreamParser.rawPeekU8(bytecode, effectiveOffset);
+                        effectiveOffset++;
+                        break;
+                    case BytecodeBitEncoding.DATA_SEG_VALUE_U16:
+                        value = BinaryStreamParser.rawPeekU16(bytecode, effectiveOffset);
+                        effectiveOffset += 2;
+                        break;
+                    case BytecodeBitEncoding.DATA_SEG_VALUE_U32:
+                        value = BinaryStreamParser.rawPeekU32(bytecode, effectiveOffset);
+                        effectiveOffset += 4;
+                        break;
+                    case BytecodeBitEncoding.DATA_SEG_VALUE_I64:
+                        value = BinaryStreamParser.rawPeekI64(bytecode, effectiveOffset);
+                        effectiveOffset += 8;
+                        break;
+                    default:
+                        throw CompilerDirectives.shouldNotReachHere();
+                }
+                final byte[] dataOffsetBytecode;
+                final long dataOffsetAddress;
+                if ((encoding & BytecodeBitEncoding.DATA_SEG_BYTECODE_OR_OFFSET_MASK) == BytecodeBitEncoding.DATA_SEG_BYTECODE &&
+                                ((encoding & BytecodeBitEncoding.DATA_SEG_VALUE_MASK) != BytecodeBitEncoding.DATA_SEG_VALUE_UNDEFINED)) {
+                    int dataOffsetBytecodeLength = (int) value;
+                    dataOffsetBytecode = Arrays.copyOfRange(bytecode, effectiveOffset, effectiveOffset + dataOffsetBytecodeLength);
+                    effectiveOffset += dataOffsetBytecodeLength;
+                    dataOffsetAddress = -1;
+                } else {
+                    dataOffsetBytecode = null;
+                    dataOffsetAddress = value;
+                }
+
+                final int memoryIndex;
+                if ((encoding & BytecodeBitEncoding.DATA_SEG_HAS_MEMORY_INDEX_ZERO) != 0) {
+                    memoryIndex = 0;
+                } else {
+                    final int memoryIndexEncoding = bytecode[effectiveOffset];
+                    effectiveOffset++;
+                    switch (memoryIndexEncoding & BytecodeBitEncoding.DATA_SEG_MEMORY_INDEX_MASK) {
+                        case BytecodeBitEncoding.DATA_SEG_MEMORY_INDEX_U6:
+                            memoryIndex = memoryIndexEncoding & BytecodeBitEncoding.DATA_SEG_MEMORY_INDEX_VALUE;
+                            break;
+                        case BytecodeBitEncoding.DATA_SEG_MEMORY_INDEX_U8:
+                            memoryIndex = BinaryStreamParser.rawPeekU8(bytecode, effectiveOffset);
+                            effectiveOffset++;
+                            break;
+                        case BytecodeBitEncoding.DATA_SEG_MEMORY_INDEX_U16:
+                            memoryIndex = BinaryStreamParser.rawPeekU16(bytecode, effectiveOffset);
+                            effectiveOffset += 2;
+                            break;
+                        case BytecodeBitEncoding.DATA_SEG_MEMORY_INDEX_I32:
+                            memoryIndex = BinaryStreamParser.rawPeekI32(bytecode, effectiveOffset);
+                            effectiveOffset += 4;
+                            break;
+                        default:
+                            throw CompilerDirectives.shouldNotReachHere();
+                    }
+                }
+
+                final int dataBytecodeOffset = effectiveOffset;
+                linkActions.add((context, store, instance, imports) -> {
+                    store.linker().resolveDataSegment(store, instance, dataIndex, memoryIndex, dataOffsetAddress, dataOffsetBytecode, dataLength,
+                                    dataBytecodeOffset);
+                });
+            } else {
+                linkActions.add((context, store, instance, imports) -> {
+                    store.linker().resolvePassiveDataSegment(instance, dataIndex);
+                });
+            }
+        }
+
+        return linkActions;
+    }
+
+    private void instantiateCodeEntries(WasmStore store, WasmInstance instance) {
+        final WasmModule module = instance.module();
+        final boolean multiContext = language.isMultiContext();
+        if (multiContext && module.hasBeenInstantiated()) {
+            // If the module has already been instantiated and the call targets are shared,
+            // there's no need to read and instantiate the code entries again.
+            // We only need to initialize the code entry call targets in the new instance.
+            resolveInstantiatedCodeEntries(store, instance, module);
             return;
         }
-        for (int entry = 0; entry != codeEntries.length; ++entry) {
-            CodeEntry codeEntry = codeEntries[entry];
-            instantiateCodeEntry(instance, codeEntry);
-            context.linker().resolveCodeEntry(instance.module(), entry);
+        // If module instantiation were to happen concurrently, one thread might have already
+        // finished instantiating and started executing while the other is still instantiating.
+        // So we need to ensure that instantiation is synchronized or performed atomically,
+        // and does not overwrite already instantiated (and potentially executed) code state.
+        var lock = module.getLock();
+        lock.lock();
+        try {
+            if (multiContext && module.hasBeenInstantiated()) {
+                resolveInstantiatedCodeEntries(store, instance, module);
+                return;
+            }
+
+            CodeEntry[] codeEntries = module.codeEntries();
+            if (codeEntries == null) {
+                // Reread the code section if the module is instantiated multiple times
+                codeEntries = BytecodeParser.readCodeEntries(module);
+            } else {
+                // Remove code entries from module to reduce memory footprint at runtime
+                module.setCodeEntries(null);
+            }
+            for (int entry = 0; entry != codeEntries.length; ++entry) {
+                CodeEntry codeEntry = codeEntries[entry];
+                var callTarget = instantiateCodeEntry(store, module, instance, codeEntry);
+                instance.setTarget(codeEntry.functionIndex(), callTarget);
+            }
+            // Now that the call targets of all the code entries are set, we can resolve all local
+            // direct call sites. Call sites that require linking do not need to be resolved.
+            for (int entry = 0; entry != codeEntries.length; ++entry) {
+                CodeEntry codeEntry = codeEntries[entry];
+                resolveDirectCallTargets(instance, instance.target(codeEntry.functionIndex()), codeEntry.callFunctionIndices());
+            }
+            module.setHasBeenInstantiated();
+        } finally {
+            lock.unlock();
         }
     }
 
-    private static FrameDescriptor createFrameDescriptor(byte[] localTypes, int maxStackSize) {
-        FrameDescriptor.Builder builder = FrameDescriptor.newBuilder(localTypes.length);
-        for (byte type : localTypes) {
-            builder.addSlot(WasmType.asFrameSlotKind(type), null, null);
+    /**
+     * Resolves the call targets of already instantiated code entries in a new instance.
+     */
+    private static void resolveInstantiatedCodeEntries(WasmStore store, WasmInstance instance, WasmModule module) {
+        assert store.language().isMultiContext() && module.hasBeenInstantiated();
+        for (int functionIndex = 0; functionIndex != module.numFunctions(); ++functionIndex) {
+            WasmFunction function = module.symbolTable().function(functionIndex);
+            CallTarget target = function.target();
+            // Not all functions have code entries, only those with a non-null call target.
+            if (target != null) {
+                instance.setTarget(functionIndex, target);
+            }
         }
-        builder.addSlots(maxStackSize, FrameSlotKind.Illegal);
+    }
+
+    private static FrameDescriptor createFrameDescriptor(int[] localTypes, int maxLegacyCatchDepth, int maxStackSize) {
+        FrameDescriptor.Builder builder = FrameDescriptor.newBuilder(localTypes.length);
+        builder.addSlots(localTypes.length + maxLegacyCatchDepth + maxStackSize, FrameSlotKind.Static);
         return builder.build();
     }
 
-    private void instantiateCodeEntry(WasmInstance instance, CodeEntry codeEntry) {
-        final int functionIndex = codeEntry.getFunctionIndex();
-        final WasmFunction function = instance.module().symbolTable().function(functionIndex);
-        WasmCodeEntry wasmCodeEntry = new WasmCodeEntry(function, instance.module().data(), codeEntry.getLocalTypes(), codeEntry.getMaxStackSize());
-        function.setCodeEntry(wasmCodeEntry);
-
-        /*
-         * Create the root node and create and set the call target for the body. This needs to be
-         * done before translating the body block, because we need to be able to create direct call
-         * nodes {@see TruffleRuntime#createDirectCallNode} during translation.
-         */
-        WasmRootNode rootNode = new WasmRootNode(language, createFrameDescriptor(codeEntry.getLocalTypes(), codeEntry.getMaxStackSize()), instance, wasmCodeEntry);
-        instance.setTarget(codeEntry.getFunctionIndex(), rootNode.getCallTarget());
-
-        /*
-         * Translate and set the function body.
-         */
-        WasmBlockNode bodyBlock = instantiateBlockNode(instance, rootNode.codeEntry(), codeEntry.getFunctionBlock());
-        rootNode.setBody(bodyBlock);
-
-        /* Initialize the Truffle-related components required for execution. */
-        codeEntry.initializeTruffleComponents(rootNode);
+    private CallTarget instantiateCodeEntry(WasmStore store, WasmModule module, WasmInstance instance, CodeEntry codeEntry) {
+        final int functionIndex = codeEntry.functionIndex();
+        final WasmFunction function = module.symbolTable().function(functionIndex);
+        var cachedTarget = function.target();
+        if (cachedTarget != null) {
+            assert store.language().isMultiContext();
+            return cachedTarget;
+        }
+        final WasmRootNode rootNode = instantiateCodeEntryRootNode(store, module, codeEntry, function);
+        var callTarget = rootNode.getCallTarget();
+        if (store.language().isMultiContext()) {
+            function.setTarget(callTarget);
+        } else {
+            rootNode.setBoundModuleInstance(instance);
+        }
+        return callTarget;
     }
 
-    private WasmBlockNode instantiateBlockNode(WasmInstance instance, WasmCodeEntry codeEntry, BlockNode block) {
-        final WasmBlockNode currentBlock = block.createWasmBlockNode(instance, codeEntry);
-        List<ParserNode> childNodes = block.getChildNodes();
-        Node[] children = new Node[childNodes.size()];
-        int childIndex = 0;
-        for (ParserNode childNode : childNodes) {
-            Node child = null;
-            if (childNode instanceof BlockNode) {
-                child = instantiateBlockNode(instance, codeEntry, (BlockNode) childNode);
-            }
-            if (childNode instanceof LoopNode) {
-                LoopNode loopNode = (LoopNode) childNode;
-                WasmBlockNode loopBody = instantiateBlockNode(instance, codeEntry, loopNode.getBodyNode());
-                child = Truffle.getRuntime().createLoopNode(loopBody);
-            }
-            if (childNode instanceof IfNode) {
-                IfNode ifNode = (IfNode) childNode;
-                WasmBlockNode thenBlock = instantiateBlockNode(instance, codeEntry, ifNode.getThenNode());
-                WasmBlockNode elseBlock = null;
-                if (ifNode.hasElseBlock()) {
-                    elseBlock = instantiateBlockNode(instance, codeEntry, ifNode.getElseNode());
-                }
-                child = ifNode.createWasmIfNode(instance, codeEntry, thenBlock, elseBlock);
-            }
-            if (childNode instanceof CallNode) {
-                CallNode callNode = (CallNode) childNode;
-                if (callNode.isIndirectCall()) {
-                    child = WasmIndirectCallNode.create();
-                } else {
-                    // We deliberately do not create the call node during instantiation.
-                    //
-                    // If the call target is imported from another module,
-                    // then that other module might not have been parsed yet.
-                    // Therefore, the call node will be created lazily during linking,
-                    // after the call target from the other module exists.
-
-                    final WasmFunction function = instance.module().function(callNode.getFunctionIndex());
-                    child = new WasmCallStubNode(function);
-                    final int stubIndex = childIndex;
-                    instance.module().addLinkAction((context, inst) -> context.linker().resolveCallsite(inst, currentBlock, stubIndex, function));
-                }
-            }
-            children[childIndex++] = child;
+    private WasmRootNode instantiateCodeEntryRootNode(WasmStore store, WasmModule module, CodeEntry codeEntry, WasmFunction function) {
+        final WasmCodeEntry wasmCodeEntry = new WasmCodeEntry(function, module.bytecode(), codeEntry.localTypes(), codeEntry.resultTypes(), codeEntry.maxLegacyCatchDepth(),
+                        codeEntry.usesMemoryZero());
+        final FrameDescriptor frameDescriptor = createFrameDescriptor(codeEntry.localTypes(), codeEntry.maxLegacyCatchDepth(), codeEntry.maxStackSize());
+        final CallNodes callNodes = setupCallNodes(module, codeEntry);
+        final WasmFixedMemoryImplFunctionNode functionNode = WasmFixedMemoryImplFunctionNode.create(module, wasmCodeEntry, codeEntry.bytecodeStartOffset(), codeEntry.bytecodeEndOffset(),
+                        codeEntry.exceptionTableOffset(), callNodes.directCallTargets(), callNodes.nodes());
+        final WasmRootNode rootNode;
+        if (store.getContextOptions().memoryOverheadMode()) {
+            rootNode = new WasmMemoryOverheadModeFunctionRootNode(language, frameDescriptor, module, functionNode, wasmCodeEntry);
+        } else {
+            rootNode = new WasmFunctionRootNode(language, frameDescriptor, module, functionNode, wasmCodeEntry);
         }
-        block.initializeWasmBlockNode(currentBlock, children);
-        return currentBlock;
+        return rootNode;
+    }
+
+    private static CallNodes setupCallNodes(WasmModule module, CodeEntry entry) {
+        int directCallCount = 0;
+        int indirectCallCount = entry.indirectCallCount();
+        boolean needsDirectReturnCallNodes = false;
+        for (int functionIndex : entry.callFunctionIndices()) {
+            final WasmFunction function = module.function(functionIndex);
+            if (function.isImported()) {
+                indirectCallCount++;
+            } else {
+                directCallCount++;
+                needsDirectReturnCallNodes |= function.containsReturnCalls();
+            }
+        }
+
+        WasmFunctionRootNode[] directCallTargets = directCallCount == 0 ? null : new WasmFunctionRootNode[directCallCount];
+        int callNodeCount = indirectCallCount + (needsDirectReturnCallNodes ? directCallCount : 0);
+        Node[] callNodes = callNodeCount == 0 ? null : new Node[callNodeCount];
+        for (int i = 0; i < indirectCallCount; i++) {
+            callNodes[i] = WasmIndirectCallNode.create();
+        }
+        return new CallNodes(directCallTargets, callNodes);
+    }
+
+    private static void resolveDirectCallTargets(WasmInstance instance, CallTarget target, int[] callFunctionIndices) {
+        if (((RootCallTarget) target).getRootNode() instanceof WasmFunctionRootNode rootNode) {
+            WasmFunctionRootNode[] directCallTargets = rootNode.getDirectCallTargets();
+            if (directCallTargets == null) {
+                return;
+            }
+            int directCallIndex = 0;
+            for (int functionIndex : callFunctionIndices) {
+                WasmFunction function = instance.module().function(functionIndex);
+                if (!function.isImported()) {
+                    directCallTargets[directCallIndex++] = (WasmFunctionRootNode) ((RootCallTarget) instance.target(function.index())).getRootNode();
+                }
+            }
+            assert directCallIndex == directCallTargets.length;
+        }
     }
 }

@@ -24,13 +24,9 @@
  */
 package com.oracle.objectfile.macho;
 
-import java.util.HashSet;
 import java.util.Map;
 import java.util.Objects;
-import java.util.Set;
 import java.util.TreeMap;
-
-import org.graalvm.compiler.core.common.NumUtil;
 
 import com.oracle.objectfile.BuildDependency;
 import com.oracle.objectfile.LayoutDecisionMap;
@@ -45,6 +41,10 @@ import com.oracle.objectfile.io.AssemblyBuffer;
 import com.oracle.objectfile.io.OutputAssembler;
 import com.oracle.objectfile.macho.MachOObjectFile.MachOSection;
 import com.oracle.objectfile.macho.MachOObjectFile.Segment64Command;
+
+import jdk.graal.compiler.core.common.NumUtil;
+import jdk.graal.compiler.debug.GraalError;
+import org.graalvm.collections.EconomicSet;
 
 class MachORelocationElement extends MachOObjectFile.LinkEditElement {
     /*
@@ -67,7 +67,7 @@ class MachORelocationElement extends MachOObjectFile.LinkEditElement {
     }
 
     private Map<MachORelocationInfo, MachORelocationInfo> infos = new TreeMap<>(MachORelocationElement::compareSectionThenOffset);
-    private Set<MachOSection> relocatedSections = new HashSet<>();
+    private EconomicSet<MachOSection> relocatedSections = EconomicSet.create();
 
     MachORelocationElement(Segment64Command segment) {
         segment.getOwner().super("MachORelocationElement", segment);
@@ -82,7 +82,7 @@ class MachORelocationElement extends MachOObjectFile.LinkEditElement {
     }
 
     public boolean relocatesSegment(Segment64Command seg) {
-        return seg.elementsInSegment.stream().anyMatch(e -> e instanceof MachOSection && relocatedSections.contains(e));
+        return seg.elementsInSegment.stream().anyMatch(e -> e instanceof MachOSection && relocatedSections.contains((MachOSection) e));
     }
 
     @Override
@@ -188,7 +188,7 @@ enum X86_64Reloc implements MachORelocationType {
 enum ARM64Reloc implements MachORelocationType {
     UNSIGNED(0), // for pointers
     SUBTRACTOR(1), // must be followed by a ARM64_RELOC_UNSIGNED
-    BRANCH26(2), // a B/BL instruction with 26-bit displacement
+    BRANCH26(2, true), // a B/BL instruction with 26-bit displacement
     PAGE21(3, true), // pc-rel distance to page of target
     PAGEOFF12(4), // offset within page, scaled by r_length
     GOT_LOAD_PAGE21(5, true), // pc-rel distance to page of GOT slot
@@ -264,9 +264,10 @@ final class MachORelocationInfo implements RelocationRecord, RelocationMethod {
         this.log2length = (byte) ((requestedLength == 8) ? 3 : (requestedLength == 4) ? 2 : (requestedLength == 2) ? 1 : 0);
         this.kind = kind;
         SymbolTable symtab = relocatedSection.getOwner().getSymbolTable();
-        // FIXME: also allow section numbers here, for non-extern symbols
-        // FIXME: encode R_ABS symbol number
         this.sym = symtab.getSymbol(symbolName);
+        if (this.sym == null) {
+            throw new IllegalArgumentException("Could not find symbol " + symbolName);
+        }
         // if the symbol is defined in the same file, i.e. locally, we have a target section
         assert !asLocalReloc || this.sym.isDefined();
         this.targetSection = asLocalReloc ? (MachOSection) this.sym.getDefinedSection() : null;
@@ -280,7 +281,7 @@ final class MachORelocationInfo implements RelocationRecord, RelocationMethod {
     }
 
     static MachORelocationInfo createRelocation(MachORelocationElement containingElement, MachOSection relocatedSection, int offset, RelocationKind kind, String symbolName) {
-        int length = ObjectFile.RelocationKind.getRelocationSize(kind);
+        int length = kind.getRelocationSize();
         MachORelocationType type = getMachORelocationType(relocatedSection, kind);
         return new MachORelocationInfo(containingElement, relocatedSection, offset, length, type, symbolName, false, 0);
 
@@ -296,7 +297,7 @@ final class MachORelocationInfo implements RelocationRecord, RelocationMethod {
         int symbolNum;
         if (isAddendKind()) {
             assert !isExtern() : "addend must be encoded as a local";
-            assert NumUtil.isSignedNbit(24, addend);
+            GraalError.guarantee(NumUtil.isSignedNbit(24, addend), "Addend has to be 24bit signed number. Got value 0x%x", addend);
             // store addend as symbolnum
             symbolNum = addend;
         } else if (isExtern()) {
@@ -308,7 +309,7 @@ final class MachORelocationInfo implements RelocationRecord, RelocationMethod {
             assert sym.getDefinedOffset() == 0 : "Relocation for non-external symbol with section base offset != 0 not supported";
         }
         if (log2length < 0 || log2length >= 4) {
-            throw new IllegalArgumentException("length must be in {1,2,4,8} bytes, so log2length must be in [0,3]");
+            throw new IllegalArgumentException("Length must be in {1,2,4,8} bytes, so log2length must be in [0,3]");
         }
         int startPos = oa.pos();
         oa.write4Byte(sectionOffset);
@@ -322,13 +323,11 @@ final class MachORelocationInfo implements RelocationRecord, RelocationMethod {
          * case-splitting for endianness.
          */
         int remainingWord = 0;
-        //@formatter:off
         remainingWord |= symbolNum & 0x00ffffff;
         remainingWord |= (kind.isPCRelative() ? 1 : 0) << 24;
-        remainingWord |=            (log2length & 0x3) << 25;
-        remainingWord |=          (isExtern() ? 1 : 0) << 27;
-        remainingWord |=       (kind.getValue() & 0xf) << 28;
-        //@formatter:on
+        remainingWord |= (log2length & 0x3) << 25;
+        remainingWord |= (isExtern() ? 1 : 0) << 27;
+        remainingWord |= (kind.getValue() & 0xf) << 28;
         oa.write4Byte(remainingWord);
         assert oa.pos() - startPos == 8; // check we wrote how much we expected
     }
@@ -340,8 +339,6 @@ final class MachORelocationInfo implements RelocationRecord, RelocationMethod {
 
     @Override
     public Symbol getReferencedSymbol() {
-        // assert extern;
-        // FIXME: what about the !extern case?
         return sym;
     }
 
@@ -382,7 +379,7 @@ final class MachORelocationInfo implements RelocationRecord, RelocationMethod {
                         return X86_64Reloc.SIGNED;
                     default:
                     case UNKNOWN:
-                        throw new IllegalArgumentException("unknown relocation kind: " + kind);
+                        throw new IllegalArgumentException("Unknown relocation kind: " + kind);
                 }
             case ARM64:
                 switch (kind) {
@@ -401,10 +398,10 @@ final class MachORelocationInfo implements RelocationRecord, RelocationMethod {
                         return ARM64Reloc.PAGEOFF12;
                     default:
                     case UNKNOWN:
-                        throw new IllegalArgumentException("unknown relocation kind: " + kind);
+                        throw new IllegalArgumentException("Unknown relocation kind: " + kind);
                 }
             default:
-                throw new IllegalArgumentException("unknown relocation kind: " + kind);
+                throw new IllegalArgumentException("Unknown relocation kind: " + kind);
         }
     }
 

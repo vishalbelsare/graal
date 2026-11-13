@@ -26,14 +26,25 @@ package com.oracle.svm.core.thread;
 
 import java.util.Arrays;
 
-import org.graalvm.compiler.api.replacements.Fold;
 import org.graalvm.nativeimage.ImageSingletons;
 import org.graalvm.nativeimage.IsolateThread;
 import org.graalvm.nativeimage.Platform;
 import org.graalvm.nativeimage.Platforms;
 
-import com.oracle.svm.core.annotate.Uninterruptible;
+import com.oracle.svm.core.imagelayer.LayeredFoldResolver;
+import com.oracle.svm.guest.staging.core.thread.ThreadListener;
+import com.oracle.svm.shared.Uninterruptible;
+import com.oracle.svm.shared.singletons.AutomaticallyRegisteredImageSingleton;
+import com.oracle.svm.shared.singletons.traits.BuiltinTraits.AllAccess;
+import com.oracle.svm.shared.singletons.traits.BuiltinTraits.SingleLayer;
+import com.oracle.svm.shared.singletons.traits.SingletonLayeredInstallationKind.InitialLayerOnly;
+import com.oracle.svm.shared.singletons.traits.SingletonTraits;
+import com.oracle.svm.shared.util.VMError;
 
+import jdk.graal.compiler.api.replacements.Fold;
+
+@AutomaticallyRegisteredImageSingleton
+@SingletonTraits(access = AllAccess.class, layeredCallbacks = SingleLayer.class, layeredInstallationKind = InitialLayerOnly.class)
 public class ThreadListenerSupport {
     private ThreadListener[] listeners;
 
@@ -42,7 +53,6 @@ public class ThreadListenerSupport {
         listeners = new ThreadListener[0];
     }
 
-    // Checkstyle: allow synchronization.
     @Platforms(Platform.HOSTED_ONLY.class)
     public synchronized void register(ThreadListener listener) {
         assert listener != null;
@@ -51,24 +61,44 @@ public class ThreadListenerSupport {
         listeners = Arrays.copyOf(listeners, oldLength + 1);
         listeners[oldLength] = listener;
     }
-    // Checkstyle: disallow synchronization.
 
-    @Fold
+    @Fold(resolver = LayeredFoldResolver.InitialLayer.class)
     public static ThreadListenerSupport get() {
         return ImageSingletons.lookup(ThreadListenerSupport.class);
     }
 
     @Uninterruptible(reason = "Force that all listeners are uninterruptible.")
-    public void beforeThreadStart(IsolateThread isolateThread, Thread javaThread) {
-        for (int i = 0; i < listeners.length; i++) {
-            listeners[i].beforeThreadRun(isolateThread, javaThread);
+    public void afterThreadStart(IsolateThread isolateThread, Thread javaThread) {
+        for (ThreadListener listener : listeners) {
+            listener.afterThreadStart(isolateThread, javaThread);
+        }
+    }
+
+    public void beforeThreadRun() {
+        for (ThreadListener listener : listeners) {
+            listener.beforeThreadRun();
+        }
+    }
+
+    @Uninterruptible(reason = "Force that all listeners are uninterruptible.")
+    public void afterThreadRun() {
+        for (int i = listeners.length - 1; i >= 0; i--) {
+            try {
+                listeners[i].afterThreadRun();
+            } catch (Throwable e) {
+                throw VMError.shouldNotReachHere(e);
+            }
         }
     }
 
     @Uninterruptible(reason = "Force that all listeners are uninterruptible.")
     public void afterThreadExit(IsolateThread isolateThread, Thread javaThread) {
-        for (int i = 0; i < listeners.length; i++) {
-            listeners[i].afterThreadExit(isolateThread, javaThread);
+        for (int i = listeners.length - 1; i >= 0; i--) {
+            try {
+                listeners[i].afterThreadExit(isolateThread, javaThread);
+            } catch (Throwable e) {
+                throw VMError.shouldNotReachHere(e);
+            }
         }
     }
 }

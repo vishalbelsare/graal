@@ -20,20 +20,21 @@
  * or visit www.oracle.com if you need additional information or have any
  * questions.
  */
-
 package com.oracle.truffle.espresso.nodes.helper;
+
+import static com.oracle.truffle.espresso.vm.InterpreterToVM.outOfBoundsMessage;
 
 import com.oracle.truffle.api.CompilerDirectives;
 import com.oracle.truffle.api.CompilerDirectives.CompilationFinal;
-import com.oracle.truffle.api.nodes.Node;
+import com.oracle.truffle.espresso.EspressoLanguage;
 import com.oracle.truffle.espresso.impl.ArrayKlass;
 import com.oracle.truffle.espresso.meta.Meta;
+import com.oracle.truffle.espresso.nodes.EspressoNode;
 import com.oracle.truffle.espresso.nodes.bytecodes.InstanceOf;
 import com.oracle.truffle.espresso.nodes.bytecodes.InstanceOfFactory;
-import com.oracle.truffle.espresso.runtime.EspressoContext;
-import com.oracle.truffle.espresso.runtime.StaticObject;
+import com.oracle.truffle.espresso.runtime.staticobject.StaticObject;
 
-public final class EspressoReferenceArrayStoreNode extends Node {
+public final class EspressoReferenceArrayStoreNode extends EspressoNode {
 
     @Child InstanceOf.Dynamic instanceOfDynamic;
     @CompilationFinal boolean noOutOfBoundEx = true;
@@ -43,18 +44,17 @@ public final class EspressoReferenceArrayStoreNode extends Node {
         this.instanceOfDynamic = InstanceOfFactory.DynamicNodeGen.create();
     }
 
-    public void arrayStore(EspressoContext context, StaticObject value, int index, StaticObject array) {
-        if (Integer.compareUnsigned(index, array.length()) >= 0) {
+    public void arrayStore(EspressoLanguage language, Meta meta, StaticObject value, int index, StaticObject array) {
+        int length = array.length(language);
+        if (Integer.compareUnsigned(index, length) >= 0) {
             enterOutOfBound();
-            Meta meta = context.getMeta();
-            throw meta.throwException(meta.java_lang_ArrayIndexOutOfBoundsException);
+            throw meta.throwExceptionWithMessage(meta.java_lang_ArrayIndexOutOfBoundsException, outOfBoundsMessage(index, length));
         }
-        if (!StaticObject.isNull(value) && !instanceOfDynamic.execute(((ArrayKlass) array.getKlass()).getComponentType(), value.getKlass())) {
+        if (!StaticObject.isNull(value) && !instanceOfDynamic.execute(value.getKlass(), ((ArrayKlass) array.getKlass()).getComponentType())) {
             enterArrayStoreEx();
-            Meta meta = context.getMeta();
             throw meta.throwException(meta.java_lang_ArrayStoreException);
         }
-        (array.<Object[]> unwrap())[index] = value;
+        (array.<StaticObject[]> unwrap(language))[index] = value;
     }
 
     private void enterOutOfBound() {

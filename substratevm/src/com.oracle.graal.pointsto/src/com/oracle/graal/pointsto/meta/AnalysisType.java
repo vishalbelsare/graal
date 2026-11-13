@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2012, 2021, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2012, 2026, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -24,89 +24,125 @@
  */
 package com.oracle.graal.pointsto.meta;
 
-import java.lang.annotation.Annotation;
-import java.lang.reflect.Modifier;
+import java.lang.invoke.VarHandle;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collection;
-import java.util.Collections;
+import java.util.LinkedList;
 import java.util.List;
+import java.util.Queue;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.ConcurrentMap;
-import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReferenceFieldUpdater;
 import java.util.function.Consumer;
+import java.util.function.Function;
 
-import org.graalvm.compiler.debug.GraalError;
-import org.graalvm.compiler.graph.Node;
-import org.graalvm.util.GuardedAnnotationAccess;
+import org.graalvm.collections.EconomicSet;
+import org.graalvm.nativeimage.hosted.Feature.DuringAnalysisAccess;
 import org.graalvm.word.WordBase;
 
 import com.oracle.graal.pointsto.BigBang;
+import com.oracle.graal.pointsto.ObjectScanner.ScanReason;
 import com.oracle.graal.pointsto.PointsToAnalysis;
-import com.oracle.graal.pointsto.PointsToAnalysis.ConstantObjectsProfiler;
-import com.oracle.graal.pointsto.api.DefaultUnsafePartition;
-import com.oracle.graal.pointsto.api.PointstoOptions;
 import com.oracle.graal.pointsto.constraints.UnsupportedFeatureException;
 import com.oracle.graal.pointsto.flow.AllInstantiatedTypeFlow;
+import com.oracle.graal.pointsto.flow.TypeFlow;
 import com.oracle.graal.pointsto.flow.context.object.AnalysisObject;
 import com.oracle.graal.pointsto.flow.context.object.ConstantContextSensitiveObject;
-import com.oracle.graal.pointsto.infrastructure.OriginalClassProvider;
+import com.oracle.graal.pointsto.heap.TypeData;
 import com.oracle.graal.pointsto.infrastructure.WrappedJavaType;
 import com.oracle.graal.pointsto.typestate.TypeState;
+import com.oracle.graal.pointsto.util.AnalysisError;
 import com.oracle.graal.pointsto.util.AnalysisFuture;
 import com.oracle.graal.pointsto.util.AtomicUtils;
+import com.oracle.graal.pointsto.util.ConcurrentLightHashMap;
 import com.oracle.graal.pointsto.util.ConcurrentLightHashSet;
-import com.oracle.svm.util.UnsafePartitionKind;
+import com.oracle.svm.shared.util.LogUtils;
+import com.oracle.svm.util.GuestAccess;
+import com.oracle.svm.util.OriginalClassProvider;
+import com.oracle.svm.util.OriginalMethodProvider;
 
+import jdk.graal.compiler.debug.Assertions;
+import jdk.graal.compiler.debug.GraalError;
+import jdk.vm.ci.code.BytecodePosition;
 import jdk.vm.ci.meta.Assumptions.AssumptionResult;
-import jdk.vm.ci.meta.Constant;
 import jdk.vm.ci.meta.JavaConstant;
 import jdk.vm.ci.meta.JavaKind;
+import jdk.vm.ci.meta.JavaType;
+import jdk.vm.ci.meta.MetaUtil;
 import jdk.vm.ci.meta.PrimitiveConstant;
 import jdk.vm.ci.meta.ResolvedJavaField;
 import jdk.vm.ci.meta.ResolvedJavaMethod;
+import jdk.vm.ci.meta.ResolvedJavaRecordComponent;
 import jdk.vm.ci.meta.ResolvedJavaType;
 import jdk.vm.ci.meta.Signature;
+import jdk.vm.ci.meta.UnresolvedJavaType;
 
-public class AnalysisType implements WrappedJavaType, OriginalClassProvider, Comparable<AnalysisType> {
+public abstract class AnalysisType extends AnalysisElement implements WrappedJavaType, OriginalClassProvider, Comparable<AnalysisType> {
 
-    @SuppressWarnings("rawtypes")//
-    private static final AtomicReferenceFieldUpdater<AnalysisType, ConcurrentHashMap> UNSAFE_ACCESS_FIELDS_UPDATER = //
-                    AtomicReferenceFieldUpdater.newUpdater(AnalysisType.class, ConcurrentHashMap.class, "unsafeAccessedFields");
+    private static final AtomicReferenceFieldUpdater<AnalysisType, Object> UNSAFE_ACCESS_FIELDS_UPDATER = //
+                    AtomicReferenceFieldUpdater.newUpdater(AnalysisType.class, Object.class, "unsafeAccessedFields");
 
-    private static final AtomicReferenceFieldUpdater<AnalysisType, ConstantContextSensitiveObject> UNIQUE_CONSTANT_UPDATER = //
-                    AtomicReferenceFieldUpdater.newUpdater(AnalysisType.class, ConstantContextSensitiveObject.class, "uniqueConstant");
+    private static final AtomicReferenceFieldUpdater<AnalysisType, AnalysisObject> UNIQUE_CONSTANT_UPDATER = //
+                    AtomicReferenceFieldUpdater.newUpdater(AnalysisType.class, AnalysisObject.class, "uniqueConstant");
 
-    @SuppressWarnings("rawtypes")//
-    private static final AtomicReferenceFieldUpdater<AnalysisType, Object> INTERCEPTORS_UPDATER = //
-                    AtomicReferenceFieldUpdater.newUpdater(AnalysisType.class, Object.class, "interceptors");
+    private static final AtomicReferenceFieldUpdater<AnalysisType, Object> subtypeReachableNotificationsUpdater = AtomicReferenceFieldUpdater
+                    .newUpdater(AnalysisType.class, Object.class, "subtypeReachableNotifications");
+
+    private static final AtomicReferenceFieldUpdater<AnalysisType, Object> instantiatedNotificationsUpdater = AtomicReferenceFieldUpdater
+                    .newUpdater(AnalysisType.class, Object.class, "typeInstantiatedNotifications");
+
+    private static final AtomicReferenceFieldUpdater<AnalysisType, Object> objectReachableCallbacksUpdater = AtomicReferenceFieldUpdater
+                    .newUpdater(AnalysisType.class, Object.class, "objectReachableCallbacks");
+
+    private static final AtomicReferenceFieldUpdater<AnalysisType, Object> isInstantiatedUpdater = AtomicReferenceFieldUpdater
+                    .newUpdater(AnalysisType.class, Object.class, "isInstantiated");
+
+    private static final AtomicReferenceFieldUpdater<AnalysisType, Object> isUnsafeAllocatedUpdater = AtomicReferenceFieldUpdater
+                    .newUpdater(AnalysisType.class, Object.class, "isUnsafeAllocated");
+
+    private static final AtomicReferenceFieldUpdater<AnalysisType, Object> isReachableUpdater = AtomicReferenceFieldUpdater
+                    .newUpdater(AnalysisType.class, Object.class, "isReachable");
+
+    private static final AtomicReferenceFieldUpdater<AnalysisType, Object> isAnySubtypeInstantiatedUpdater = AtomicReferenceFieldUpdater
+                    .newUpdater(AnalysisType.class, Object.class, "isAnySubtypeInstantiated");
+
+    static final AtomicReferenceFieldUpdater<AnalysisType, Object> overrideableMethodsUpdater = AtomicReferenceFieldUpdater
+                    .newUpdater(AnalysisType.class, Object.class, "overrideableMethods");
+
+    private static final AtomicReferenceFieldUpdater<AnalysisType, Object> SUBTYPES_UPDATER = AtomicReferenceFieldUpdater.newUpdater(AnalysisType.class, Object.class, "subTypes");
+
+    private static final AtomicReferenceFieldUpdater<AnalysisType, Object> RESOLVED_METHODS_UPDATER = AtomicReferenceFieldUpdater.newUpdater(AnalysisType.class, Object.class, "resolvedMethods");
+
+    public static final AnalysisType[] EMPTY_ARRAY = new AnalysisType[0];
 
     protected final AnalysisUniverse universe;
     private final ResolvedJavaType wrapped;
+    private final String qualifiedName;
+    private final String unqualifiedName;
 
-    private final AtomicBoolean isInHeap = new AtomicBoolean();
-    private final AtomicBoolean isAllocated = new AtomicBoolean();
-    private final AtomicBoolean isReachable = new AtomicBoolean();
+    @SuppressWarnings("unused") private volatile Object isInstantiated;
+    /** Can be allocated via Unsafe or JNI, i.e., without executing a constructor. */
+    @SuppressWarnings("unused") private volatile Object isUnsafeAllocated;
+    @SuppressWarnings("unused") private volatile Object isReachable;
+    @SuppressWarnings("unused") private volatile Object isAnySubtypeInstantiated;
     private boolean reachabilityListenerNotified;
     private boolean unsafeFieldsRecomputed;
-    private boolean unsafeAccessedFieldsRegistered;
 
-    /**
-     * Unsafe accessed fields for this type.
-     *
-     * This field can be initialized during the multithreaded analysis phase in case of the computed
-     * value fields, thus we use the UNSAFE_ACCESS_FIELDS_UPDATER to initialize it.
-     */
-    private volatile ConcurrentHashMap<UnsafePartitionKind, Collection<AnalysisField>> unsafeAccessedFields;
+    @SuppressWarnings("unused") private volatile Object unsafeAccessedFields;
 
     /** Immediate subtypes and this type itself. */
-    private final Set<AnalysisType> subTypes;
+    @SuppressWarnings("unused") private volatile Object subTypes;
     AnalysisType superClass;
 
+    /**
+     * Unique id assigned to each {@link AnalysisType}. This id is consistent across layers and can
+     * be used to load or match a type in an extension layer.
+     */
     private final int id;
+    /** Marks a type loaded from a shared layer. */
+    private final boolean isInSharedLayer;
 
     private final JavaKind storageKind;
     private final boolean isCloneableWithAllocation;
@@ -114,13 +150,13 @@ public class AnalysisType implements WrappedJavaType, OriginalClassProvider, Com
     /** The unique context insensitive analysis object for this type. */
     private AnalysisObject contextInsensitiveAnalysisObject;
     /** Mapping from JavaConstant to the analysis ConstantObject. */
-    private ConcurrentMap<Constant, ConstantContextSensitiveObject> constantObjectsCache;
+    private ConcurrentMap<JavaConstant, AnalysisObject> constantObjectsCache;
     /**
      * A unique ConstantObject per analysis type. When the size of {@link #constantObjectsCache} is
      * above a threshold all the ConstantObject recorded until that moment are merged in the
      * {@link #uniqueConstant}.
      */
-    private volatile ConstantContextSensitiveObject uniqueConstant;
+    private volatile AnalysisObject uniqueConstant;
 
     /**
      * Cache for the resolved methods.
@@ -128,7 +164,7 @@ public class AnalysisType implements WrappedJavaType, OriginalClassProvider, Com
      * Map ResolvedJavaMethod to Object and not AnalysisMethod because when the type doesn't
      * implement the method the value stored is {@link AnalysisType#NULL_METHOD}.
      */
-    private final ConcurrentHashMap<ResolvedJavaMethod, Object> resolvedMethods = new ConcurrentHashMap<>();
+    @SuppressWarnings("unused") private volatile Object resolvedMethods;
 
     /**
      * Marker used in the {@link AnalysisType#resolvedMethods} map to signal that the type doesn't
@@ -140,27 +176,90 @@ public class AnalysisType implements WrappedJavaType, OriginalClassProvider, Com
     private final AnalysisType elementalType;
 
     private final AnalysisType[] interfaces;
+    private AnalysisType[] declaredTypes;
+    private AnalysisMethod[] declaredMethods;
 
     /* isArray is an expensive operation so we eagerly compute it */
     private final boolean isArray;
+    private final boolean isJavaLangObject;
 
     private final int dimension;
 
     @SuppressWarnings("unused") private volatile Object interceptors;
 
-    public enum UsageKind {
-        InHeap,
-        Allocated,
-        Reachable;
-    }
+    private final AnalysisFuture<Void> onTypeReachableTask;
+    private final AnalysisFuture<Void> initializeMetaDataTask;
 
-    private final AnalysisFuture<Void> initializationTask;
+    /**
+     * Additional information that is only available for types that are marked as reachable. It is
+     * preserved after analysis.
+     */
+    private final AnalysisFuture<TypeData> typeData;
 
-    AnalysisType(AnalysisUniverse universe, ResolvedJavaType javaType, JavaKind storageKind, AnalysisType objectType, AnalysisType cloneableType) {
+    /**
+     * Contains reachability handlers that are notified when any of the subtypes are marked as
+     * reachable. Each handler is notified only once per subtype.
+     */
+    @SuppressWarnings("unused") private volatile Object subtypeReachableNotifications;
+
+    /**
+     * The reachability handler that were registered at the time the type was marked as reachable.
+     * Reachability handler that are added by the user later on are not included in this list, i.e.,
+     * there is no guarantee that such handlers have finished execution before, e.g., reading values
+     * of fields in that type.
+     */
+    List<AnalysisFuture<Void>> scheduledTypeReachableNotifications;
+
+    /**
+     * Contains callbacks that are notified when this type is marked as instantiated. Each callback
+     * is called at least once, but there are no guarantees that it will be called exactly once.
+     */
+    @SuppressWarnings("unused") private volatile Object typeInstantiatedNotifications;
+
+    /**
+     * Contains callbacks that are executed when an object of this type is marked as reachable.
+     */
+    @SuppressWarnings("unused") private volatile Object objectReachableCallbacks;
+
+    /**
+     * All methods of this type that can be overridden, i.e., that are not statically bound. Note
+     * that this set can contain methods that are not returned by {@link #getDeclaredMethods}: For
+     * classes that contain interfaces, the VM creates synthetic bridge methods that are not in the
+     * class file and therefore not in the list of declared methods.
+     */
+    @SuppressWarnings("unused") private volatile Object overrideableMethods;
+
+    private volatile AnalysisType arrayClass = null;
+
+    /**
+     * Sentinel marker for the uninitialized state of {@link #permittedSubclasses}. Indicates that
+     * the permitted subclasses (for sealed types) has not yet been computed. Distinguishes this
+     * state from both a computed {@code null} (not sealed) and a computed list (which may be
+     * empty).
+     */
+    private static final List<AnalysisType> PERMITTED_SUBCLASSES_UNINITIALIZED = new ArrayList<>();
+    private volatile List<AnalysisType> permittedSubclasses = PERMITTED_SUBCLASSES_UNINITIALIZED;
+
+    @SuppressWarnings("this-escape")
+    public AnalysisType(AnalysisUniverse universe, ResolvedJavaType javaType, JavaKind storageKind, AnalysisType objectType, AnalysisType cloneableType) {
+        super(universe.hostVM.enableTrackAcrossLayers());
         this.universe = universe;
+        ResolvedJavaType originalType = OriginalClassProvider.getOriginalType(javaType);
+        AnalysisError.guarantee(originalType == null || originalType instanceof BaseLayerType || GuestAccess.get().owns(originalType),
+                        "Analysis type is not owned by the guest context: %s", javaType);
         this.wrapped = javaType;
+        qualifiedName = wrapped.toJavaName(true);
+        unqualifiedName = wrapped.toJavaName(false);
+
         isArray = wrapped.isArray();
+        isJavaLangObject = wrapped.isJavaLangObject();
         this.storageKind = storageKind;
+
+        if (!(isPrimitive() || isWordType())) {
+            this.instantiatedTypes = new AllInstantiatedTypeFlow(this, true);
+            this.instantiatedTypesNonNull = new AllInstantiatedTypeFlow(this, false);
+        }
+
         if (universe.analysisPolicy().needsConstantCache()) {
             this.constantObjectsCache = new ConcurrentHashMap<>();
         }
@@ -183,20 +282,6 @@ public class AnalysisType implements WrappedJavaType, OriginalClassProvider, Com
         /* Ensure the super types as well as the component type (for arrays) is created too. */
         superClass = universe.lookup(wrapped.getSuperclass());
         interfaces = convertTypes(wrapped.getInterfaces());
-
-        subTypes = ConcurrentHashMap.newKeySet();
-        addSubType(this);
-
-        /* Build subtypes. */
-        if (superClass != null) {
-            superClass.addSubType(this);
-        }
-        if (isInterface() && interfaces.length == 0) {
-            objectType.addSubType(this);
-        }
-        for (AnalysisType interf : interfaces) {
-            interf.addSubType(this);
-        }
 
         if (isArray()) {
             this.componentType = universe.lookup(wrapped.getComponentType());
@@ -224,7 +309,47 @@ public class AnalysisType implements WrappedJavaType, OriginalClassProvider, Com
         }
 
         /* Set id after accessing super types, so that all these types get a lower id number. */
-        this.id = universe.nextTypeId.getAndIncrement();
+        if (universe.hostVM().buildingExtensionLayer()) {
+            int tid = universe.getImageLayerLoader().lookupHostedTypeInBaseLayer(this);
+            if (tid != -1) {
+                /*
+                 * This id is the actual link between the corresponding type from the shared layer
+                 * and this new type.
+                 */
+                this.id = tid;
+                this.isInSharedLayer = true;
+            } else {
+                this.id = universe.computeNextTypeId();
+                /*
+                 * If both the BaseLayerType and the complete type are created at the same time,
+                 * there can be a race for the shared layer id. It is possible that the complete
+                 * type gets the shared layer id even though the BaseLayerType is created. In this
+                 * case, the AnalysisType should still be marked as isInSharedLayer.
+                 */
+                this.isInSharedLayer = wrapped instanceof BaseLayerType;
+            }
+        } else {
+            this.id = universe.computeNextTypeId();
+            this.isInSharedLayer = false;
+        }
+
+        /*
+         * Only after setting the id, the hashCode and compareTo methods work properly. So only now
+         * it is allowed to put the type into a hashmap, e.g., invoke addSubType.
+         */
+        addSubType(this);
+
+        /* Build subtypes. */
+        if (superClass != null) {
+            superClass.addSubType(this);
+        }
+        if (isInterface() && interfaces.length == 0) {
+            objectType.addSubType(this);
+        }
+        for (AnalysisType interf : interfaces) {
+            interf.addSubType(this);
+        }
+
         /* Set the context insensitive analysis object so that it has access to its type id. */
         this.contextInsensitiveAnalysisObject = new AnalysisObject(universe, this);
 
@@ -237,7 +362,12 @@ public class AnalysisType implements WrappedJavaType, OriginalClassProvider, Com
         }
 
         /* The registration task initializes the type. */
-        this.initializationTask = new AnalysisFuture<>(() -> universe.hostVM.initializeType(this), null);
+        this.onTypeReachableTask = new AnalysisFuture<>(() -> universe.onTypeReachable(this), null);
+        this.initializeMetaDataTask = new AnalysisFuture<>(() -> universe.initializeMetaData(this), null);
+        this.typeData = new AnalysisFuture<>(() -> {
+            AnalysisError.guarantee(universe.getHeapScanner() != null, "Heap scanner is not available.");
+            return universe.getHeapScanner().computeTypeData(this);
+        });
     }
 
     private AnalysisType[] convertTypes(ResolvedJavaType[] originalTypes) {
@@ -248,7 +378,7 @@ public class AnalysisType implements WrappedJavaType, OriginalClassProvider, Com
             }
             result.add(universe.lookup(originalType));
         }
-        return result.toArray(new AnalysisType[result.size()]);
+        return result.toArray(AnalysisType.EMPTY_ARRAY);
     }
 
     public AnalysisType getArrayClass(int dim) {
@@ -257,6 +387,10 @@ public class AnalysisType implements WrappedJavaType, OriginalClassProvider, Com
             result = result.getArrayClass();
         }
         return result;
+    }
+
+    public int getArrayDimension() {
+        return dimension;
     }
 
     public void cleanupAfterAnalysis() {
@@ -268,10 +402,15 @@ public class AnalysisType implements WrappedJavaType, OriginalClassProvider, Com
         constantObjectsCache = null;
         uniqueConstant = null;
         unsafeAccessedFields = null;
+        scheduledTypeReachableNotifications = null;
     }
 
     public int getId() {
         return id;
+    }
+
+    public boolean isInSharedLayer() {
+        return isInSharedLayer;
     }
 
     public AnalysisObject getContextInsensitiveAnalysisObject() {
@@ -282,14 +421,14 @@ public class AnalysisType implements WrappedJavaType, OriginalClassProvider, Com
         return uniqueConstant;
     }
 
-    public AnalysisObject getCachedConstantObject(PointsToAnalysis bb, JavaConstant constant) {
+    public AnalysisObject getCachedConstantObject(PointsToAnalysis bb, JavaConstant constant, Function<JavaConstant, AnalysisObject> constantTransformer) {
 
         /*
-         * Constant caching is only used we certain analysis policies. Ideally we would store the
+         * Constant caching is only used with certain analysis policies. Ideally we would store the
          * cache in the policy, but it is simpler to store the cache for each type.
          */
         assert bb.analysisPolicy().needsConstantCache() : "The analysis policy doesn't specify the need for a constants cache.";
-        assert bb.trackConcreteAnalysisObjects(this);
+        assert bb.trackConcreteAnalysisObjects(this) : this;
         assert !(constant instanceof PrimitiveConstant) : "The analysis should not model PrimitiveConstant.";
 
         if (uniqueConstant != null) {
@@ -297,41 +436,31 @@ public class AnalysisType implements WrappedJavaType, OriginalClassProvider, Com
             return uniqueConstant;
         }
 
-        if (constantObjectsCache.size() >= PointstoOptions.MaxConstantObjectsPerType.getValue(bb.getOptions())) {
+        /* If maxConstantObjectsPerType is 0 there is no limit, i.e., we track all constants. */
+        if (bb.maxConstantObjectsPerType() > 0 && constantObjectsCache.size() >= bb.maxConstantObjectsPerType()) {
             // The number of constant objects has increased above the limit,
             // merge the constants in the uniqueConstant and return it
             mergeConstantObjects(bb);
             return uniqueConstant;
         }
 
-        // Get the analysis ConstantObject modeling the JavaConstant
-        AnalysisObject result = constantObjectsCache.get(constant);
-        if (result == null) {
-            // Create a ConstantObject to model each JavaConstant
-            ConstantContextSensitiveObject newValue = new ConstantContextSensitiveObject(bb, this, constant);
-            ConstantContextSensitiveObject oldValue = constantObjectsCache.putIfAbsent(constant, newValue);
-            result = oldValue != null ? oldValue : newValue;
-
-            if (PointstoOptions.ProfileConstantObjects.getValue(bb.getOptions())) {
-                ConstantObjectsProfiler.registerConstant(this);
-                ConstantObjectsProfiler.maybeDumpConstantHistogram();
-            }
-        }
-
-        return result;
+        /* Get the analysis ConstantObject modeling the JavaConstant. */
+        return constantObjectsCache.computeIfAbsent(constant, constantTransformer);
     }
 
     private void mergeConstantObjects(PointsToAnalysis bb) {
-        ConstantContextSensitiveObject uConstant = new ConstantContextSensitiveObject(bb, this, null);
+        ConstantContextSensitiveObject uConstant = new ConstantContextSensitiveObject(bb, this);
         if (UNIQUE_CONSTANT_UPDATER.compareAndSet(this, null, uConstant)) {
-            constantObjectsCache.values().stream().forEach(constantObject -> {
+            constantObjectsCache.values().forEach(constantObject -> {
                 /*
                  * The order of the two lines below matters: setting the merged flag first, before
                  * doing the actual merging, ensures that concurrent updates to the flow are still
                  * merged correctly.
                  */
-                constantObject.setMergedWithUniqueConstantObject();
-                constantObject.mergeInstanceFieldsFlows(bb, uniqueConstant);
+                if (constantObject instanceof ConstantContextSensitiveObject ct) {
+                    ct.setMergedWithUniqueConstantObject();
+                    ct.mergeInstanceFieldsFlows(bb, uniqueConstant);
+                }
             });
         }
     }
@@ -350,15 +479,17 @@ public class AnalysisType implements WrappedJavaType, OriginalClassProvider, Com
      * type is marked as instantiated, e.g., a saturated field access type flow needs to be notified
      * when a sub-type of its declared type is marked as instantiated.
      */
-    public AllInstantiatedTypeFlow instantiatedTypes = new AllInstantiatedTypeFlow(this, true);
-    public AllInstantiatedTypeFlow instantiatedTypesNonNull = new AllInstantiatedTypeFlow(this, false);
+    public AllInstantiatedTypeFlow instantiatedTypes;
+    public AllInstantiatedTypeFlow instantiatedTypesNonNull;
 
     /*
-     * Returns a type flow containing all types that are assignable from this type and are also
-     * instantiated.
+     * Returns a generic type flow containing a) all types that are assignable from this type and
+     * are also instantiated for objects or b) any primitive value for primitives.
      */
-    public AllInstantiatedTypeFlow getTypeFlow(@SuppressWarnings("unused") BigBang bb, boolean includeNull) {
-        if (includeNull) {
+    public TypeFlow<?> getTypeFlow(@SuppressWarnings("unused") BigBang bb, boolean includeNull) {
+        if (isPrimitive() || isWordType()) {
+            return ((PointsToAnalysis) bb).getAnyPrimitiveSourceTypeFlow();
+        } else if (includeNull) {
             return instantiatedTypes;
         } else {
             return instantiatedTypesNonNull;
@@ -379,7 +510,7 @@ public class AnalysisType implements WrappedJavaType, OriginalClassProvider, Com
     }
 
     public static boolean verifyAssignableTypes(BigBang bb) {
-        List<AnalysisType> allTypes = bb.getUniverse().getTypes();
+        List<AnalysisType> allTypes = bb.getUniverse().getTypes().stream().filter(t -> !(t.getWrapped() instanceof BaseLayerType)).toList();
 
         Set<String> mismatchedAssignableResults = ConcurrentHashMap.newKeySet();
         allTypes.parallelStream().filter(t -> t.instantiatedTypes != null).forEach(t1 -> {
@@ -401,48 +532,38 @@ public class AnalysisType implements WrappedJavaType, OriginalClassProvider, Com
             }
         });
         if (!mismatchedAssignableResults.isEmpty()) {
-            mismatchedAssignableResults.forEach(System.err::println);
+            mismatchedAssignableResults.forEach(System.out::println);
             throw new AssertionError("Verification of all-instantiated type flows failed");
         }
         return true;
     }
 
-    public boolean registerAsInHeap() {
-        registerAsReachable();
-        if (AtomicUtils.atomicMark(isInHeap)) {
-            registerAsInstantiated(UsageKind.InHeap);
-            return true;
-        }
-        return false;
-    }
-
     /**
-     * @param node For future use and debugging
+     * @param reason the {@link BytecodePosition} where this type is marked as instantiated, or a
+     *            {@link com.oracle.graal.pointsto.ObjectScanner.ScanReason}, or a {@link String}
+     *            describing why this type was manually marked as in-heap
      */
-    public boolean registerAsAllocated(Node node) {
-        registerAsReachable();
-        if (AtomicUtils.atomicMark(isAllocated)) {
-            registerAsInstantiated(UsageKind.Allocated);
+    public boolean registerAsInstantiated(Object reason) {
+        assert isValidReason(reason) : "Registering a type as instantiated needs to provide a valid reason.";
+        registerAsReachable(reason);
+        if (AtomicUtils.atomicSet(this, reason, isInstantiatedUpdater)) {
+            onInstantiated();
             return true;
         }
         return false;
     }
 
-    /** Register the type as instantiated with all its super types. */
-    private void registerAsInstantiated(UsageKind usageKind) {
-        assert isAllocated.get() || isInHeap.get();
-        assert isArray() || (isInstanceClass() && !Modifier.isAbstract(getModifiers())) : this;
-        universe.hostVM.checkForbidden(this, usageKind);
+    protected void onInstantiated() {
+        assert !isWordType() : Assertions.errorMessage("Word types cannot be instantiated", this);
+        forAllSuperTypes(superType -> AtomicUtils.atomicSet(superType, this, isAnySubtypeInstantiatedUpdater));
 
-        PointsToAnalysis bb = ((PointsToAnalysis) universe.getBigbang());
-        TypeState typeState = TypeState.forExactType(bb, this, true);
-        TypeState typeStateNonNull = TypeState.forExactType(bb, this, false);
+        universe.onTypeInstantiated(this);
+        notifyInstantiatedCallbacks();
+    }
 
-        /* Register the instantiated type with its super types. */
-        forAllSuperTypes(t -> {
-            t.instantiatedTypes.addState(bb, typeState);
-            t.instantiatedTypesNonNull.addState(bb, typeStateNonNull);
-        });
+    public boolean registerAsUnsafeAllocated(Object reason) {
+        registerAsInstantiated(reason);
+        return AtomicUtils.atomicSet(this, reason, isUnsafeAllocatedUpdater);
     }
 
     /**
@@ -450,71 +571,203 @@ public class AnalysisType implements WrappedJavaType, OriginalClassProvider, Com
      * that the type is registered with all its super types before it is propagated by the analysis
      * through type flows.
      */
+    @SuppressWarnings("unused")
     public void registerAsAssignable(BigBang bb) {
-        TypeState typeState = TypeState.forType(((PointsToAnalysis) bb), this, true);
-        /*
-         * Register the assignable type with its super types. Skip this type, it can lead to a
-         * deadlock when this is called when the type is created.
-         */
-        forAllSuperTypes(t -> t.addAssignableType(bb, typeState), false);
-        /* Register the type as assignable to itself. */
-        this.addAssignableType(bb, typeState);
     }
 
-    public boolean registerAsReachable() {
-        if (!isReachable.get()) {
-            forAllSuperTypes(AnalysisType::markReachable);
+    public boolean registerAsReachable(Object reason) {
+        assert isValidReason(reason) : "Registering a type as reachable needs to provide a valid reason.";
+        if (!AtomicUtils.isSet(this, isReachableUpdater)) {
+            /* First mark all super types as reachable. */
+            forAllSuperTypes(type -> type.registerAsReachable(reason), false);
+            /*
+             * Only mark this type itself as reachable after marking all supertypes. This ensures
+             * that, e.g., a type is never seen as reachable by another thread before all of its
+             * supertypes are already marked as reachable too. Note that this does *not* guarantee
+             * that the onReachable hook for all supertypes is already finished, because they can
+             * still be running in another thread.
+             */
+            AtomicUtils.atomicSetAndRun(this, reason, isReachableUpdater, () -> onReachable(reason));
             return true;
         }
         return false;
     }
 
-    private void markReachable() {
-        if (AtomicUtils.atomicMark(isReachable)) {
-            universe.hostVM.checkForbidden(this, UsageKind.Reachable);
-            if (isArray()) {
-                /*
-                 * For array types, distinguishing between "used" and "instantiated" does not
-                 * provide any benefits since array types do not implement new methods. Marking all
-                 * used array types as instantiated too allows more usages of Arrays.newInstance
-                 * without the need of explicit registration of types for reflection.
-                 */
-                registerAsAllocated(null);
-            }
-            ensureInitialized();
+    @Override
+    protected void onReachable(Object reason) {
+        registerAsTrackedAcrossLayers(reason);
+
+        List<AnalysisFuture<Void>> futures = new ArrayList<>();
+        notifyReachabilityCallbacks(universe, futures);
+        forAllSuperTypes(type -> ConcurrentLightHashSet.forEach(type, subtypeReachableNotificationsUpdater,
+                        (SubtypeReachableNotification n) -> futures.add(n.notifyCallback(universe, this))));
+
+        if (futures.size() > 0) {
+            scheduledTypeReachableNotifications = futures;
         }
+
+        if (isInSharedLayer && !(wrapped instanceof BaseLayerType)) {
+            /*
+             * Since the analysis of the type is skipped, the fields have to be created manually to
+             * ensure their flags are loaded from the base layer. Not creating the fields would
+             * cause inconsistency issues between the size of objects from the base and the
+             * extension layers.
+             */
+            getInstanceFields(true);
+            getStaticFields();
+        }
+
+        universe.notifyReachableType();
+        if (isArray()) {
+            /*
+             * For array types, distinguishing between "used" and "instantiated" does not provide
+             * any benefits since array types do not implement new methods. Marking all used array
+             * types as instantiated too allows more usages of Arrays.newInstance without the need
+             * of explicit registration of types for reflection.
+             */
+            registerAsInstantiated("All array types are marked as instantiated eagerly.");
+        }
+
+        universe.getBigbang().postTask(unused -> forAllSuperTypes(this::prepareMethodImplementations, false));
+
+        ensureOnTypeReachableTaskDone();
+    }
+
+    @Override
+    protected void onTrackedAcrossLayers(Object reason) {
+        AnalysisError.guarantee(!getUniverse().sealed(), "Type %s was marked as tracked after the universe was sealed", this);
+        if (superClass != null) {
+            superClass.registerAsTrackedAcrossLayers(reason);
+        }
+        for (AnalysisType inter : interfaces) {
+            inter.registerAsTrackedAcrossLayers(reason);
+        }
+        try {
+            AnalysisType enclosingType = getEnclosingType();
+            if (enclosingType != null) {
+                enclosingType.registerAsTrackedAcrossLayers(reason);
+            }
+        } catch (InternalError | TypeNotPresentException | LinkageError e) {
+            /*
+             * Ignore missing type errors. The build process should not fail if the incomplete type
+             * is not reached through other paths.
+             */
+        }
+        /*
+         * Track fields of tracked types to ensure the analysis results are transferred across
+         * layers. This is important for things such as object layout decisions made in later
+         * layers.
+         */
+        for (var field : getInstanceFields(true)) {
+            ((AnalysisField) field).registerAsTrackedAcrossLayers(reason);
+        }
+        for (var field : getStaticFields()) {
+            ((AnalysisField) field).registerAsTrackedAcrossLayers(reason);
+        }
+    }
+
+    /** Prepare information that {@link AnalysisMethod#collectMethodImplementations} needs. */
+    private void prepareMethodImplementations(AnalysisType superType) {
+        ConcurrentLightHashSet.forEach(superType, overrideableMethodsUpdater, (AnalysisMethod method) -> {
+            assert !method.canBeStaticallyBound() && !method.isConstructor() : method;
+
+            AnalysisMethod override = resolveConcreteMethod(method, null);
+            if (override != null && !override.equals(method)) {
+                ConcurrentLightHashSet.addElement(method, AnalysisMethod.allImplementationsUpdater, override);
+                if (method.reachableInCurrentLayer()) {
+                    override.setReachableInCurrentLayer();
+                }
+            }
+        });
+    }
+
+    public void registerSubtypeReachabilityNotification(SubtypeReachableNotification notification) {
+        ConcurrentLightHashSet.addElement(this, subtypeReachableNotificationsUpdater, notification);
+    }
+
+    public void registerObjectReachableCallback(JVMCIObjectReachableCallback callback) {
+        ConcurrentLightHashSet.addElement(this, objectReachableCallbacksUpdater, callback);
+        /* Register the callback with already discovered subtypes too. */
+        ConcurrentLightHashSet.forEach(this, SUBTYPES_UPDATER, (AnalysisType subType) -> {
+            /* Subtypes include this type itself. */
+            if (!subType.equals(this)) {
+                subType.registerObjectReachableCallback(callback);
+            }
+        });
+    }
+
+    public void notifyObjectReachable(JavaConstant object, ScanReason reason) {
+        ConcurrentLightHashSet.forEach(this, objectReachableCallbacksUpdater,
+                        (JVMCIObjectReachableCallback c) -> c.doCallback(universe.getConcurrentAnalysisAccess(), object, reason));
+    }
+
+    /**
+     * Returns whether this type currently has object-reachability callbacks registered.
+     */
+    public boolean hasReachabilityCallbacks() {
+        return ConcurrentLightHashSet.size(this, objectReachableCallbacksUpdater) > 0;
+    }
+
+    public void registerInstantiatedCallback(Consumer<DuringAnalysisAccess> callback) {
+        if (this.isInstantiated()) {
+            /* If the type is already instantiated just trigger the callback. */
+            callback.accept(universe.getConcurrentAnalysisAccess());
+        } else {
+            ElementNotification notification = new ElementNotification(callback);
+            ConcurrentLightHashSet.addElement(this, instantiatedNotificationsUpdater, notification);
+            if (this.isInstantiated()) {
+                /*
+                 * If the type became instantiated during registration manually trigger the
+                 * callback.
+                 */
+                notifyInstantiatedCallback(notification);
+            }
+        }
+    }
+
+    private void notifyInstantiatedCallback(ElementNotification notification) {
+        notification.notifyCallback(universe, this);
+        ConcurrentLightHashSet.removeElement(this, instantiatedNotificationsUpdater, notification);
+    }
+
+    protected void notifyInstantiatedCallbacks() {
+        ConcurrentLightHashSet.forEach(this, instantiatedNotificationsUpdater, (ElementNotification c) -> c.notifyCallback(universe, this));
+        ConcurrentLightHashSet.removeElementIf(this, instantiatedNotificationsUpdater, ElementNotification::isNotified);
     }
 
     /**
      * Iterates all super types for this type, where a super type is defined as any type that is
      * assignable from this type, feeding each of them to the consumer.
-     * 
+     *
      * For a class B extends A, the array type A[] is not a superclass of the array type B[]. So
      * there is no strict need to make A[] reachable when B[] is reachable. But it turns out that
      * this is puzzling for users, and there are frameworks that instantiate such arrays
      * programmatically using Array.newInstance(). To reduce the amount of manual configuration that
      * is necessary, we mark all array types of the elemental supertypes and superinterfaces also as
      * reachable.
-     * 
+     *
      * Moreover, even if B extends A doesn't imply that B[] extends A[] it does imply that
      * A[].isAssignableFrom(B[]).
-     * 
+     *
      * NOTE: This method doesn't guarantee that a super type will only be processed once. For
      * example when java.lang.Class is processed its interface java.lang.reflect.AnnotatedElement is
      * reachable directly, but also through java.lang.GenericDeclaration, so it will be processed
      * twice.
      */
-    private void forAllSuperTypes(Consumer<AnalysisType> superTypeConsumer) {
+    public void forAllSuperTypes(Consumer<AnalysisType> superTypeConsumer) {
         forAllSuperTypes(superTypeConsumer, true);
     }
 
-    private void forAllSuperTypes(Consumer<AnalysisType> superTypeConsumer, boolean includeThisType) {
+    protected void forAllSuperTypes(Consumer<AnalysisType> superTypeConsumer, boolean includeThisType) {
         forAllSuperTypes(elementalType, dimension, includeThisType, superTypeConsumer);
         for (int i = 0; i < dimension; i++) {
             forAllSuperTypes(this, i, false, superTypeConsumer);
         }
         if (dimension > 0 && !elementalType.isPrimitive() && !elementalType.isJavaLangObject()) {
             forAllSuperTypes(universe.objectType(), dimension, true, superTypeConsumer);
+        }
+        if (this.isInterface()) {
+            superTypeConsumer.accept(universe.objectType());
         }
     }
 
@@ -531,14 +784,23 @@ public class AnalysisType implements WrappedJavaType, OriginalClassProvider, Com
         forAllSuperTypes(elementType.getSuperclass(), arrayDimension, true, superTypeConsumer);
     }
 
-    private synchronized void addAssignableType(BigBang bb, TypeState typeState) {
+    protected synchronized void addAssignableType(BigBang bb, TypeState typeState) {
         assignableTypesState = TypeState.forUnion(((PointsToAnalysis) bb), assignableTypesState, typeState);
         assignableTypesNonNullState = assignableTypesState.forNonNull(((PointsToAnalysis) bb));
     }
 
-    public void ensureInitialized() {
+    public TypeData getOrComputeData() {
+        GraalError.guarantee(isReachable(), "TypeData is only available for reachable types");
+        return this.typeData.ensureDone();
+    }
+
+    public void ensureOnTypeReachableTaskDone() {
         /* Run the registration and wait for it to complete, if necessary. */
-        initializationTask.ensureDone();
+        onTypeReachableTask.ensureDone();
+    }
+
+    public AnalysisFuture<Void> getInitializeMetaDataTask() {
+        return initializeMetaDataTask;
     }
 
     public boolean getReachabilityListenerNotified() {
@@ -566,67 +828,16 @@ public class AnalysisType implements WrappedJavaType, OriginalClassProvider, Com
      * This is controlled by the isUnsafeAccessed flag in the AnalysField. Also, a field cannot be
      * part of more than one partitions.
      */
-    public void registerUnsafeAccessedField(AnalysisField field, UnsafePartitionKind partitionKind) {
-
-        unsafeAccessedFieldsRegistered = true;
-
-        if (unsafeAccessedFields == null) {
-            /* Lazily initialize the map, not all types have unsafe accessed fields. */
-            UNSAFE_ACCESS_FIELDS_UPDATER.compareAndSet(this, null, new ConcurrentHashMap<>());
-        }
-
-        Collection<AnalysisField> unsafePartition = unsafeAccessedFields.get(partitionKind);
-        if (unsafePartition == null) {
-            /*
-             * We use a thread safe collection to store an unsafe accessed fields partition. Since
-             * elements can be added to it concurrently using a non thread safe collection, such as
-             * an array list, can result in null being added to the list. Since we don't need index
-             * access ConcurrentLinkedQueue is a good match.
-             */
-            Collection<AnalysisField> newPartition = new ConcurrentLinkedQueue<>();
-            Collection<AnalysisField> oldPartition = unsafeAccessedFields.putIfAbsent(partitionKind, newPartition);
-            unsafePartition = oldPartition != null ? oldPartition : newPartition;
-        }
-
-        assert !unsafePartition.contains(field) : "Field " + field + " already registered as unsafe accessed with " + this;
-        unsafePartition.add(field);
+    public void registerUnsafeAccessedField(AnalysisField field) {
+        AnalysisError.guarantee(!universe.analysisPolicy().useConservativeUnsafeAccess(), "With conservative unsafe access we don't track unsafe accessed fields.");
+        ConcurrentLightHashSet.addElement(this, UNSAFE_ACCESS_FIELDS_UPDATER, field);
     }
 
-    private boolean hasUnsafeAccessedFields() {
+    public Collection<AnalysisField> unsafeAccessedFields() {
+        AnalysisError.guarantee(!universe.analysisPolicy().useConservativeUnsafeAccess(), "With conservative unsafe access we don't track unsafe accessed fields.");
         /*
-         * Walk up the inheritance chain, as soon as we encounter a class that has unsafe accessed
-         * fields we return true, otherwise we reach the top of the hierarchy and return false.
-         *
-         * Since unsafe accessed fields can be registered on the fly, i.e., during the analysis, we
-         * cannot cache this result. If we cached the result and the result was false, i.e., no
-         * unsafe accessed fields were registered yet, we would have to invalidate it when a field
-         * is registered as unsafe during the analysis and then walk down the type hierarchy and
-         * invalidate the cached value of all the sub-types.
-         */
-        return unsafeAccessedFieldsRegistered || (getSuperclass() != null ? getSuperclass().hasUnsafeAccessedFields() : false);
-    }
-
-    public List<AnalysisField> unsafeAccessedFields() {
-        return unsafeAccessedFields(DefaultUnsafePartition.get());
-    }
-
-    public List<AnalysisField> unsafeAccessedFields(UnsafePartitionKind partitionKind) {
-        if (!hasUnsafeAccessedFields()) {
-            /*
-             * Do a quick check if this type has unsafe accessed fields before constructing the data
-             * structures holding all the unsafe accessed fields: the ones of this type and the ones
-             * up its type hierarchy.
-             */
-            return Collections.emptyList();
-        }
-        return allUnsafeAccessedFields(partitionKind);
-    }
-
-    private List<AnalysisField> allUnsafeAccessedFields(UnsafePartitionKind partitionKind) {
-        /*
-         * Walk up the type hierarchy and build the unsafe partition containing all the unsafe
-         * fields of the current type and all its super types. The unsafePartition collection
-         * doesn't need to be thread safe since updates to it are only done on the current thread.
+         * Walk up the type hierarchy and collect all the unsafe fields of the current type and all
+         * its super types. We optimize for the most likely outcome: the returned list is empty.
          *
          * The resulting list could be cached but the caching mechanism is complicated by
          * registering unsafe accessed fields during the analysis. When a field is registered as
@@ -636,20 +847,46 @@ public class AnalysisType implements WrappedJavaType, OriginalClassProvider, Com
          * Caching would still be possible, but it would be unnecessary complicated and prone to
          * race conditions.
          */
-        List<AnalysisField> unsafePartition = new ArrayList<>();
-        unsafePartition.addAll(unsafeAccessedFields != null && unsafeAccessedFields.containsKey(partitionKind) ? unsafeAccessedFields.get(partitionKind) : Collections.emptyList());
-        if (getSuperclass() != null) {
-            List<AnalysisField> superFileds = getSuperclass().allUnsafeAccessedFields(partitionKind);
-            unsafePartition.addAll(superFileds);
+        Collection<AnalysisField> result = null;
+        for (AnalysisType cur = this; cur != null; cur = cur.getSuperclass()) {
+            Collection<AnalysisField> curFields = ConcurrentLightHashSet.getElements(cur, UNSAFE_ACCESS_FIELDS_UPDATER);
+            if (curFields.size() > 0) {
+                if (result == null) {
+                    /* First type with unsafe fields, no need for a copy yet. */
+                    result = curFields;
+                } else {
+                    if (!(result instanceof ArrayList)) {
+                        /* Second type with unsafe fields, we need our own list to accumulate. */
+                        result = new ArrayList<>(result);
+                    }
+                    result.addAll(curFields);
+                }
+            }
         }
-
-        return unsafePartition;
+        return result == null ? List.of() : result;
     }
 
     public boolean isInstantiated() {
-        boolean instantiated = isInHeap.get() || isAllocated.get();
-        assert !instantiated || isReachable.get();
+        boolean instantiated = AtomicUtils.isSet(this, isInstantiatedUpdater);
+        assert !instantiated || isReachable() : this;
         return instantiated;
+    }
+
+    public Object getInstantiatedReason() {
+        return isInstantiated;
+    }
+
+    public Object getAnyInstantiatedSubtype() {
+        return isAnySubtypeInstantiated;
+    }
+
+    public boolean isUnsafeAllocated() {
+        return AtomicUtils.isSet(this, isUnsafeAllocatedUpdater);
+    }
+
+    /** Returns true if this type or any of its subtypes was marked as instantiated. */
+    public boolean isAnySubtypeInstantiated() {
+        return AtomicUtils.isSet(this, isAnySubtypeInstantiatedUpdater);
     }
 
     /**
@@ -661,8 +898,13 @@ public class AnalysisType implements WrappedJavaType, OriginalClassProvider, Com
         return unsafeFieldsRecomputed;
     }
 
+    @Override
     public boolean isReachable() {
-        return isReachable.get();
+        return AtomicUtils.isSet(this, isReachableUpdater);
+    }
+
+    public Object getReachableReason() {
+        return isReachable;
     }
 
     /**
@@ -680,26 +922,55 @@ public class AnalysisType implements WrappedJavaType, OriginalClassProvider, Com
      */
     public boolean isWordType() {
         /* Word types are currently the only types where kind and storageKind differ. */
-        return getJavaKind() != getStorageKind();
+        boolean wordType = getJavaKind() != getStorageKind();
+        assert !wordType || getJavaKind().isObject() : Assertions.errorMessage("Only words are expected to have a discrepancy between java kind and storage kind", this);
+        return wordType;
     }
 
     @Override
     public ResolvedJavaType getWrapped() {
-        return universe.substitutions.resolve(wrapped);
-    }
-
-    public ResolvedJavaType getWrappedWithoutResolve() {
         return wrapped;
     }
 
+    /**
+     * Returns whether this type is backed by a host VM type rather than an incomplete placeholder
+     * loaded from a shared layer.
+     */
+    public boolean isBackedByHostType() {
+        return !(wrapped instanceof BaseLayerType);
+    }
+
     @Override
-    public Class<?> getJavaClass() {
-        return OriginalClassProvider.getJavaClass(universe.getOriginalSnippetReflection(), wrapped);
+    public ResolvedJavaType unwrapTowardsOriginalType() {
+        return wrapped;
     }
 
     @Override
     public final String getName() {
         return wrapped.getName();
+    }
+
+    /**
+     * Array names must incorporate substituted component names rather than the original VM name
+     * retained by the wrapped array type. This keeps runtime class names consistent with their
+     * component types, including when names are constant-folded.
+     */
+    @Override
+    public String toClassName() {
+        if (isArray()) {
+            return MetaUtil.internalNameToJava("[".repeat(getArrayDimension()) + getElementalType().getName(), true, true);
+        }
+        return wrapped.toClassName();
+    }
+
+    @Override
+    public String toJavaName() {
+        return qualifiedName;
+    }
+
+    @Override
+    public String toJavaName(boolean qualified) {
+        return qualified ? qualifiedName : unqualifiedName;
     }
 
     @Override
@@ -708,7 +979,7 @@ public class AnalysisType implements WrappedJavaType, OriginalClassProvider, Com
     }
 
     @Override
-    public final AnalysisType resolve(ResolvedJavaType accessingClass) {
+    public final ResolvedJavaType resolve(ResolvedJavaType accessingClass) {
         return this;
     }
 
@@ -732,11 +1003,9 @@ public class AnalysisType implements WrappedJavaType, OriginalClassProvider, Com
     @Override
     public void initialize() {
         if (!wrapped.isInitialized()) {
-            throw GraalError.shouldNotReachHere("Classes can only be initialized using methods in ClassInitializationFeature: " + toClassName());
+            throw GraalError.shouldNotReachHere("Classes can only be initialized using methods in ClassInitializationFeature: " + toClassName()); // ExcludeFromJacocoGeneratedReport
         }
     }
-
-    private volatile AnalysisType arrayClass = null;
 
     @Override
     public final AnalysisType getArrayClass() {
@@ -744,6 +1013,88 @@ public class AnalysisType implements WrappedJavaType, OriginalClassProvider, Com
             arrayClass = universe.lookup(wrapped.getArrayClass());
         }
         return arrayClass;
+    }
+
+    @Override
+    public boolean isHidden() {
+        return wrapped.isHidden();
+    }
+
+    @Override
+    public List<? extends AnalysisType> getPermittedSubclasses() {
+        if (permittedSubclasses == PERMITTED_SUBCLASSES_UNINITIALIZED) {
+            permittedSubclasses = buildPermittedSubclasses(wrapped.getPermittedSubclasses());
+        }
+        return permittedSubclasses;
+    }
+
+    private List<AnalysisType> buildPermittedSubclasses(List<? extends JavaType> wrappedPermittedSubclasses) {
+        if (wrappedPermittedSubclasses == null) {
+            return null;
+        }
+        if (universe.sealed()) {
+            return buildPermittedSubclassesAfterAnalysis(wrappedPermittedSubclasses);
+        }
+        return buildPermittedSubclassesDuringAnalysis(wrappedPermittedSubclasses);
+    }
+
+    /**
+     * Builds the list of permitted subclasses during the analysis. This may add types to the
+     * analysis universe.
+     */
+    private List<AnalysisType> buildPermittedSubclassesDuringAnalysis(List<? extends JavaType> wrappedPermittedSubclasses) {
+        assert !universe.sealed();
+        List<AnalysisType> result = new ArrayList<>(wrappedPermittedSubclasses.size());
+        for (JavaType permittedSubclass : wrappedPermittedSubclasses) {
+            /*
+             * It is possible that we see unresolved types here. If the permitted subclasses are
+             * queried during analysis, we need to resolve them.
+             */
+            ResolvedJavaType resolvedPermittedSubclass;
+            try {
+                resolvedPermittedSubclass = permittedSubclass.resolve(wrapped);
+            } catch (LinkageError e) {
+                /*
+                 * Like Class.getPermittedSubclasses(), omit subclasses that cannot be loaded. A
+                 * permitted subclass may be absent from the application class path, for example
+                 * after removing unused classes. Such a subclass cannot be instantiated and must
+                 * not prevent analysis of the remaining sealed hierarchy.
+                 */
+                continue;
+            }
+            /*
+             * The permitted subclasses of the wrapped type may contain types that are unsupported
+             * on the target platform (e.g. hosted-only types). We therefore need to filter the list
+             * and remove those types. This is fine because such types cannot be part of the
+             * analysis universe anyway.
+             */
+            if (universe.hostVM.platformSupported(resolvedPermittedSubclass)) {
+                result.add(universe.lookup(resolvedPermittedSubclass));
+            }
+        }
+        return result;
+    }
+
+    /**
+     * Builds the list of permitted subclasses if the analysis universe was sealed. This never adds
+     * types to the analysis universe. The list will only contain the permitted subclasses of the
+     * wrapped type that were reachable during analysis.
+     */
+    private List<AnalysisType> buildPermittedSubclassesAfterAnalysis(List<? extends JavaType> wrappedPermittedSubclasses) {
+        assert universe.sealed();
+        List<AnalysisType> result = new ArrayList<>(wrappedPermittedSubclasses.size());
+        for (JavaType permittedSubclass : wrappedPermittedSubclasses) {
+            AnalysisType analysisType;
+            if (permittedSubclass instanceof ResolvedJavaType resolvedPermittedSubclass && (analysisType = universe.optionalLookup(resolvedPermittedSubclass)) != null) {
+                result.add(analysisType);
+            }
+        }
+        return result;
+    }
+
+    @Override
+    public AnalysisType lookupType(UnresolvedJavaType unresolvedJavaType, boolean resolve) {
+        return universe.lookup(wrapped.lookupType(unresolvedJavaType, resolve));
     }
 
     @Override
@@ -757,6 +1108,16 @@ public class AnalysisType implements WrappedJavaType, OriginalClassProvider, Com
     }
 
     @Override
+    public boolean isRecord() {
+        return wrapped.isRecord();
+    }
+
+    @Override
+    public List<? extends ResolvedJavaRecordComponent> getRecordComponents() {
+        return wrapped.getRecordComponents();
+    }
+
+    @Override
     public boolean isInstanceClass() {
         return wrapped.isInstanceClass();
     }
@@ -764,6 +1125,11 @@ public class AnalysisType implements WrappedJavaType, OriginalClassProvider, Com
     @Override
     public boolean isArray() {
         return isArray;
+    }
+
+    @Override
+    public boolean isJavaLangObject() {
+        return isJavaLangObject;
     }
 
     @Override
@@ -778,13 +1144,12 @@ public class AnalysisType implements WrappedJavaType, OriginalClassProvider, Com
 
     @Override
     public boolean isAssignableFrom(ResolvedJavaType other) {
-        ResolvedJavaType subst = universe.substitutions.resolve(((AnalysisType) other).wrapped);
-        return wrapped.isAssignableFrom(subst);
+        return wrapped.isAssignableFrom(OriginalClassProvider.getOriginalType(other));
     }
 
     @Override
     public boolean isInstance(JavaConstant obj) {
-        return wrapped.isInstance(universe.toHosted(obj));
+        return wrapped.isInstance(obj);
     }
 
     @Override
@@ -800,25 +1165,64 @@ public class AnalysisType implements WrappedJavaType, OriginalClassProvider, Com
     @Override
     public ResolvedJavaType getSingleImplementor() {
         /*
+         * Make use of a sealed class hierarchy. Try to find a single implementing (abstract) class
+         * by following the one permitted subclass of this interface.
+         */
+        assert isInterface();
+        if (isSealed() && hasSinglePermittedImplementor(getPermittedSubclasses())) {
+            return getPermittedSubclasses().getFirst();
+        }
+        /*
          * New classes can be loaded during the analysis, so we cannot guarantee a consistent and
          * correct result. So we need to conservatively say that there is no single implementor.
          */
         return this;
     }
 
+    private static boolean hasSinglePermittedImplementor(List<? extends AnalysisType> permittedSubclasses) {
+        return permittedSubclasses.size() == 1 && !permittedSubclasses.getFirst().isInterface();
+    }
+
     /** Get the immediate subtypes, including this type itself. */
-    public Set<AnalysisType> getSubTypes() {
-        return subTypes;
+    public Collection<AnalysisType> getSubTypes() {
+        return ConcurrentLightHashSet.getElements(this, SUBTYPES_UPDATER);
     }
 
     private void addSubType(AnalysisType subType) {
-        this.subTypes.add(subType);
+        boolean result = ConcurrentLightHashSet.addElement(this, SUBTYPES_UPDATER, subType);
+        /* Register the object reachability callbacks with the newly discovered subtype. */
+        if (!subType.equals(this)) {
+            /* Subtypes include this type itself. */
+            ConcurrentLightHashSet.forEach(this, objectReachableCallbacksUpdater, (JVMCIObjectReachableCallback callback) -> subType.registerObjectReachableCallback(callback));
+        }
+        assert result : "Tried to add a " + subType + " which is already registered";
+    }
+
+    /**
+     * Collects and returns *all* subtypes of this type, not only the immediate subtypes, including
+     * this type itself, regardless of reachability status. To access the immediate subtypes use
+     * {@link AnalysisType#getSubTypes()}.
+     *
+     * Since the subtypes are updated continuously as the universe is expanded this method may
+     * return different results on each call, until the analysis universe reaches a stable state.
+     */
+    public EconomicSet<AnalysisType> getAllSubtypes() {
+        EconomicSet<AnalysisType> result = EconomicSet.create();
+        collectSubtypes(this, result);
+        return result;
+    }
+
+    private static void collectSubtypes(AnalysisType baseType, EconomicSet<AnalysisType> result) {
+        for (AnalysisType subType : baseType.getSubTypes()) {
+            if (result.add(subType)) {
+                collectSubtypes(subType, result);
+            }
+        }
     }
 
     @Override
     public AnalysisType findLeastCommonAncestor(ResolvedJavaType otherType) {
-        ResolvedJavaType subst = universe.substitutions.resolve(((AnalysisType) otherType).wrapped);
-        return universe.lookup(wrapped.findLeastCommonAncestor(subst));
+        return universe.lookup(wrapped.findLeastCommonAncestor(OriginalClassProvider.getOriginalType(otherType)));
     }
 
     @Override
@@ -836,13 +1240,13 @@ public class AnalysisType implements WrappedJavaType, OriginalClassProvider, Com
     }
 
     @Override
-    public ResolvedJavaType getElementalType() {
+    public AnalysisType getElementalType() {
         return elementalType;
     }
 
     public boolean hasSubTypes() {
         /* subTypes always includes this type itself. */
-        return subTypes.size() > 1;
+        return ConcurrentLightHashSet.size(this, SUBTYPES_UPDATER) > 1;
     }
 
     @Override
@@ -852,25 +1256,39 @@ public class AnalysisType implements WrappedJavaType, OriginalClassProvider, Com
          * available to implement it for JIT compilation at image run time. So we want to make sure
          * that Graal is not using this method, and only resolveConcreteMethod instead.
          */
-        throw GraalError.unimplemented();
+        throw GraalError.unimplementedOverride(); // ExcludeFromJacocoGeneratedReport
     }
 
     @Override
     public AnalysisMethod resolveConcreteMethod(ResolvedJavaMethod method, ResolvedJavaType callerType) {
-        Object resolvedMethod = resolvedMethods.get(method);
+        Object resolvedMethod = ConcurrentLightHashMap.get(this, RESOLVED_METHODS_UPDATER, method);
         if (resolvedMethod == null) {
-            ResolvedJavaMethod substMethod = universe.substitutions.resolve(((AnalysisMethod) method).wrapped);
-            /*
-             * We do not want any access checks to be performed, so we use the method's declaring
-             * class as the caller type.
-             */
-            ResolvedJavaType substCallerType = substMethod.getDeclaringClass();
+            ResolvedJavaMethod originalMethod = OriginalMethodProvider.getOriginalMethod(method);
+            Object newResolvedMethod = null;
+            if (originalMethod != null) {
+                /*
+                 * We do not want any access checks to be performed, so we use the method's
+                 * declaring class as the caller type.
+                 */
+                ResolvedJavaType originalCallerType = originalMethod.getDeclaringClass();
 
-            Object newResolvedMethod = universe.lookup(wrapped.resolveConcreteMethod(substMethod, substCallerType));
+                try {
+                    var concreteMethod = originalMethod instanceof BaseLayerMethod ? originalMethod : wrapped.resolveConcreteMethod(originalMethod, originalCallerType);
+                    newResolvedMethod = universe.lookup(concreteMethod);
+                    if (newResolvedMethod == null) {
+                        newResolvedMethod = getUniverse().getBigbang().fallbackResolveConcreteMethod(this, (AnalysisMethod) method);
+                    }
+
+                } catch (UnsupportedFeatureException e) {
+                    /* An unsupported overriding method is not reachable. */
+                    newResolvedMethod = null;
+                }
+            }
+
             if (newResolvedMethod == null) {
                 newResolvedMethod = NULL_METHOD;
             }
-            Object oldResolvedMethod = resolvedMethods.putIfAbsent(method, newResolvedMethod);
+            Object oldResolvedMethod = ConcurrentLightHashMap.putIfAbsent(this, RESOLVED_METHODS_UPDATER, method, newResolvedMethod);
             resolvedMethod = oldResolvedMethod != null ? oldResolvedMethod : newResolvedMethod;
         }
         return resolvedMethod == NULL_METHOD ? null : (AnalysisMethod) resolvedMethod;
@@ -887,10 +1305,61 @@ public class AnalysisType implements WrappedJavaType, OriginalClassProvider, Com
 
     @Override
     public AssumptionResult<ResolvedJavaMethod> findUniqueConcreteMethod(ResolvedJavaMethod method) {
-        // ResolvedJavaMethod subst = universe.substitutions.resolve(((AnalysisMethod)
-        // method).wrapped);
-        // return universe.lookup(wrapped.findUniqueConcreteMethod(subst));
+        if (!isInterface() && isSealed()) {
+            ResolvedJavaMethod uniqueConcreteMethodInPermittedSubclasses = findUniqueConcreteMethodInPermittedSubclasses(method);
+            if (uniqueConcreteMethodInPermittedSubclasses != null) {
+                return new AssumptionResult<>(uniqueConcreteMethodInPermittedSubclasses);
+            }
+        }
         return null;
+    }
+
+    private ResolvedJavaMethod findUniqueConcreteMethodInPermittedSubclasses(ResolvedJavaMethod method) {
+        assert isSealed();
+
+        ResolvedJavaMethod uniqueImplementation = resolveConcreteMethod(method);
+        Queue<AnalysisType> worklist = new LinkedList<>(getPermittedSubclasses());
+        AnalysisType currentType;
+        while ((currentType = worklist.poll()) != null) {
+            boolean currentTypeIsSealed = currentType.isSealed();
+            boolean currentTypeIsFinal = currentType.isFinalFlagSet();
+            /*
+             * If any class in the hierarchy is non-sealed (i.e. not final and not sealed), we
+             * abort. In this case, arbitrary user classes may extend the base class, and we cannot
+             * do further reasoning here.
+             */
+            if (!currentTypeIsSealed && !currentTypeIsFinal) {
+                return null;
+            }
+
+            if (currentTypeIsSealed) {
+                /* If sealed, 'getPermittedSubclasses' is guaranteed to be non-null. */
+                worklist.addAll(currentType.getPermittedSubclasses());
+            }
+
+            ResolvedJavaMethod currentImplementation = currentType.resolveConcreteMethod(method);
+            if (currentImplementation == null) {
+                continue;
+            }
+
+            // remember the first concrete method
+            if (uniqueImplementation == null) {
+                uniqueImplementation = currentImplementation;
+                continue;
+            }
+
+            /*
+             * We can only return a unique concrete method if every implementation in the permitted
+             * subclass hierarchy resolves to the same target method.
+             */
+            if (uniqueImplementation.equals(currentImplementation)) {
+                continue;
+            }
+
+            // bailout: found two different implementations
+            return null;
+        }
+        return uniqueImplementation;
     }
 
     @Override
@@ -903,82 +1372,102 @@ public class AnalysisType implements WrappedJavaType, OriginalClassProvider, Com
     }
 
     /*
-     * Cache is volatile to ensure that the final contents of AnalysisField[] are visible after the
-     * array gets visible.
+     * Cache is volatile to ensure that the final contents of ResolvedJavaField[] are visible after
+     * the array gets visible.
+     *
+     * Although all elements are of type AnalysisField, we set this array to be of type
+     * ResolvedJavaField so that runtime compilation does not need to convert the array type.
+     * Resolving GR-66575 will allow these arrays to be of type {@code AnalysisField[]}.
      */
-    private volatile AnalysisField[] instanceFieldsWithSuper;
-    private volatile AnalysisField[] instanceFieldsWithoutSuper;
+    private volatile ResolvedJavaField[] instanceFieldsWithSuper;
+    private volatile ResolvedJavaField[] instanceFieldsWithoutSuper;
+    private volatile ResolvedJavaField[] staticFields;
 
-    public void clearInstanceFieldsCache() {
-        instanceFieldsWithSuper = null;
-        instanceFieldsWithoutSuper = null;
-    }
-
+    /**
+     * Note that although this returns a {@code ResolvedJavaField[]}, all instance fields are of
+     * type {@link AnalysisField} and can be cast to AnalysisField without problem.
+     */
     @Override
-    public AnalysisField[] getInstanceFields(boolean includeSuperclasses) {
-        AnalysisField[] result = includeSuperclasses ? instanceFieldsWithSuper : instanceFieldsWithoutSuper;
-        if (result != null) {
-            return result;
-        } else {
-            return initializeInstanceFields(includeSuperclasses);
-        }
+    public ResolvedJavaField[] getInstanceFields(boolean includeSuperclasses) {
+        return includeSuperclasses ? getInstanceFieldsWithSuper() : getInstanceFieldsWithoutSuper();
     }
 
-    private AnalysisField[] initializeInstanceFields(boolean includeSuperclasses) {
-        List<AnalysisField> list = new ArrayList<>();
-        if (includeSuperclasses && getSuperclass() != null) {
-            list.addAll(Arrays.asList(getSuperclass().getInstanceFields(true)));
+    private ResolvedJavaField[] getInstanceFieldsWithoutSuper() {
+        if (instanceFieldsWithoutSuper == null) {
+            if (isArray() || isInterface() || isPrimitive()) {
+                instanceFieldsWithoutSuper = AnalysisField.EMPTY_ARRAY;
+            } else {
+                instanceFieldsWithoutSuper = convertFields(wrapped.getInstanceFields(false), false);
+            }
         }
-        AnalysisField[] result = convertFields(interceptInstanceFields(wrapped.getInstanceFields(false)), list, includeSuperclasses);
-        if (includeSuperclasses) {
-            instanceFieldsWithSuper = result;
-        } else {
-            instanceFieldsWithoutSuper = result;
-        }
-        return result;
+        return instanceFieldsWithoutSuper;
     }
 
-    private AnalysisField[] convertFields(ResolvedJavaField[] original, List<AnalysisField> list, boolean listIncludesSuperClassesFields) {
-        for (int i = 0; i < original.length; i++) {
-            if (!original[i].isInternal()) {
+    private ResolvedJavaField[] getInstanceFieldsWithSuper() {
+        if (instanceFieldsWithSuper == null) {
+            if (isArray() || isInterface() || isPrimitive()) {
+                instanceFieldsWithSuper = AnalysisField.EMPTY_ARRAY;
+            } else {
+                ResolvedJavaField[] instanceFields = getInstanceFieldsWithoutSuper();
+                if (getSuperclass() == null) {
+                    instanceFieldsWithSuper = instanceFields;
+                } else {
+                    ResolvedJavaField[] superInstanceFields = getSuperclass().getInstanceFields(true);
+                    ResolvedJavaField[] result = Arrays.copyOf(superInstanceFields, superInstanceFields.length + instanceFields.length);
+                    System.arraycopy(instanceFields, 0, result, superInstanceFields.length, instanceFields.length);
+                    for (int index = 0; index < instanceFields.length; ++index) {
+                        ((AnalysisField) instanceFields[index]).setPosition(superInstanceFields.length + index);
+                    }
+                    instanceFieldsWithSuper = result;
+                }
+            }
+        }
+        return instanceFieldsWithSuper;
+    }
+
+    /**
+     * Note that although this returns a ResolvedJavaField[], all instance fields are of type
+     * AnalysisField and can be cast to AnalysisField without problem.
+     */
+    @Override
+    public ResolvedJavaField[] getStaticFields() {
+        if (staticFields == null) {
+            if (isArray() || isPrimitive()) {
+                staticFields = AnalysisField.EMPTY_ARRAY;
+            } else {
+                staticFields = convertFields(wrapped.getStaticFields(), true);
+            }
+        }
+        return staticFields;
+    }
+
+    /**
+     * Converts the given array of hosted {@link ResolvedJavaField}s into an array of
+     * {@link AnalysisField}s. The resulting array is compact and contains only convertible fields,
+     * i.e., if looking up the field in the {@link AnalysisUniverse} is not supported then the field
+     * is skipped.
+     */
+    private ResolvedJavaField[] convertFields(ResolvedJavaField[] originals, boolean setPosition) {
+        ResolvedJavaField[] result = new ResolvedJavaField[originals.length];
+        int index = 0;
+        for (ResolvedJavaField original : originals) {
+            if (!original.isInternal() && universe.hostVM.platformSupported(original)) {
                 try {
-                    AnalysisField aField = universe.lookup(original[i]);
-                    if (aField != null) {
-                        if (listIncludesSuperClassesFields) {
-                            /*
-                             * If the list includes the super classes fields, register the position.
-                             */
-                            aField.setPosition(list.size());
+                    AnalysisField field = universe.lookup(original);
+                    if (field != null) {
+                        if (setPosition) {
+                            field.setPosition(index);
                         }
-                        list.add(aField);
+                        result[index++] = field;
                     }
                 } catch (UnsupportedFeatureException ex) {
                     // Ignore deleted fields and fields of deleted types.
                 }
             }
         }
-        return list.toArray(new AnalysisField[list.size()]);
-    }
 
-    @Override
-    public AnalysisField[] getStaticFields() {
-        registerAsReachable();
-        return convertFields(wrapped.getStaticFields(), new ArrayList<>(), false);
-    }
-
-    @Override
-    public Annotation[] getAnnotations() {
-        return GuardedAnnotationAccess.getAnnotations(wrapped);
-    }
-
-    @Override
-    public Annotation[] getDeclaredAnnotations() {
-        return GuardedAnnotationAccess.getDeclaredAnnotations(wrapped);
-    }
-
-    @Override
-    public <T extends Annotation> T getAnnotation(Class<T> annotationClass) {
-        return GuardedAnnotationAccess.getAnnotation(wrapped, annotationClass);
+        // Trim array if some fields could not be converted.
+        return index == result.length ? result : Arrays.copyOf(result, index);
     }
 
     @Override
@@ -989,7 +1478,7 @@ public class AnalysisType implements WrappedJavaType, OriginalClassProvider, Com
 
     @Override
     public String toString() {
-        return "AnalysisType<" + toJavaName(true) + ", allocated: " + isAllocated + ", inHeap: " + isInHeap + ", reachable: " + isReachable + ">";
+        return "AnalysisType<" + unqualifiedName + " -> " + wrapped.toString() + ", instantiated: " + (isInstantiated != null) + ", reachable: " + (isReachable != null) + ">";
     }
 
     @Override
@@ -1002,7 +1491,7 @@ public class AnalysisType implements WrappedJavaType, OriginalClassProvider, Com
         try {
             return wrapped.isLocal();
         } catch (InternalError e) {
-            universe.hostVM().warn("unknown locality of class " + wrapped.getName() + ", assuming class is not local. To remove the warning report an issue " +
+            LogUtils.warning("Unknown locality of class " + wrapped.getName() + ", assuming class is not local. To remove the warning report an issue " +
                             "to the library or language author. The issue is caused by " + wrapped.getName() + " which is not following the naming convention.");
             return false;
         }
@@ -1015,29 +1504,66 @@ public class AnalysisType implements WrappedJavaType, OriginalClassProvider, Com
 
     @Override
     public AnalysisType getEnclosingType() {
-        ResolvedJavaType wrappedEnclosingType;
-        try {
-            wrappedEnclosingType = wrapped.getEnclosingType();
-        } catch (LinkageError e) {
-            /* Ignore LinkageError thrown by enclosing type resolution. */
-            return null;
-        }
-        return universe.lookup(wrappedEnclosingType);
+        return universe.lookup(wrapped.getEnclosingType());
     }
 
     @Override
-    public AnalysisMethod[] getDeclaredConstructors() {
-        return universe.lookup(wrapped.getDeclaredConstructors());
+    public AnalysisMethod getEnclosingMethod() {
+        return universe.lookup(wrapped.getEnclosingMethod());
+    }
+
+    @Override
+    public AnalysisType[] getDeclaredTypes() {
+        AnalysisType[] result = declaredTypes;
+        if (result == null) {
+            result = universe.lookup(wrapped.getDeclaredTypes());
+            /* Ensure array element initializations are published before publishing the array. */
+            VarHandle.storeStoreFence();
+            declaredTypes = result;
+        }
+        return result;
     }
 
     @Override
     public AnalysisMethod[] getDeclaredMethods() {
-        return universe.lookup(wrapped.getDeclaredMethods());
+        return getDeclaredMethods(true);
+    }
+
+    @Override
+    public AnalysisMethod[] getDeclaredMethods(boolean forceLink) {
+        GraalError.guarantee(!forceLink, "only use getDeclaredMethods without forcing to link, because linking can throw LinkageError");
+        AnalysisMethod[] result = declaredMethods;
+        if (result == null) {
+            result = universe.lookup(wrapped.getDeclaredMethods(forceLink));
+            /* Ensure array element initializations are published before publishing the array. */
+            VarHandle.storeStoreFence();
+            declaredMethods = result;
+        }
+        return result;
+    }
+
+    @Override
+    public List<ResolvedJavaMethod> getAllMethods(boolean forceLink) {
+        /*
+         * Not needed on SubstrateVM for now.
+         */
+        throw GraalError.unimplementedOverride(); // ExcludeFromJacocoGeneratedReport
+    }
+
+    @Override
+    public AnalysisMethod[] getDeclaredConstructors() {
+        return getDeclaredConstructors(true);
+    }
+
+    @Override
+    public AnalysisMethod[] getDeclaredConstructors(boolean forceLink) {
+        GraalError.guarantee(forceLink == false, "only use getDeclaredConstructors without forcing to link, because linking can throw LinkageError");
+        return universe.lookup(wrapped.getDeclaredConstructors(forceLink));
     }
 
     @Override
     public AnalysisMethod findMethod(String name, Signature signature) {
-        for (AnalysisMethod method : getDeclaredMethods()) {
+        for (AnalysisMethod method : getDeclaredMethods(false)) {
             if (method.getName().equals(name) && method.getSignature().equals(signature)) {
                 return method;
             }
@@ -1079,10 +1605,9 @@ public class AnalysisType implements WrappedJavaType, OriginalClassProvider, Com
         return isCloneableWithAllocation;
     }
 
-    @SuppressWarnings("deprecation")
     @Override
-    public ResolvedJavaType getHostClass() {
-        return universe.lookup(wrapped.getHostClass());
+    public AnalysisUniverse getUniverse() {
+        return universe;
     }
 
     @Override
@@ -1091,36 +1616,13 @@ public class AnalysisType implements WrappedJavaType, OriginalClassProvider, Com
     }
 
     @Override
-    public int hashCode() {
+    public final int hashCode() {
+        assert id != 0 || isJavaLangObject() : "Type id not set yet";
         return id;
     }
 
     @Override
-    public boolean equals(Object obj) {
+    public final boolean equals(Object obj) {
         return this == obj;
-    }
-
-    /* Value copied from java.lang.Class. */
-    private static final int ANNOTATION = 0x00002000;
-
-    /* Method copied from java.lang.Class. */
-    public boolean isAnnotation() {
-        return (getModifiers() & ANNOTATION) != 0;
-    }
-
-    public void addInstanceFieldsInterceptor(InstanceFieldsInterceptor interceptor) {
-        ConcurrentLightHashSet.addElement(this, INTERCEPTORS_UPDATER, interceptor);
-    }
-
-    private ResolvedJavaField[] interceptInstanceFields(ResolvedJavaField[] fields) {
-        ResolvedJavaField[] result = fields;
-        for (Object interceptor : ConcurrentLightHashSet.getElements(this, INTERCEPTORS_UPDATER)) {
-            result = ((InstanceFieldsInterceptor) interceptor).interceptInstanceFields(universe, result, this);
-        }
-        return result;
-    }
-
-    public interface InstanceFieldsInterceptor {
-        ResolvedJavaField[] interceptInstanceFields(AnalysisUniverse universe, ResolvedJavaField[] fields, AnalysisType type);
     }
 }

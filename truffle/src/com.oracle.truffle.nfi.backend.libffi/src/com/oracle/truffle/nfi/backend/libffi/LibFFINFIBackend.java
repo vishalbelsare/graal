@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2017, 2021, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2017, 2024, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * The Universal Permissive License (UPL), Version 1.0
@@ -52,7 +52,6 @@ import com.oracle.truffle.api.nodes.RootNode;
 import com.oracle.truffle.nfi.backend.libffi.LibFFISignature.SignatureBuilder;
 import com.oracle.truffle.nfi.backend.spi.NFIBackend;
 import com.oracle.truffle.nfi.backend.spi.NFIBackendLibrary;
-import com.oracle.truffle.nfi.backend.spi.NFIBackendTools;
 import com.oracle.truffle.nfi.backend.spi.types.NativeLibraryDescriptor;
 import com.oracle.truffle.nfi.backend.spi.types.NativeSimpleType;
 import com.oracle.truffle.nfi.backend.spi.util.ProfiledArrayBuilder.ArrayBuilderFactory;
@@ -62,11 +61,9 @@ import com.oracle.truffle.nfi.backend.spi.util.ProfiledArrayBuilder.ArrayBuilder
 final class LibFFINFIBackend implements NFIBackend {
 
     private final LibFFILanguage language;
-    final NFIBackendTools tools;
 
-    LibFFINFIBackend(LibFFILanguage language, NFIBackendTools tools) {
+    LibFFINFIBackend(LibFFILanguage language) {
         this.language = language;
-        this.tools = tools;
     }
 
     @Override
@@ -76,39 +73,7 @@ final class LibFFINFIBackend implements NFIBackend {
         if (descriptor.isDefaultLibrary()) {
             root = new GetDefaultLibraryNode(language);
         } else {
-            int flags = 0;
-            boolean lazyOrNow = false;
-            if (descriptor.getFlags() != null) {
-                for (String flag : descriptor.getFlags()) {
-                    switch (flag) {
-                        case "RTLD_GLOBAL":
-                            flags |= ctx.RTLD_GLOBAL;
-                            break;
-                        case "RTLD_LOCAL":
-                            flags |= ctx.RTLD_LOCAL;
-                            break;
-                        case "RTLD_LAZY":
-                            flags |= ctx.RTLD_LAZY;
-                            lazyOrNow = true;
-                            break;
-                        case "RTLD_NOW":
-                            flags |= ctx.RTLD_NOW;
-                            lazyOrNow = true;
-                            break;
-                        case "ISOLATED_NAMESPACE":
-                            if (ctx.ISOLATED_NAMESPACE == 0) {
-                                // undefined
-                                throw new IllegalArgumentException("isolated namespace not supported");
-                            }
-                            flags |= ctx.ISOLATED_NAMESPACE;
-                            break;
-                    }
-                }
-            }
-            if (!lazyOrNow) {
-                // default to 'RTLD_NOW' if neither 'RTLD_LAZY' nor 'RTLD_NOW' was specified
-                flags |= ctx.RTLD_NOW;
-            }
+            int flags = ctx.platformLoadFlags.parseFlags(descriptor.getFlags());
             root = new LoadLibraryNode(language, descriptor.getFilename(), flags);
         }
         return root.getCallTarget();

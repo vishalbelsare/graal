@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2019, 2021, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2019, 2025, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -24,18 +24,30 @@
  */
 package com.oracle.svm.agent;
 
+import static com.oracle.svm.agent.NativeImageAgent.ExitCodes.AGENT_ERROR;
+import static com.oracle.svm.agent.NativeImageAgent.ExitCodes.PARSE_ERROR;
+import static com.oracle.svm.agent.NativeImageAgent.ExitCodes.SUCCESS;
+import static com.oracle.svm.agent.NativeImageAgent.ExitCodes.USAGE_ERROR;
+
+import java.io.File;
 import java.io.FileNotFoundException;
 import java.io.IOException;
+import java.io.PrintWriter;
+import java.io.StringWriter;
 import java.nio.file.AtomicMoveNotSupportedException;
+import java.nio.file.FileAlreadyExistsException;
 import java.nio.file.Files;
 import java.nio.file.NoSuchFileException;
 import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.nio.file.StandardCopyOption;
+import java.nio.file.StandardOpenOption;
+import java.nio.file.attribute.FileTime;
 import java.text.DateFormat;
 import java.text.SimpleDateFormat;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.ConcurrentModificationException;
 import java.util.Date;
 import java.util.List;
 import java.util.TimeZone;
@@ -44,40 +56,48 @@ import java.util.concurrent.TimeUnit;
 import java.util.function.Function;
 import java.util.function.Predicate;
 import java.util.function.Supplier;
-import java.util.regex.Pattern;
 
-import com.oracle.svm.agent.ignoredconfig.AgentMetaInfProcessor;
-import com.oracle.svm.agent.stackaccess.InterceptedState;
-import com.oracle.svm.agent.stackaccess.EagerlyLoadedJavaStackAccess;
-import com.oracle.svm.agent.stackaccess.OnDemandJavaStackAccess;
-import com.oracle.svm.agent.tracing.TraceFileWriter;
-import com.oracle.svm.agent.tracing.ConfigurationResultWriter;
-import com.oracle.svm.agent.tracing.core.Tracer;
-import com.oracle.svm.agent.tracing.core.TracingResultWriter;
-import com.oracle.svm.core.configure.ConfigurationFile;
-import com.oracle.svm.driver.metainf.NativeImageMetaInfWalker;
+import org.graalvm.collections.EconomicSet;
 import org.graalvm.nativeimage.Platform;
 import org.graalvm.nativeimage.ProcessProperties;
 import org.graalvm.nativeimage.hosted.Feature;
 
-import com.oracle.svm.agent.predicatedconfig.MethodInfoRecordKeeper;
-import com.oracle.svm.agent.predicatedconfig.ConfigurationWithOriginsResultWriter;
+import com.oracle.svm.agent.conditionalconfig.ConditionalConfigurationPartialRunWriter;
+import com.oracle.svm.agent.conditionalconfig.ConditionalConfigurationWriter;
+import com.oracle.svm.agent.configwithorigins.ConfigurationWithOriginsTracer;
+import com.oracle.svm.agent.configwithorigins.ConfigurationWithOriginsWriter;
+import com.oracle.svm.agent.configwithorigins.MethodInfoRecordKeeper;
+import com.oracle.svm.agent.ignoredconfig.AgentMetaInfProcessor;
+import com.oracle.svm.agent.stackaccess.EagerlyLoadedJavaStackAccess;
+import com.oracle.svm.agent.stackaccess.InterceptedState;
+import com.oracle.svm.agent.stackaccess.OnDemandJavaStackAccess;
+import com.oracle.svm.agent.tracing.ConfigurationResultWriter;
+import com.oracle.svm.agent.tracing.TraceFileWriter;
+import com.oracle.svm.agent.tracing.core.Tracer;
+import com.oracle.svm.agent.tracing.core.TracingResultWriter;
+import com.oracle.svm.configure.ConfigurationFile;
+import com.oracle.svm.configure.PredefinedClassesConfigurationParser;
+import com.oracle.svm.configure.config.ConfigurationFileCollection;
 import com.oracle.svm.configure.config.ConfigurationSet;
+import com.oracle.svm.configure.config.conditional.ConditionalConfigurationPredicate;
+import com.oracle.svm.configure.filters.ComplexFilter;
 import com.oracle.svm.configure.filters.FilterConfigurationParser;
-import com.oracle.svm.configure.filters.RuleNode;
+import com.oracle.svm.configure.filters.HierarchyFilterNode;
 import com.oracle.svm.configure.trace.AccessAdvisor;
 import com.oracle.svm.configure.trace.TraceProcessor;
-import com.oracle.svm.core.SubstrateUtil;
-import com.oracle.svm.driver.NativeImage;
-import com.oracle.svm.jni.nativeapi.JNIEnvironment;
-import com.oracle.svm.jni.nativeapi.JNIJavaVM;
-import com.oracle.svm.jni.nativeapi.JNIObjectHandle;
+import com.oracle.svm.core.JavaVersionUtil;
+import com.oracle.svm.core.jni.headers.JNIEnvironment;
+import com.oracle.svm.core.jni.headers.JNIJavaVM;
+import com.oracle.svm.core.jni.headers.JNIObjectHandle;
+import com.oracle.svm.driver.metainf.NativeImageMetaInfWalker;
 import com.oracle.svm.jvmtiagentbase.JNIHandleSet;
 import com.oracle.svm.jvmtiagentbase.JvmtiAgentBase;
 import com.oracle.svm.jvmtiagentbase.Support;
 import com.oracle.svm.jvmtiagentbase.jvmti.JvmtiEnv;
 import com.oracle.svm.jvmtiagentbase.jvmti.JvmtiEventCallbacks;
 import com.oracle.svm.jvmtiagentbase.jvmti.JvmtiInterface;
+
+import jdk.graal.compiler.phases.common.LazyValue;
 
 public final class NativeImageAgent extends JvmtiAgentBase<NativeImageAgentJNIHandleSet> {
     private static final String AGENT_NAME = "native-image-agent";
@@ -89,9 +109,24 @@ public final class NativeImageAgent extends JvmtiAgentBase<NativeImageAgentJNIHa
     private TracingResultWriter tracingResultWriter;
 
     private Path configOutputDirPath;
+    private Path configOutputLockFilePath;
+    private FileTime expectedConfigModifiedBefore;
+    EconomicSet<String> classPathEntries;
 
     private static String getTokenValue(String token) {
         return token.substring(token.indexOf('=') + 1);
+    }
+
+    private static boolean getBooleanTokenValue(String token) {
+        int equalsIndex = token.indexOf('=');
+        if (equalsIndex == -1) {
+            return true;
+        }
+        return Boolean.parseBoolean(token.substring(equalsIndex + 1));
+    }
+
+    private static boolean isBooleanOption(String token, String option) {
+        return token.equals(option) || token.startsWith(option + "=");
     }
 
     @Override
@@ -108,17 +143,21 @@ public final class NativeImageAgent extends JvmtiAgentBase<NativeImageAgentJNIHa
     protected int onLoadCallback(JNIJavaVM vm, JvmtiEnv jvmti, JvmtiEventCallbacks callbacks, String options) {
         String traceOutputFile = null;
         String configOutputDir = null;
-        ConfigurationSet mergeConfigs = new ConfigurationSet();
-        ConfigurationSet omittedConfigs = new ConfigurationSet();
+        String ignoredEntriesFile = null;
+        ConfigurationFileCollection mergeConfigs = new ConfigurationFileCollection();
+        ConfigurationFileCollection omittedConfigs = new ConfigurationFileCollection();
         boolean builtinCallerFilter = true;
         boolean builtinHeuristicFilter = true;
         List<String> callerFilterFiles = new ArrayList<>();
         List<String> accessFilterFiles = new ArrayList<>();
         boolean experimentalClassLoaderSupport = true;
         boolean experimentalClassDefineSupport = false;
+        boolean experimentalUnsafeAllocationSupport = false;
         boolean experimentalOmitClasspathConfig = false;
-        boolean build = false;
         boolean configurationWithOrigins = false;
+        List<String> conditionalConfigUserPackageFilterFiles = new ArrayList<>();
+        List<String> conditionalConfigClassNameFilterFiles = new ArrayList<>();
+        boolean conditionalConfigPartialRun = false;
         int configWritePeriod = -1; // in seconds
         int configWritePeriodInitialDelay = 1; // in seconds
         boolean trackReflectionMetadata = true;
@@ -127,81 +166,89 @@ public final class NativeImageAgent extends JvmtiAgentBase<NativeImageAgentJNIHa
         for (String token : tokens) {
             if (token.startsWith("trace-output=")) {
                 if (traceOutputFile != null) {
-                    return usage(1, "cannot specify trace-output= more than once.");
+                    return usage("cannot specify trace-output= more than once.");
                 }
                 traceOutputFile = getTokenValue(token);
             } else if (token.startsWith("config-output-dir=") || token.startsWith("config-merge-dir=")) {
                 if (configOutputDir != null) {
-                    return usage(1, "cannot specify more than one of config-output-dir= or config-merge-dir=.");
+                    return usage("cannot specify more than one of config-output-dir= or config-merge-dir=.");
                 }
                 configOutputDir = transformPath(getTokenValue(token));
                 if (token.startsWith("config-merge-dir=")) {
                     mergeConfigs.addDirectory(Paths.get(configOutputDir));
                 }
+            } else if (token.startsWith("experimental-ignored-entries-output=")) {
+                if (ignoredEntriesFile != null) {
+                    return usage("cannot specify ignored-entries-output= more than once.");
+                }
+                warn("Ignored entries logging (enabled by the \"experimental-ignored-entries-output\" argument) is " +
+                                "experimental and will be removed in the future. Do not rely on this feature.");
+                ignoredEntriesFile = getTokenValue(token);
             } else if (token.startsWith("config-to-omit=")) {
                 String omittedConfigDir = getTokenValue(token);
                 omittedConfigDir = transformPath(omittedConfigDir);
                 omittedConfigs.addDirectory(Paths.get(omittedConfigDir));
-            } else if (token.equals("experimental-omit-config-from-classpath")) {
-                experimentalOmitClasspathConfig = true;
-            } else if (token.startsWith("experimental-omit-config-from-classpath=")) {
-                experimentalOmitClasspathConfig = Boolean.parseBoolean(getTokenValue(token));
+            } else if (isBooleanOption(token, "experimental-omit-config-from-classpath")) {
+                experimentalOmitClasspathConfig = getBooleanTokenValue(token);
             } else if (token.startsWith("restrict-all-dir") || token.equals("restrict") || token.startsWith("restrict=")) {
                 warn("restrict mode is no longer supported, ignoring option: " + token);
             } else if (token.equals("no-builtin-caller-filter")) {
                 builtinCallerFilter = false;
-            } else if (token.startsWith("builtin-caller-filter=")) {
-                builtinCallerFilter = Boolean.parseBoolean(getTokenValue(token));
+            } else if (isBooleanOption(token, "builtin-caller-filter")) {
+                builtinCallerFilter = getBooleanTokenValue(token);
             } else if (token.equals("no-builtin-heuristic-filter")) {
                 builtinHeuristicFilter = false;
-            } else if (token.startsWith("builtin-heuristic-filter=")) {
-                builtinHeuristicFilter = Boolean.parseBoolean(getTokenValue(token));
-            } else if (token.equals("no-filter")) { // legacy
-                builtinCallerFilter = false;
-                builtinHeuristicFilter = false;
-            } else if (token.startsWith("no-filter=")) { // legacy
-                builtinCallerFilter = !Boolean.parseBoolean(getTokenValue(token));
+            } else if (isBooleanOption(token, "builtin-heuristic-filter")) {
+                builtinHeuristicFilter = getBooleanTokenValue(token);
+            } else if (isBooleanOption(token, "no-filter")) { // legacy
+                builtinCallerFilter = !getBooleanTokenValue(token);
                 builtinHeuristicFilter = builtinCallerFilter;
             } else if (token.startsWith("caller-filter-file=")) {
                 callerFilterFiles.add(getTokenValue(token));
             } else if (token.startsWith("access-filter-file=")) {
                 accessFilterFiles.add(getTokenValue(token));
-            } else if (token.equals("experimental-class-loader-support")) {
-                experimentalClassLoaderSupport = true;
-            } else if (token.startsWith("experimental-class-loader-support=")) {
-                experimentalClassLoaderSupport = Boolean.parseBoolean(getTokenValue(token));
-            } else if (token.equals("experimental-class-define-support")) {
-                experimentalClassDefineSupport = true;
-            } else if (token.startsWith("experimental-class-define-support=")) {
-                experimentalClassDefineSupport = Boolean.parseBoolean(getTokenValue(token));
+            } else if (isBooleanOption(token, "experimental-class-loader-support")) {
+                experimentalClassLoaderSupport = getBooleanTokenValue(token);
+            } else if (isBooleanOption(token, "experimental-class-define-support")) {
+                experimentalClassDefineSupport = getBooleanTokenValue(token);
+            } else if (isBooleanOption(token, "experimental-unsafe-allocation-support")) {
+                experimentalUnsafeAllocationSupport = getBooleanTokenValue(token);
             } else if (token.startsWith("config-write-period-secs=")) {
                 configWritePeriod = parseIntegerOrNegative(getTokenValue(token));
                 if (configWritePeriod <= 0) {
-                    return usage(1, "config-write-period-secs must be an integer greater than 0");
+                    return usage("config-write-period-secs must be an integer greater than 0");
                 }
             } else if (token.startsWith("config-write-initial-delay-secs=")) {
                 configWritePeriodInitialDelay = parseIntegerOrNegative(getTokenValue(token));
                 if (configWritePeriodInitialDelay < 0) {
-                    return usage(1, "config-write-initial-delay-secs must be an integer greater or equal to 0");
+                    return usage("config-write-initial-delay-secs must be an integer greater or equal to 0");
                 }
-            } else if (token.equals("build")) {
-                build = true;
-            } else if (token.startsWith("build=")) {
-                build = Boolean.parseBoolean(getTokenValue(token));
-            } else if (token.equals("experimental-configuration-with-origins")) {
-                configurationWithOrigins = true;
-            } else if (token.equals("track-reflection-metadata")) {
-                trackReflectionMetadata = true;
-            } else if (token.startsWith("track-reflection-metadata=")) {
-                trackReflectionMetadata = Boolean.parseBoolean(getTokenValue(token));
+            } else if (isBooleanOption(token, "experimental-configuration-with-origins")) {
+                configurationWithOrigins = getBooleanTokenValue(token);
+            } else if (token.startsWith("experimental-conditional-config-filter-file=")) {
+                conditionalConfigUserPackageFilterFiles.add(getTokenValue(token));
+            } else if (token.startsWith("conditional-config-class-filter-file=")) {
+                conditionalConfigClassNameFilterFiles.add(getTokenValue(token));
+            } else if (isBooleanOption(token, "experimental-conditional-config-part")) {
+                conditionalConfigPartialRun = getBooleanTokenValue(token);
+            } else if (isBooleanOption(token, "track-reflection-metadata")) {
+                trackReflectionMetadata = getBooleanTokenValue(token);
             } else {
-                return usage(1, "unknown option: '" + token + "'.");
+                return usage("unknown option: '" + token + "'.");
             }
         }
 
-        if (traceOutputFile == null && configOutputDir == null && !build) {
+        if (!checkJVMVersion(jvmti)) {
+            return USAGE_ERROR;
+        }
+
+        if (traceOutputFile == null && configOutputDir == null) {
             configOutputDir = transformPath(AGENT_NAME + "_config-pid{pid}-{datetime}/");
-            inform("no output/build options provided, tracking dynamic accesses and writing configuration to directory: " + configOutputDir);
+            inform("no output options provided, tracking dynamic accesses and writing configuration to directory: " + configOutputDir);
+        }
+
+        if (configurationWithOrigins && !conditionalConfigUserPackageFilterFiles.isEmpty()) {
+            return error(USAGE_ERROR, "The agent can only be used in either the configuration with origins mode or the predefined classes mode.");
         }
 
         if (configurationWithOrigins && !mergeConfigs.isEmpty()) {
@@ -213,64 +260,113 @@ public final class NativeImageAgent extends JvmtiAgentBase<NativeImageAgentJNIHa
             warn("using experimental configuration with origins mode. Note that native-image cannot process these files, and this flag may change or be removed without a warning!");
         }
 
-        RuleNode callerFilter = null;
+        ComplexFilter callerFilter = null;
+        HierarchyFilterNode callerFilterHierarchyFilterNode = null;
         if (!builtinCallerFilter) {
-            callerFilter = RuleNode.createRoot();
-            callerFilter.addOrGetChildren("**", RuleNode.Inclusion.Include);
+            callerFilterHierarchyFilterNode = HierarchyFilterNode.createInclusiveRoot();
+            callerFilter = new ComplexFilter(callerFilterHierarchyFilterNode);
         }
+
         if (!callerFilterFiles.isEmpty()) {
-            if (callerFilter == null) {
-                callerFilter = AccessAdvisor.copyBuiltinCallerFilterTree();
+            if (callerFilterHierarchyFilterNode == null) {
+                callerFilterHierarchyFilterNode = AccessAdvisor.copyBuiltinCallerFilterTree();
+                callerFilter = new ComplexFilter(callerFilterHierarchyFilterNode);
             }
             if (!parseFilterFiles(callerFilter, callerFilterFiles)) {
-                return 1;
+                return PARSE_ERROR;
             }
         }
 
-        RuleNode accessFilter = null;
+        ComplexFilter accessFilter = null;
         if (!accessFilterFiles.isEmpty()) {
-            accessFilter = AccessAdvisor.copyBuiltinAccessFilterTree();
+            accessFilter = new ComplexFilter(AccessAdvisor.copyBuiltinAccessFilterTree());
             if (!parseFilterFiles(accessFilter, accessFilterFiles)) {
-                return 1;
+                return PARSE_ERROR;
             }
         }
 
-        final MethodInfoRecordKeeper recordKeeper = new MethodInfoRecordKeeper(configurationWithOrigins);
-        final Supplier<InterceptedState> interceptedStateSupplier = configurationWithOrigins ? EagerlyLoadedJavaStackAccess.stackAccessSupplier()
+        if (!conditionalConfigUserPackageFilterFiles.isEmpty() && conditionalConfigPartialRun) {
+            return error(USAGE_ERROR, "The agent can generate conditional configuration either for the current run or in the partial mode but not both at the same time.");
+        }
+
+        classPathEntries = EconomicSet.create(Arrays.asList(getClasspathEntries(jvmti)));
+
+        boolean isConditionalConfigurationRun = !conditionalConfigUserPackageFilterFiles.isEmpty() || conditionalConfigPartialRun;
+        boolean shouldTraceOriginInformation = configurationWithOrigins || isConditionalConfigurationRun;
+        final MethodInfoRecordKeeper recordKeeper = new MethodInfoRecordKeeper(shouldTraceOriginInformation);
+        final Supplier<InterceptedState> interceptedStateSupplier = shouldTraceOriginInformation ? EagerlyLoadedJavaStackAccess.stackAccessSupplier()
                         : OnDemandJavaStackAccess.stackAccessSupplier();
 
         if (configOutputDir != null) {
             if (traceOutputFile != null) {
-                return usage(1, "can only once specify exactly one of trace-output=, config-output-dir= or config-merge-dir=.");
+                return usage("can only once specify exactly one of trace-output=, config-output-dir= or config-merge-dir=.");
             }
             try {
-                configOutputDirPath = Paths.get(configOutputDir);
-                if (!Files.exists(configOutputDirPath)) {
-                    Files.createDirectories(configOutputDirPath);
+                configOutputDirPath = Files.createDirectories(Path.of(configOutputDir));
+                configOutputLockFilePath = configOutputDirPath.resolve(ConfigurationFile.LOCK_FILE_NAME);
+                try {
+                    Files.writeString(configOutputLockFilePath, Long.toString(ProcessProperties.getProcessID()),
+                                    StandardOpenOption.CREATE_NEW, StandardOpenOption.WRITE);
+                } catch (FileAlreadyExistsException e) {
+                    String process;
+                    try {
+                        process = Files.readString(configOutputLockFilePath).stripTrailing();
+                    } catch (Exception ignored) {
+                        process = "(unknown)";
+                    }
+                    return error(AGENT_ERROR, "Output directory '" + configOutputDirPath + "' is locked by process " + process + ", " +
+                                    "which means another agent instance is already writing to this directory. " +
+                                    "Only one agent instance can safely write to a specific target directory at the same time. " +
+                                    "Unless file '" + ConfigurationFile.LOCK_FILE_NAME + "' is a leftover from an earlier process that terminated abruptly, it is unsafe to delete it. " +
+                                    "For running multiple processes with agents at the same time to create a single configuration, read AutomaticMetadataCollection.md " +
+                                    "or https://www.graalvm.org/dev/reference-manual/native-image/metadata/AutomaticMetadataCollection/ on how to use the native-image-utils tool.");
                 }
                 if (experimentalOmitClasspathConfig) {
                     ignoreConfigFromClasspath(jvmti, omittedConfigs);
                 }
-                AccessAdvisor advisor = createAccessAdvisor(builtinHeuristicFilter, callerFilter, accessFilter);
-                TraceProcessor omittedConfigProcessor = null;
+                AccessAdvisor advisor = new AccessAdvisor(builtinHeuristicFilter, callerFilter, accessFilter, ignoredEntriesFile);
+                TraceProcessor processor = new TraceProcessor(advisor);
+                ConfigurationSet omittedConfiguration = new ConfigurationSet();
                 Predicate<String> shouldExcludeClassesWithHash = null;
                 if (!omittedConfigs.isEmpty()) {
                     Function<IOException, Exception> ignore = e -> {
                         warn("Failed to load omitted config: " + e);
                         return null;
                     };
-                    omittedConfigProcessor = new TraceProcessor(advisor, omittedConfigs.loadJniConfig(ignore), omittedConfigs.loadReflectConfig(ignore),
-                                    omittedConfigs.loadProxyConfig(ignore), omittedConfigs.loadResourceConfig(ignore), omittedConfigs.loadSerializationConfig(ignore),
-                                    omittedConfigs.loadPredefinedClassesConfig(null, null, ignore), null);
-                    shouldExcludeClassesWithHash = omittedConfigProcessor.getPredefinedClassesConfiguration()::containsClassWithHash;
+                    omittedConfiguration = omittedConfigs.loadConfigurationSet(ignore, null, null);
+                    shouldExcludeClassesWithHash = omittedConfiguration.getPredefinedClassesConfiguration()::containsClassWithHash;
                 }
 
-                Path[] predefinedClassDestinationDirs = {configOutputDirPath.resolve(ConfigurationFile.PREDEFINED_CLASSES_AGENT_EXTRACTED_SUBDIR)};
-                if (configurationWithOrigins) {
-                    ConfigurationWithOriginsResultWriter writer = new ConfigurationWithOriginsResultWriter(advisor, recordKeeper);
-                    tracer = writer;
-                    tracingResultWriter = writer;
+                if (shouldTraceOriginInformation) {
+                    ConfigurationWithOriginsTracer configWithOriginsTracer = new ConfigurationWithOriginsTracer(processor, recordKeeper);
+                    tracer = configWithOriginsTracer;
+
+                    if (isConditionalConfigurationRun) {
+                        if (conditionalConfigPartialRun) {
+                            tracingResultWriter = new ConditionalConfigurationPartialRunWriter(configWithOriginsTracer);
+                        } else {
+                            ComplexFilter userCodeFilter = new ComplexFilter(HierarchyFilterNode.createRoot());
+                            if (!parseFilterFiles(userCodeFilter, conditionalConfigUserPackageFilterFiles)) {
+                                return PARSE_ERROR;
+                            }
+                            ComplexFilter classNameFilter;
+                            if (!conditionalConfigClassNameFilterFiles.isEmpty()) {
+                                classNameFilter = new ComplexFilter(HierarchyFilterNode.createRoot());
+                                if (!parseFilterFiles(classNameFilter, conditionalConfigClassNameFilterFiles)) {
+                                    return PARSE_ERROR;
+                                }
+                            } else {
+                                classNameFilter = new ComplexFilter(HierarchyFilterNode.createInclusiveRoot());
+                            }
+
+                            ConditionalConfigurationPredicate predicate = new ConditionalConfigurationPredicate(classNameFilter);
+                            tracingResultWriter = new ConditionalConfigurationWriter(configWithOriginsTracer, userCodeFilter, predicate);
+                        }
+                    } else {
+                        tracingResultWriter = new ConfigurationWithOriginsWriter(configWithOriginsTracer);
+                    }
                 } else {
+                    List<LazyValue<Path>> predefinedClassDestDirs = List.of(PredefinedClassesConfigurationParser.directorySupplier(configOutputDirPath));
                     Function<IOException, Exception> handler = e -> {
                         if (e instanceof NoSuchFileException) {
                             warn("file " + ((NoSuchFileException) e).getFile() + " for merging could not be found, skipping");
@@ -281,57 +377,57 @@ public final class NativeImageAgent extends JvmtiAgentBase<NativeImageAgentJNIHa
                         }
                         return e; // rethrow
                     };
-                    TraceProcessor processor = new TraceProcessor(advisor, mergeConfigs.loadJniConfig(handler), mergeConfigs.loadReflectConfig(handler),
-                                    mergeConfigs.loadProxyConfig(handler), mergeConfigs.loadResourceConfig(handler), mergeConfigs.loadSerializationConfig(handler),
-                                    mergeConfigs.loadPredefinedClassesConfig(predefinedClassDestinationDirs, shouldExcludeClassesWithHash, handler), omittedConfigProcessor);
-                    ConfigurationResultWriter writer = new ConfigurationResultWriter(processor);
+
+                    ConfigurationSet configuration = mergeConfigs.loadConfigurationSet(handler, predefinedClassDestDirs, shouldExcludeClassesWithHash);
+                    ConfigurationResultWriter writer = new ConfigurationResultWriter(processor, configuration, omittedConfiguration);
                     tracer = writer;
                     tracingResultWriter = writer;
                 }
+                expectedConfigModifiedBefore = getMostRecentlyModified(configOutputDirPath, getMostRecentlyModified(configOutputLockFilePath, null));
             } catch (Throwable t) {
-                return error(2, t.toString());
+                return error(AGENT_ERROR, t.toString());
             }
-        } else if (traceOutputFile != null) {
+        } else {
             try {
                 Path path = Paths.get(transformPath(traceOutputFile));
                 TraceFileWriter writer = new TraceFileWriter(path);
                 tracer = writer;
                 tracingResultWriter = writer;
             } catch (Throwable t) {
-                return error(2, t.toString());
+                return error(AGENT_ERROR, t.toString());
             }
         }
 
-        if (build) {
-            int status = buildImage(jvmti);
-            if (status == 0) {
-                System.exit(status);
-            }
-            return status;
+        if (tracer != null) {
+            tracer.traceTrackReflectionMetadata(trackReflectionMetadata);
         }
 
         try {
             BreakpointInterceptor.onLoad(jvmti, callbacks, tracer, this, interceptedStateSupplier,
-                            experimentalClassLoaderSupport, experimentalClassDefineSupport, trackReflectionMetadata);
+                            experimentalClassLoaderSupport, experimentalClassDefineSupport, experimentalUnsafeAllocationSupport, trackReflectionMetadata);
         } catch (Throwable t) {
-            return error(3, t.toString());
+            return error(AGENT_ERROR, t.toString());
         }
         try {
             JniCallInterceptor.onLoad(tracer, this, interceptedStateSupplier);
         } catch (Throwable t) {
-            return error(4, t.toString());
+            return error(AGENT_ERROR, t.toString());
         }
 
         setupExecutorServiceForPeriodicConfigurationCapture(configWritePeriod, configWritePeriodInitialDelay);
-        return 0;
+        return SUCCESS;
     }
 
     private static void inform(String message) {
+        // Checkstyle: allow System.err (agent class)
         System.err.println(AGENT_NAME + ": " + message);
+        // Checkstyle: disallow System.err
     }
 
     private static void warn(String message) {
+        // Checkstyle: Allow raw info or warning printing - begin
         inform("Warning: " + message);
+        // Checkstyle: Allow raw info or warning printing - end
     }
 
     private static <T> T error(T result, String message) {
@@ -339,23 +435,39 @@ public final class NativeImageAgent extends JvmtiAgentBase<NativeImageAgentJNIHa
         return result;
     }
 
-    private static <T> T usage(T result, String message) {
+    private static int usage(String message) {
         inform(message);
         inform("Example usage: -agentlib:native-image-agent=config-output-dir=/path/to/config-dir/");
-        inform("For details, please read BuildConfiguration.md or https://www.graalvm.org/reference-manual/native-image/BuildConfiguration/");
-        return result;
+        inform("For details, please read AutomaticMetadataCollection.md or https://www.graalvm.org/dev/reference-manual/native-image/metadata/AutomaticMetadataCollection/");
+        return USAGE_ERROR;
     }
 
-    private static AccessAdvisor createAccessAdvisor(boolean builtinHeuristicFilter, RuleNode callerFilter, RuleNode accessFilter) {
-        AccessAdvisor advisor = new AccessAdvisor();
-        advisor.setHeuristicsEnabled(builtinHeuristicFilter);
-        if (callerFilter != null) {
-            advisor.setCallerFilterTree(callerFilter);
+    private static boolean checkJVMVersion(JvmtiEnv jvmti) {
+        String agentVersion = System.getProperty("java.vm.version");
+        int agentMajorVersion = JavaVersionUtil.JAVA_SPEC;
+
+        String vmVersion = Support.getSystemProperty(jvmti, "java.vm.version");
+        if (vmVersion == null) {
+            warn(String.format("Unable to determine the \"java.vm.version\" of the running JVM. Note that the JVM should have major version %d, otherwise metadata may be incorrect.",
+                            agentMajorVersion));
+            return true;
         }
-        if (accessFilter != null) {
-            advisor.setAccessFilterTree(accessFilter);
+
+        // Fail if the major versions differ.
+        String[] parts = vmVersion.split("\\D");
+        if (parts.length == 0 || Integer.parseInt(parts[0]) != agentMajorVersion) {
+            return error(false, String.format(
+                            "The current VM (%s) is incompatible with the agent, which was built for a JVM with major version %d. To resolve this issue, run the agent using a JVM with major version %d.",
+                            vmVersion, agentMajorVersion, agentMajorVersion));
         }
-        return advisor;
+
+        // Warn if the VM is different.
+        if (!vmVersion.startsWith(agentVersion)) {
+            warn(String.format(
+                            "The running JVM (%s) is different from the JVM used to build the agent (%s). If the generated metadata is incorrect or incomplete, consider running the agent using the same JVM that built it.",
+                            vmVersion, agentVersion));
+        }
+        return true;
     }
 
     private static int parseIntegerOrNegative(String number) {
@@ -366,15 +478,15 @@ public final class NativeImageAgent extends JvmtiAgentBase<NativeImageAgentJNIHa
         }
     }
 
-    private static boolean parseFilterFiles(RuleNode filter, List<String> filterFiles) {
+    private static boolean parseFilterFiles(ComplexFilter filter, List<String> filterFiles) {
         for (String path : filterFiles) {
             try {
-                new FilterConfigurationParser(filter).parseAndRegister(Paths.get(path));
+                new FilterConfigurationParser(filter).parseAndRegister(Paths.get(path).toUri());
             } catch (Exception e) {
                 return error(false, "cannot parse filter file " + path + ": " + e);
             }
         }
-        filter.removeRedundantNodes();
+        filter.getHierarchyFilterNode().removeRedundantNodes();
         return true;
     }
 
@@ -400,7 +512,7 @@ public final class NativeImageAgent extends JvmtiAgentBase<NativeImageAgentJNIHa
                         initialDelay, writePeriod, TimeUnit.SECONDS);
     }
 
-    private static void ignoreConfigFromClasspath(JvmtiEnv jvmti, ConfigurationSet ignoredConfigSet) {
+    private static String[] getClasspathEntries(JvmtiEnv jvmti) {
         String classpath = Support.getSystemProperty(jvmti, "java.class.path");
         String sep = Support.getSystemProperty(jvmti, "path.separator");
         if (sep == null) {
@@ -409,62 +521,31 @@ public final class NativeImageAgent extends JvmtiAgentBase<NativeImageAgentJNIHa
             } else if (Platform.includedIn(Platform.WINDOWS.class)) {
                 sep = "[:;]";
             } else {
-                warn("Running on unknown platform. Not omitting existing config from classpath.");
-                return;
+                warn("Running on unknown platform. Could not process classpath.");
+                return new String[]{};
             }
         }
+        String[] entries = classpath.split(sep);
+        for (int i = 0; i < entries.length; i++) {
+            try {
+                entries[i] = new File(entries[i]).getCanonicalPath();
+            } catch (IOException ex) {
+                warn("Could not normalize classpath entry %s. Agent output may be incorrect.".formatted(entries[i]));
+            }
+        }
+        return entries;
+    }
 
-        AgentMetaInfProcessor processor = new AgentMetaInfProcessor(ignoredConfigSet);
-        for (String cpEntry : classpath.split(sep)) {
+    private static void ignoreConfigFromClasspath(JvmtiEnv jvmti, ConfigurationFileCollection ignoredConfigCollection) {
+        String[] entries = getClasspathEntries(jvmti);
+        AgentMetaInfProcessor processor = new AgentMetaInfProcessor(ignoredConfigCollection);
+        for (String cpEntry : entries) {
             try {
                 NativeImageMetaInfWalker.walkMetaInfForCPEntry(Paths.get(cpEntry), processor);
             } catch (NativeImageMetaInfWalker.MetaInfWalkException e) {
                 warn("Failed to walk the classpath entry: " + cpEntry + " Reason: " + e);
             }
         }
-    }
-
-    private static final Pattern propertyBlacklist = Pattern.compile("(java\\..*)|(sun\\..*)|(jvmci\\..*)");
-    private static final Pattern propertyWhitelist = Pattern.compile("(java\\.library\\.path)|(java\\.io\\.tmpdir)");
-
-    private static int buildImage(JvmtiEnv jvmti) {
-        System.out.println("Building native image ...");
-        String classpath = Support.getSystemProperty(jvmti, "java.class.path");
-        if (classpath == null) {
-            return usage(1, "Build mode could not determine classpath.");
-        }
-        String javaCommand = Support.getSystemProperty(jvmti, "sun.java.command");
-        String mainClassMissing = "Build mode could not determine main class.";
-        if (javaCommand == null) {
-            return usage(1, mainClassMissing);
-        }
-        String mainClass = SubstrateUtil.split(javaCommand, " ")[0];
-        if (mainClass.isEmpty()) {
-            return usage(1, mainClassMissing);
-        }
-        List<String> buildArgs = new ArrayList<>();
-        // buildArgs.add("--verbose");
-        String[] keys = Support.getSystemProperties(jvmti);
-        for (String key : keys) {
-            boolean whitelisted = propertyWhitelist.matcher(key).matches();
-            boolean blacklisted = !whitelisted && propertyBlacklist.matcher(key).matches();
-            if (blacklisted) {
-                continue;
-            }
-            buildArgs.add("-D" + key + "=" + Support.getSystemProperty(jvmti, key));
-        }
-        if (mainClass.toLowerCase().endsWith(".jar")) {
-            buildArgs.add("-jar");
-        } else {
-            buildArgs.addAll(Arrays.asList("-cp", classpath));
-        }
-        buildArgs.add(mainClass);
-        buildArgs.add(AGENT_NAME + ".build");
-        // System.out.println(String.join("\n", buildArgs));
-        Path javaHome = Paths.get(Support.getSystemProperty(jvmti, "java.home"));
-        String userDirStr = Support.getSystemProperty(jvmti, "user.dir");
-        NativeImage.agentBuild(javaHome, userDirStr == null ? null : Paths.get(userDirStr), buildArgs);
-        return 0;
     }
 
     private static String transformPath(String path) {
@@ -505,19 +586,40 @@ public final class NativeImageAgent extends JvmtiAgentBase<NativeImageAgentJNIHa
 
     private static final int MAX_WARNINGS_FOR_WRITING_CONFIGS_FAILURES = 5;
     private static int currentFailuresWritingConfigs = 0;
+    private static int currentFailuresModifiedTargetDirectory = 0;
 
     private void writeConfigurationFiles() {
+        Path tempDirectory = null;
         try {
-            final Path tempDirectory = configOutputDirPath.toFile().exists()
-                            ? Files.createTempDirectory(configOutputDirPath, "tempConfig-")
-                            : Files.createTempDirectory("tempConfig-");
-            List<Path> writtenFilePaths = tracingResultWriter.writeToDirectory(tempDirectory);
+            FileTime mostRecent = getMostRecentlyModified(configOutputDirPath, expectedConfigModifiedBefore);
 
-            for (Path writtenFilePath : writtenFilePaths) {
-                Path fileName = tempDirectory.relativize(writtenFilePath);
-                Path target = configOutputDirPath.resolve(fileName);
-                tryAtomicMove(writtenFilePath, target);
+            // Write files first before failing any modification checks
+            tempDirectory = Files.createTempDirectory(configOutputDirPath, transformPath("agent-pid{pid}-{datetime}.tmp"));
+            List<Path> tempFilePaths = tracingResultWriter.writeToDirectory(tempDirectory);
+
+            if (!Files.exists(configOutputLockFilePath)) {
+                throw unexpectedlyModified(configOutputLockFilePath);
             }
+            expectUnmodified(configOutputLockFilePath);
+            /*
+             * Checking for the modification of the whole configuration directory is not possible
+             * since predefined classes configuration outputs folders and files during the agent
+             * run.
+             */
+
+            Path[] targetFilePaths = new Path[tempFilePaths.size()];
+            for (int i = 0; i < tempFilePaths.size(); i++) {
+                Path fileName = tempDirectory.relativize(tempFilePaths.get(i));
+                targetFilePaths[i] = configOutputDirPath.resolve(fileName);
+                expectUnmodified(targetFilePaths[i]);
+            }
+
+            for (int i = 0; i < tempFilePaths.size(); i++) {
+                tryAtomicMove(tempFilePaths.get(i), targetFilePaths[i]);
+                mostRecent = getMostRecentlyModified(targetFilePaths[i], mostRecent);
+            }
+            mostRecent = getMostRecentlyModified(configOutputDirPath, mostRecent);
+            expectedConfigModifiedBefore = mostRecent;
 
             /*
              * Note that sidecar files may be written directly to the final output directory, such
@@ -527,14 +629,51 @@ public final class NativeImageAgent extends JvmtiAgentBase<NativeImageAgentJNIHa
 
             compulsoryDelete(tempDirectory);
         } catch (IOException e) {
-            warnUpToLimit(currentFailuresWritingConfigs++, MAX_WARNINGS_FOR_WRITING_CONFIGS_FAILURES, "Error when writing configuration files: " + e.toString());
+            warnUpToLimit(currentFailuresWritingConfigs++, MAX_WARNINGS_FOR_WRITING_CONFIGS_FAILURES,
+                            "Error when writing configuration files:" + System.lineSeparator() + stackTraceToString(e));
+        } catch (ConcurrentModificationException e) {
+            warnUpToLimit(currentFailuresModifiedTargetDirectory++, MAX_WARNINGS_FOR_WRITING_CONFIGS_FAILURES,
+                            "file or directory '" + e.getMessage() + "' has been modified by another process. " +
+                                            "All output files remain in the temporary directory '" + configOutputDirPath.resolve("..").relativize(tempDirectory) + "'. " +
+                                            "Ensure that only one agent instance and no other processes are writing to the output directory '" + configOutputDirPath + "' at the same time. " +
+                                            "For running multiple processes with agents at the same time to create a single configuration, read AutomaticMetadataCollection.md " +
+                                            "or https://www.graalvm.org/dev/reference-manual/native-image/metadata/AutomaticMetadataCollection/ on how to use the native-image-utils tool.");
         }
     }
 
+    private void expectUnmodified(Path path) {
+        try {
+            if (Files.getLastModifiedTime(path).compareTo(expectedConfigModifiedBefore) > 0) {
+                throw unexpectedlyModified(path);
+            }
+        } catch (IOException ignored) {
+            // best effort
+        }
+    }
+
+    private static ConcurrentModificationException unexpectedlyModified(Path path) {
+        throw new ConcurrentModificationException(path.getFileName().toString());
+    }
+
+    private static FileTime getMostRecentlyModified(Path path, FileTime other) {
+        FileTime modified;
+        try {
+            modified = Files.getLastModifiedTime(path);
+        } catch (IOException ignored) {
+            return other; // best effort
+        }
+        return (other == null || other.compareTo(modified) < 0) ? modified : other;
+    }
+
+    @SuppressWarnings("BusyWait")
     private static void compulsoryDelete(Path pathToDelete) {
         final int maxRetries = 3;
         int retries = 0;
         while (pathToDelete.toFile().exists() && !pathToDelete.toFile().delete() && retries < maxRetries) {
+            try {
+                Thread.sleep((long) (100 + Math.random() * 500));
+            } catch (InterruptedException e) {
+            }
             retries++;
         }
     }
@@ -551,6 +690,12 @@ public final class NativeImageAgent extends JvmtiAgentBase<NativeImageAgentJNIHa
         }
     }
 
+    private static String stackTraceToString(Throwable throwable) {
+        StringWriter stringWriter = new StringWriter();
+        throwable.printStackTrace(new PrintWriter(stringWriter));
+        return stringWriter.toString();
+    }
+
     private static final int MAX_FAILURES_ATOMIC_MOVE = 20;
     private static int currentFailuresAtomicMove = 0;
 
@@ -559,7 +704,7 @@ public final class NativeImageAgent extends JvmtiAgentBase<NativeImageAgentJNIHa
             Files.move(source, target, StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE);
         } catch (AtomicMoveNotSupportedException e) {
             warnUpToLimit(currentFailuresAtomicMove++, MAX_FAILURES_ATOMIC_MOVE,
-                            String.format("Could not move temporary configuration profile from (%s) to (%s) atomically. " +
+                            String.format("Could not move temporary configuration profile from '%s' to '%s' atomically. " +
                                             "This might result in inconsistencies.", source.toAbsolutePath(), target.toAbsolutePath()));
             Files.move(source, target, StandardCopyOption.REPLACE_EXISTING);
         }
@@ -585,6 +730,8 @@ public final class NativeImageAgent extends JvmtiAgentBase<NativeImageAgentJNIHa
             if (tracingResultWriter.supportsOnUnloadTraceWriting()) {
                 if (configOutputDirPath != null) {
                     writeConfigurationFiles();
+                    compulsoryDelete(configOutputLockFilePath);
+                    configOutputLockFilePath = null;
                     configOutputDirPath = null;
                 }
             }
@@ -604,7 +751,14 @@ public final class NativeImageAgent extends JvmtiAgentBase<NativeImageAgentJNIHa
          * The epilogue of this method does not tear down our VM: we don't seem to observe all
          * threads that end and therefore can't detach them, so we would wait forever for them.
          */
-        return 0;
+        return SUCCESS;
+    }
+
+    static class ExitCodes {
+        static final int SUCCESS = 0;
+        static final int USAGE_ERROR = 1;
+        static final int PARSE_ERROR = 2;
+        static final int AGENT_ERROR = 3;
     }
 
     @SuppressWarnings("unused")

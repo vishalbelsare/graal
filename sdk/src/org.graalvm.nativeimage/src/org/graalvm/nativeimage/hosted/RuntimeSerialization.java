@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2021, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2021, 2025, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * The Universal Permissive License (UPL), Version 1.0
@@ -43,7 +43,9 @@ package org.graalvm.nativeimage.hosted;
 import org.graalvm.nativeimage.ImageSingletons;
 import org.graalvm.nativeimage.Platform;
 import org.graalvm.nativeimage.Platforms;
-import org.graalvm.nativeimage.impl.ConfigurationCondition;
+import org.graalvm.nativeimage.dynamicaccess.ReflectiveAccess;
+import org.graalvm.nativeimage.impl.APIDeprecationSupport;
+import org.graalvm.nativeimage.dynamicaccess.AccessCondition;
 import org.graalvm.nativeimage.impl.RuntimeSerializationSupport;
 
 /**
@@ -55,13 +57,44 @@ import org.graalvm.nativeimage.impl.RuntimeSerializationSupport;
 @Platforms(Platform.HOSTED_ONLY.class)
 public final class RuntimeSerialization {
 
+    private static final APIDeprecationSupport deprecationFlag = ImageSingletons.lookup(APIDeprecationSupport.class);
+
+    /**
+     * Register the specified serialization target class itself and all associated classes.
+     * <p>
+     * According to the Java Object Serialization Specification, the associated classes include 1)
+     * all the target class' non-static and non-transient fields types and their associated classes;
+     * 2) other fields defined in the customised writeObject(ObjectOutputStream) and
+     * readObject(ObjectInputStream). This method can automatically explore all possible
+     * serialization target classes in the first scenario, but can't figure out the classes in the
+     * second scenario.
+     * <p>
+     * Another limitation is the specified {@code clazz} must have no subclasses (effectively
+     * final). Otherwise, the actual serialization target class could be any subclass of the
+     * specified class at runtime.
+     * <p>
+     * This API is deprecated; use the {@link ReflectiveAccess} instead.
+     *
+     * @param clazz the serialization target class
+     * @since 21.3
+     */
+    public static void registerIncludingAssociatedClasses(Class<?> clazz) {
+        deprecationFlag.printDeprecationWarning();
+        RuntimeSerializationSupport.singleton().registerIncludingAssociatedClasses(AccessCondition.unconditional(), clazz);
+    }
+
     /**
      * Makes the provided classes available for serialization at runtime.
+     * <p>
+     * This API is deprecated; use the {@link ReflectiveAccess} instead.
      *
      * @since 21.3
      */
     public static void register(Class<?>... classes) {
-        ImageSingletons.lookup(RuntimeSerializationSupport.class).register(ConfigurationCondition.alwaysTrue(), classes);
+        deprecationFlag.printDeprecationWarning();
+        for (Class<?> clazz : classes) {
+            RuntimeSerializationSupport.singleton().register(AccessCondition.unconditional(), false, clazz);
+        }
     }
 
     /**
@@ -72,11 +105,44 @@ public final class RuntimeSerialization {
      * {@code ReflectionFactory.newConstructorForSerialization(Class<?> cl, Constructor<?> constructorToCall)}
      * where the passed `constructorToCall` differs from what would automatically be used if regular
      * deserialization of `cl` would happen. This method exists to also support such usecases.
+     * 
+     * @deprecated Use {@link #register(Class[])} instead. All possible custom constructors will be
+     *             registered automatically.
      *
      * @since 21.3
      */
+    @Deprecated(since = "24.2")
+    @SuppressWarnings("unused")
     public static void registerWithTargetConstructorClass(Class<?> clazz, Class<?> customTargetConstructorClazz) {
-        ImageSingletons.lookup(RuntimeSerializationSupport.class).registerWithTargetConstructorClass(ConfigurationCondition.alwaysTrue(), clazz, customTargetConstructorClazz);
+        RuntimeSerializationSupport.singleton().register(AccessCondition.unconditional(), false, clazz);
+    }
+
+    /**
+     * Makes a class available for serialization at runtime that is created for the lambda
+     * expressions (a class that has a $deserializeLambda$ method) specified by the
+     * lambdaCapturingClass.
+     * <p>
+     * This API is deprecated; use the {@link ReflectiveAccess} instead.
+     *
+     * @since 22.3
+     */
+    public static void registerLambdaCapturingClass(Class<?> lambdaCapturingClass) {
+        deprecationFlag.printDeprecationWarning();
+        RuntimeSerializationSupport.singleton().registerLambdaCapturingClass(AccessCondition.unconditional(), lambdaCapturingClass);
+    }
+
+    /**
+     * Makes a dynamic proxy class (class that extends {@link java.lang.reflect.Proxy}) available
+     * for serialization at runtime that is specified by the given interfaces the proxy class
+     * implements.
+     * <p>
+     * This API is deprecated; use the {@link ReflectiveAccess} instead.
+     *
+     * @since 22.3
+     */
+    public static void registerProxyClass(Class<?>... implementedInterfaces) {
+        deprecationFlag.printDeprecationWarning();
+        RuntimeSerializationSupport.singleton().registerProxyClass(AccessCondition.unconditional(), implementedInterfaces);
     }
 
     private RuntimeSerialization() {

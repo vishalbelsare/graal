@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2016, 2020, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2016, 2022, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * The Universal Permissive License (UPL), Version 1.0
@@ -42,6 +42,7 @@ package com.oracle.truffle.api.instrumentation.test;
 
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
+import static org.junit.Assert.assertNotEquals;
 import static org.junit.Assert.assertNotNull;
 import static org.junit.Assert.assertNull;
 import static org.junit.Assert.assertSame;
@@ -218,6 +219,19 @@ public class InstrumentationTest extends AbstractInstrumentationTest {
         assertNotNull("At least one Runnable found", start);
     }
 
+    @Test
+    public void queryHostLanguage() throws Exception {
+        @SuppressWarnings("unchecked")
+        Class<? extends TruffleLanguage<?>> hostLanguage = (Class<? extends TruffleLanguage<?>>) Class.forName("com.oracle.truffle.host.HostLanguage");
+        LanguageInfo hostInfo = instrumentEnv.getLanguageInfo(hostLanguage);
+        Runnable r = instrumentEnv.lookup(hostInfo, Runnable.class);
+        assertNull(r);
+        Object lv = instrumentEnv.getLanguageView(hostInfo, 42);
+        assertNotNull(lv);
+        Object scope = instrumentEnv.getScope(hostInfo);
+        assertNotNull(scope);
+    }
+
     @Test(expected = IllegalStateException.class) // IllegalStateException: Engine is already closed
     public void queryInstrumentsAfterDisposeDoesnotEnable() throws Exception {
         engine = Engine.newBuilder().err(err).build();
@@ -353,7 +367,7 @@ public class InstrumentationTest extends AbstractInstrumentationTest {
     }
 
     @SuppressWarnings("serial")
-    private static class MyLanguageException extends RuntimeException {
+    private static final class MyLanguageException extends RuntimeException {
 
     }
 
@@ -1181,17 +1195,17 @@ public class InstrumentationTest extends AbstractInstrumentationTest {
     public void testOutputConsumer() throws IOException {
         try {
             // print without instruments
-            String rout = run("PRINT(OUT, InitialToStdOut)");
+            String rout = run("PRINT(OUT, CONSTANT(\"InitialToStdOut\"))");
             Assert.assertEquals("InitialToStdOut", rout);
-            run("PRINT(ERR, InitialToStdErr)");
+            run("PRINT(ERR, CONSTANT(\"InitialToStdErr\"))");
             Assert.assertEquals("InitialToStdErr", err.toString());
             err.reset();
 
             // turn instruments on
             assureEnabled(engine.getInstruments().get("testOutputConsumerArray"));
             assureEnabled(engine.getInstruments().get("testOutputConsumerPiped"));
-            context.eval(lines("PRINT(OUT, OutputToStdOut)"));
-            context.eval(lines("PRINT(ERR, OutputToStdErr)"));
+            context.eval(lines("PRINT(OUT, CONSTANT(\"OutputToStdOut\"))"));
+            context.eval(lines("PRINT(ERR, CONSTANT(\"OutputToStdErr\"))"));
             // test that the output goes eveywhere
             Assert.assertEquals("OutputToStdOut", getOut());
             Assert.assertEquals("OutputToStdOut", TestOutputConsumerArray.getOut());
@@ -1209,8 +1223,8 @@ public class InstrumentationTest extends AbstractInstrumentationTest {
 
             // close piped err stream and test that print still works
             TestOutputConsumerPiped.fromErr.close();
-            context.eval(lines("PRINT(OUT, MoreOutputToStdOut)"));
-            context.eval(lines("PRINT(ERR, MoreOutputToStdErr)"));
+            context.eval(lines("PRINT(OUT, CONSTANT(\"MoreOutputToStdOut\"))"));
+            context.eval(lines("PRINT(ERR, CONSTANT(\"MoreOutputToStdErr\"))"));
             Assert.assertEquals("OutputToStdOutMoreOutputToStdOut", out.toString());
             Assert.assertEquals("OutputToStdOutMoreOutputToStdOut", TestOutputConsumerArray.getOut());
             String errorMsg = "java.lang.Exception: Output operation write(B[II) failed for java.io.PipedOutputStream";
@@ -1225,7 +1239,7 @@ public class InstrumentationTest extends AbstractInstrumentationTest {
             err.reset();
 
             // the I/O error is not printed again
-            context.eval(lines("PRINT(ERR, EvenMoreOutputToStdErr)"));
+            context.eval(lines("PRINT(ERR, CONSTANT(\"EvenMoreOutputToStdErr\"))"));
             Assert.assertEquals("EvenMoreOutputToStdErr", err.toString());
             Assert.assertEquals("OutputToStdErrMoreOutputToStdErrEvenMoreOutputToStdErr", TestOutputConsumerArray.getErr());
 
@@ -1234,8 +1248,8 @@ public class InstrumentationTest extends AbstractInstrumentationTest {
             setup();
             out.reset();
             err.reset();
-            context.eval(lines("PRINT(OUT, FinalOutputToStdOut)"));
-            context.eval(lines("PRINT(ERR, FinalOutputToStdErr)"));
+            context.eval(lines("PRINT(OUT, CONSTANT(\"FinalOutputToStdOut\"))"));
+            context.eval(lines("PRINT(ERR, CONSTANT(\"FinalOutputToStdErr\"))"));
             Assert.assertEquals("FinalOutputToStdOut", out.toString());
             Assert.assertEquals("FinalOutputToStdErr", err.toString());
             // nothing more printed to the disabled instrument
@@ -1370,7 +1384,7 @@ public class InstrumentationTest extends AbstractInstrumentationTest {
     @Registration(id = "testUsedTagNotRequired1", services = Object.class)
     public static class TestUsedTagNotRequired1 extends TruffleInstrument {
 
-        private static class Foobar {
+        private static final class Foobar {
 
         }
 
@@ -1484,12 +1498,12 @@ public class InstrumentationTest extends AbstractInstrumentationTest {
         assertEquals(1, service.onCreateCalls);
 
         final Map<String, ? extends Instrument> instruments = forked.getEngine().getInstruments();
-        assertSame(instrument, instruments.get("testIsNodeTaggedWith1"));
+        assertEquals(instrument, instruments.get("testIsNodeTaggedWith1"));
         assertSame(service, instruments.get("testIsNodeTaggedWith1").lookup(TestIsNodeTaggedWith1.class));
 
         assertEquals(instruments.size(), engine.getInstruments().size());
         for (String key : instruments.keySet()) {
-            assertSame(engine.getInstruments().get(key), instruments.get(key));
+            assertEquals(engine.getInstruments().get(key), instruments.get(key));
         }
 
         assertEquals(0, service.onDisposeCalls);
@@ -2211,7 +2225,7 @@ public class InstrumentationTest extends AbstractInstrumentationTest {
 
         @Override
         protected void onCreate(Env env) {
-            env.registerService(new Supplier<Object>() {
+            env.registerService(new Supplier<>() {
                 @Override
                 public Object get() {
                     return env.getPolyglotBindings();
@@ -2279,7 +2293,7 @@ public class InstrumentationTest extends AbstractInstrumentationTest {
 
                 @TruffleBoundary
                 private void storeInvokedTarget(MaterializedFrame frame) {
-                    CallTarget callTarget = Truffle.getRuntime().getCurrentFrame().getCallTarget();
+                    CallTarget callTarget = Truffle.getRuntime().iterateFrames((f) -> f.getCallTarget());
                     frame.setObject(TARGET_SLOT, callTarget);
                 }
 
@@ -2402,6 +2416,34 @@ public class InstrumentationTest extends AbstractInstrumentationTest {
         run(source);
         instrumentationFinished.await();
         run(Source.create(InstrumentationTestLanguage.ID, "JOIN()"));
+    }
+
+    @Test
+    public void testEquals() {
+        Instrument instrument1 = engine.getInstruments().get(EqualsInstrument1.ID);
+        Instrument instrument2 = engine.getInstruments().get(EqualsInstrument2.ID);
+        assertNotEquals(instrument1, instrument2);
+        assertEquals(instrument1, engine.getInstruments().get(EqualsInstrument1.ID));
+    }
+
+    @Registration(id = EqualsInstrument1.ID)
+    public static final class EqualsInstrument1 extends TruffleInstrument {
+
+        static final String ID = "EqualsInstrument1";
+
+        @Override
+        protected void onCreate(Env env) {
+        }
+    }
+
+    @Registration(id = EqualsInstrument2.ID)
+    public static final class EqualsInstrument2 extends TruffleInstrument {
+
+        static final String ID = "EqualsInstrument2";
+
+        @Override
+        protected void onCreate(Env env) {
+        }
     }
 
     public static class AsynchronousStacksInstrument extends ProxyInstrument {

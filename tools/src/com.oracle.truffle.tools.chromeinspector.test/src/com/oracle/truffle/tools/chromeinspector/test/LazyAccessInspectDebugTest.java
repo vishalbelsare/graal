@@ -29,6 +29,9 @@ import static org.junit.Assert.assertTrue;
 
 import java.util.concurrent.atomic.AtomicInteger;
 
+import com.oracle.truffle.api.CompilerDirectives;
+import com.oracle.truffle.api.CompilerDirectives.CompilationFinal;
+import com.oracle.truffle.api.frame.FrameDescriptor;
 import org.graalvm.polyglot.Source;
 import org.junit.Test;
 
@@ -78,9 +81,9 @@ public class LazyAccessInspectDebugTest {
         InspectorTester tester = InspectorTester.start(true);
         tester.sendMessage("{\"id\":1,\"method\":\"Runtime.enable\"}");
         tester.sendMessage("{\"id\":2,\"method\":\"Debugger.enable\"}");
-        assertTrue(tester.compareReceivedMessages(
+        tester.receiveMessages(
                         "{\"result\":{},\"id\":1}\n" +
-                        "{\"result\":{},\"id\":2}\n"));
+                        "{\"result\":{\"debuggerId\":\"UniqueDebuggerId.", "},\"id\":2}\n");
         tester.sendMessage("{\"id\":3,\"method\":\"Runtime.runIfWaitingForDebugger\"}");
         assertTrue(tester.compareReceivedMessages(
                         "{\"result\":{},\"id\":3}\n" +
@@ -193,6 +196,7 @@ public class LazyAccessInspectDebugTest {
 
             @Node.Child private TestStatementNode statement;
             private final SourceSection statementSection;
+            @CompilationFinal private volatile Integer slotIndex;
 
             TestRootNode(TruffleLanguage<?> language, com.oracle.truffle.api.source.Source source) {
                 super(language);
@@ -214,9 +218,18 @@ public class LazyAccessInspectDebugTest {
             @Override
             public Object execute(VirtualFrame frame) {
                 TruffleObject obj = new LazyReadObject(false);
-                int slot = frame.getFrameDescriptor().findOrAddAuxiliarySlot("o");
+                int slot = getSlotIndex(frame.getFrameDescriptor());
                 frame.setAuxiliarySlot(slot, obj);
                 return statement.execute(frame);
+            }
+
+            private int getSlotIndex(FrameDescriptor fd) {
+                Integer index = this.slotIndex;
+                if (index == null) {
+                    CompilerDirectives.transferToInterpreterAndInvalidate();
+                    this.slotIndex = index = fd.findOrAddAuxiliarySlot("o");
+                }
+                return index;
             }
 
             @Override
@@ -271,7 +284,7 @@ public class LazyAccessInspectDebugTest {
             }
 
             @Override
-            protected boolean hasLanguage() {
+            protected boolean hasLanguageId() {
                 // Provides the ProxyLanguage by default.
                 return true;
             }
@@ -333,7 +346,7 @@ public class LazyAccessInspectDebugTest {
             }
         }
 
-        private static class MetaObject extends ProxyInteropObject {
+        private static final class MetaObject extends ProxyInteropObject {
 
             @Override
             protected boolean isMetaObject() {
@@ -357,7 +370,7 @@ public class LazyAccessInspectDebugTest {
 
         }
 
-        private static class Keys extends ProxyInteropObject {
+        private static final class Keys extends ProxyInteropObject {
 
             @Override
             protected boolean hasArrayElements() {

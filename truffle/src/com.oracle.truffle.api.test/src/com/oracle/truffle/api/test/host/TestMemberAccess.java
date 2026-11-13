@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2017, 2021, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2017, 2024, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * The Universal Permissive License (UPL), Version 1.0
@@ -422,7 +422,7 @@ public class TestMemberAccess extends ProxyLanguageEnvTest {
         testObj = (TruffleObject) INTEROP.instantiate(testClass, (short) 42);
         assertEquals(int.class.getName(), INTEROP.readMember(testObj, "ctor"));
         testObj = (TruffleObject) INTEROP.instantiate(testClass, 4.2f);
-        // TODO prioritize conversion from double to float over double to int
+        // TODO GR-38632 prioritize conversion from double to float over double to int
         // assertEquals(float.class.getName(), INTEROP.readMember(testObj, "ctor"));
     }
 
@@ -430,7 +430,7 @@ public class TestMemberAccess extends ProxyLanguageEnvTest {
     public void testOverloadedConstructor3() throws InteropException {
         TruffleObject clazz = asTruffleHostSymbol(TestConstructorException.class);
         Object testObj = INTEROP.instantiate(clazz, "test", 42);
-        assertTrue(testObj instanceof TruffleObject && env.asHostObject(testObj) instanceof TestConstructorException);
+        assertTrue(testObj instanceof TruffleObject && INTEROP.asHostObject(testObj) instanceof TestConstructorException);
         assertThrowsExceptionWithCause(() -> INTEROP.instantiate(clazz, "test"), IOException.class);
     }
 

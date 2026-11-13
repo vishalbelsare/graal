@@ -51,7 +51,7 @@ import com.oracle.truffle.tools.chromeinspector.commands.Params;
 import com.oracle.truffle.tools.chromeinspector.server.ConnectionWatcher;
 import com.oracle.truffle.tools.chromeinspector.server.InspectServerSession;
 import com.oracle.truffle.tools.chromeinspector.server.JSONMessageListener;
-import com.oracle.truffle.tools.utils.json.JSONObject;
+import org.graalvm.shadowed.org.json.JSONObject;
 import java.io.IOException;
 
 /**
@@ -182,7 +182,7 @@ class Session extends AbstractInspectorObject {
             throw new InspectorStateException("The inspector session is already connected");
         }
         InspectorExecutionContext execContext = contextSupplier.get();
-        iss = InspectServerSession.create(execContext, false, new ConnectionWatcher());
+        iss = InspectServerSession.create(execContext, false, new ConnectionWatcher(), () -> disconnect());
         iss.open(getListeners());
         execContext.setSynchronous(true);
         // Enable the Runtime by default
@@ -254,14 +254,14 @@ class Session extends AbstractInspectorObject {
         return getListeners().emit(eventName, listenerArgs);
     }
 
-    private Object post(Object[] arguments) throws ArityException, UnsupportedTypeException {
+    private Object post(Object[] arguments) throws ArityException, UnsupportedTypeException, UnsupportedMessageException {
         if (arguments.length < 1) {
             throw ArityException.create(1, -1, arguments.length);
         }
-        if (!(arguments[0] instanceof String)) {
+        if (!InteropLibrary.getUncached().isString(arguments[0])) {
             throw UnsupportedTypeException.create(new Object[]{arguments[0]});
         }
-        String method = (String) arguments[0];
+        String method = InteropLibrary.getUncached().asString(arguments[0]);
         TruffleObject params = null;
         TruffleObject callback = null;
         if (arguments.length >= 2) {

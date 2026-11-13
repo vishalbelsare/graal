@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2021, 2021, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2021, 2026, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -25,34 +25,40 @@
 
 package com.oracle.svm.core.jdk.resources;
 
+import static com.oracle.svm.core.SubstrateOptions.ResourceProtocol;
+
 import java.io.ByteArrayInputStream;
 import java.io.FileNotFoundException;
 import java.io.IOException;
 import java.io.InputStream;
 import java.net.URL;
-import java.net.URLConnection;
+import java.text.SimpleDateFormat;
+import java.util.Date;
 import java.util.List;
+import java.util.Locale;
+import java.util.Map;
+import java.util.TimeZone;
 
+import com.oracle.svm.core.hub.registry.ClassRegistries;
 import com.oracle.svm.core.jdk.Resources;
 
-public class ResourceURLConnection extends URLConnection {
+import sun.net.www.MessageHeader;
+import sun.net.www.ParseUtil;
+import sun.net.www.URLConnection;
 
-    private final URL url;
-    private final int index;
+public final class ResourceURLConnection extends URLConnection {
+
+    private static final String CONTENT_LENGTH = "content-length";
+    private static final String CONTENT_TYPE = "content-type";
+    private static final String TEXT_PLAIN = "text/plain";
+    private static final String LAST_MODIFIED = "last-modified";
+
     private byte[] data;
+    private boolean isDirectory = false;
+    private boolean initializedHeaders = false;
 
     public ResourceURLConnection(URL url) {
-        this(url, 0);
-    }
-
-    public ResourceURLConnection(URL url, int index) {
         super(url);
-        this.url = url;
-        this.index = index;
-    }
-
-    private static String resolveName(String resourceName) {
-        return resourceName.startsWith("/") ? resourceName.substring(1) : resourceName;
     }
 
     @Override
@@ -62,26 +68,50 @@ public class ResourceURLConnection extends URLConnection {
         }
         connected = true;
 
-        String resourceName = resolveName(url.getPath());
-        ResourceStorageEntry entry = Resources.get(Resources.toCanonicalForm(resourceName));
-        if (entry != null) {
-            List<byte[]> bytes = entry.getData();
-            if (index < bytes.size()) {
-                this.data = bytes.get(index);
+        String urlHost = url.getHost();
+        String hostName = urlHost != null && !urlHost.isEmpty() ? ParseUtil.decode(urlHost) : null;
+        String urlPath = ParseUtil.decode(url.getPath());
+        if (urlPath.isEmpty()) {
+            throw new IllegalArgumentException("Empty URL path not allowed in " + ResourceProtocol.getValue() + " URL");
+        }
+        NativeImageResourceFileSystemUtil.RootedResourcePath resourcePath = NativeImageResourceFileSystemUtil.parseRootedResourcePath(urlPath, "URL", urlPath);
+        String resourceName = resourcePath.resourceName();
+
+        Object entry;
+        if (ClassRegistries.respectClassLoader()) {
+            if (hostName == null) {
+                throw new IllegalArgumentException("Host required in " + ResourceProtocol.getValue() + " URL");
+            }
+            String moduleName = url.getUserInfo();
+            Module resourceModule = moduleName != null ? ModuleLayer.boot().findModule(ParseUtil.decode(moduleName)).orElse(null) : null;
+            entry = Resources.getAtRuntime(hostName, resourceModule, resourceName, false);
+        } else {
+            Module module = hostName != null ? ModuleLayer.boot().findModule(hostName).orElse(null) : null;
+            entry = Resources.getAtRuntime(module, resourceName, false);
+        }
+        if (entry != null && entry != Resources.MISSING_METADATA_MARKER) {
+            ResourceStorageEntry resourceStorageEntry = (ResourceStorageEntry) entry;
+            byte[][] bytes = resourceStorageEntry.getData();
+            isDirectory = resourceStorageEntry.isDirectory();
+            int index = resourceStorageEntry.getDataIndexForRootId(resourcePath.rootId());
+            if (index >= 0) {
+                assert index < bytes.length;
+                this.data = bytes[index];
             } else {
-                // This will happen only in case that we are creating one URL with the second URL as
-                // a context.
-                this.data = bytes.get(0);
+                this.data = null;
             }
         } else {
+            // Preserve FileNotFoundException after a warned missing-metadata access.
             this.data = null;
         }
     }
 
     @Override
     public InputStream getInputStream() throws IOException {
-        // Operations that depend on being connected will implicitly perform the connection, if
-        // necessary.
+        /*
+         * Operations that depend on being connected will implicitly perform the connection, if
+         * necessary.
+         */
         connect();
         if (data == null) {
             throw new FileNotFoundException(url.toString());
@@ -91,10 +121,74 @@ public class ResourceURLConnection extends URLConnection {
 
     @Override
     public long getContentLengthLong() {
-        // Operations that depend on being connected will implicitly perform the connection, if
-        // necessary.
-        connect();
-        return data != null ? data.length : -1L;
+        initializeHeaders();
+        return super.getContentLengthLong();
     }
 
+    @Override
+    public long getLastModified() {
+        initializeHeaders();
+        return super.getLastModified();
+    }
+
+    @Override
+    public String getHeaderField(String name) {
+        initializeHeaders();
+        return super.getHeaderField(name);
+    }
+
+    @Override
+    public Map<String, List<String>> getHeaderFields() {
+        initializeHeaders();
+        return super.getHeaderFields();
+    }
+
+    @Override
+    public String getHeaderField(int n) {
+        initializeHeaders();
+        return super.getHeaderField(n);
+    }
+
+    @Override
+    public int getContentLength() {
+        initializeHeaders();
+        return super.getContentLength();
+    }
+
+    @Override
+    public String getHeaderFieldKey(int n) {
+        initializeHeaders();
+        return super.getHeaderFieldKey(n);
+    }
+
+    @Override
+    public MessageHeader getProperties() {
+        initializeHeaders();
+        return super.getProperties();
+    }
+
+    private void initializeHeaders() {
+        connect();
+        if (!initializedHeaders) {
+            if (!isDirectory) {
+                String contentType = guessContentTypeFromName(url.getPath());
+                if (contentType != null) {
+                    properties.add(CONTENT_TYPE, contentType);
+                }
+
+                if (data != null) {
+                    properties.add(CONTENT_LENGTH, String.valueOf(data.length));
+                }
+
+                long lastModified = Resources.getLastModifiedTime();
+                Date date = new Date(lastModified);
+                SimpleDateFormat fo = new SimpleDateFormat("EEE, dd MMM yyyy HH:mm:ss 'GMT'", Locale.US);
+                fo.setTimeZone(TimeZone.getTimeZone("GMT"));
+                properties.add(LAST_MODIFIED, fo.format(date));
+            } else {
+                properties.add(CONTENT_TYPE, TEXT_PLAIN);
+            }
+            initializedHeaders = true;
+        }
+    }
 }

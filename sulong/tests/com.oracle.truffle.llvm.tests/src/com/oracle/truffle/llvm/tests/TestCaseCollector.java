@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2021, Oracle and/or its affiliates.
+ * Copyright (c) 2021, 2026, Oracle and/or its affiliates.
  *
  * All rights reserved.
  *
@@ -105,10 +105,17 @@ public final class TestCaseCollector {
             // collect excludes
             ExcludeMap excludedTests = getExcludedTests(testSuiteClass);
             // walk test cases
-            List<Object[]> list = Files.walk(suitesPath).filter(predicate).map(Path::getParent).map(testPath -> {
-                String testCaseName = getTestCaseName(suitesPath, testPath);
+            Stream<Object[]> stream = Files.walk(suitesPath).filter(predicate).map(Path::getParent).map(testPath -> {
+                String testCaseName = getTestCaseName(suitesPath, testPath).replace("\\", "/");
                 return new Object[]{testPath, testCaseName, excludedTests.get(testCaseName)};
-            }).collect(Collectors.toList());
+            });
+            if (TestOptions.TEST_NAME_FILTER != null && !TestOptions.TEST_NAME_FILTER.isEmpty()) {
+                stream = stream.filter(arr -> {
+                    String testCaseName = (String) arr[1];
+                    return testCaseName.contains(TestOptions.TEST_NAME_FILTER);
+                });
+            }
+            List<Object[]> list = stream.collect(Collectors.toList());
             if (!list.isEmpty()) {
                 return list;
             }
@@ -192,7 +199,7 @@ public final class TestCaseCollector {
             // walk <ROOT><testSuiteClass>/os_arch/
             walkOsArch(visitors, osArchDirectory);
 
-            Path configExcludeDirectory = configDirectory.resolve(TestEngineConfig.getInstance().getName());
+            Path configExcludeDirectory = configDirectory.resolve(TestEngineConfig.getInstance().getConfigFolderName());
             Path configOsArchDirectory = configExcludeDirectory.resolve("os_arch");
             // walk <ROOT><testSuiteClass>/"runtimeConfig"/<LLVMRuntimeConfig>/, skip "os_arch"
             walkFileTreeIfExists(configExcludeDirectory, visitors.skippingVisitor(configOsArchDirectory));
@@ -262,7 +269,7 @@ public final class TestCaseCollector {
             @Override
             public FileVisitResult visitFile(Path path, BasicFileAttributes attrs) throws IOException {
                 if (path.toString().endsWith(".exclude")) {
-                    // add all entries in the exclude file the the map
+                    // add all entries in the exclude file the map
                     String excludeFile = Paths.get(TestOptions.CONFIG_ROOT).relativize(path).toString();
                     readAllLines(path).forEach(excludeTest -> {
                         String oldReason = excludeTestToFile.get(excludeTest);

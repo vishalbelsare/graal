@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2019, 2021, Oracle and/or its affiliates.
+ * Copyright (c) 2019, 2026, Oracle and/or its affiliates.
  *
  * All rights reserved.
  *
@@ -36,16 +36,21 @@ import java.util.concurrent.ConcurrentMap;
 
 import com.oracle.truffle.api.CallTarget;
 import com.oracle.truffle.api.CompilerDirectives.TruffleBoundary;
+import com.oracle.truffle.api.InternalResource.OS;
 import com.oracle.truffle.api.TruffleLanguage;
+import com.oracle.truffle.llvm.runtime.LLVMContext;
 import com.oracle.truffle.llvm.runtime.LLVMLanguage;
+import com.oracle.truffle.llvm.runtime.PlatformCapability;
 import com.oracle.truffle.llvm.runtime.datalayout.DataLayout;
-import com.oracle.truffle.llvm.runtime.nodes.intrinsics.multithreading.LLVMPThreadStart;
+import com.oracle.truffle.llvm.runtime.except.LLVMPolyglotException;
+import com.oracle.truffle.llvm.runtime.nodes.intrinsics.multithreading.LLVMThreadStart;
 import com.oracle.truffle.llvm.runtime.pointer.LLVMPointer;
 
 public final class LLVMPThreadContext {
 
     // associated context for creating threads
     private final TruffleLanguage.Env env;
+    private final LLVMLanguage language;
 
     // the long-key is the thread-id
     private final Object threadLock;
@@ -78,6 +83,7 @@ public final class LLVMPThreadContext {
 
     public LLVMPThreadContext(TruffleLanguage.Env env, LLVMLanguage language, DataLayout dataLayout) {
         this.env = env;
+        this.language = language;
 
         // pthread storages
         this.threadLock = new Object();
@@ -88,8 +94,8 @@ public final class LLVMPThreadContext {
         this.pThreadKeyStorage = new ConcurrentHashMap<>();
         this.pThreadDestructorStorage = new ConcurrentHashMap<>();
 
-        this.pthreadCallTarget = language.createCachedCallTarget(LLVMPThreadStart.LLVMPThreadFunctionRootNode.class,
-                        l -> LLVMPThreadStart.LLVMPThreadFunctionRootNode.create(l, l.getActiveConfiguration().createNodeFactory(l, dataLayout)));
+        this.pthreadCallTarget = language.createCachedCallTarget(LLVMThreadStart.LLVMPThreadFunctionRootNode.class,
+                        l -> LLVMThreadStart.LLVMPThreadFunctionRootNode.create(l, l.getActiveConfiguration().createNodeFactory(l, dataLayout)));
         this.isCreateThreadAllowed = true;
     }
 
@@ -149,6 +155,7 @@ public final class LLVMPThreadContext {
     }
 
     @TruffleBoundary
+    @SuppressWarnings("deprecation") // GR-41711: we still need Thread.getId() for JDK17 support
     public LLVMPointer getSpecific(int keyId) {
         final ConcurrentMap<Long, LLVMPointer> value = pThreadKeyStorage.get(keyId);
         if (value != null) {
@@ -159,6 +166,7 @@ public final class LLVMPThreadContext {
     }
 
     @TruffleBoundary
+    @SuppressWarnings("deprecation") // GR-41711: we still need Thread.getId() for JDK17 support
     public boolean setSpecific(int keyId, LLVMPointer value) {
         final ConcurrentMap<Long, LLVMPointer> specificStore = pThreadKeyStorage.get(keyId);
         if (specificStore != null) {
@@ -169,10 +177,15 @@ public final class LLVMPThreadContext {
     }
 
     @TruffleBoundary
+    @SuppressWarnings("deprecation") // GR-41711: we still need Thread.getId() for JDK17 support
     public LLVMPointer getAndRemoveSpecificUnlessNull(int keyId) {
+        return getAndRemoveSpecificUnlessNull(keyId, Thread.currentThread().getId());
+    }
+
+    @TruffleBoundary
+    public LLVMPointer getAndRemoveSpecificUnlessNull(int keyId, long threadId) {
         final ConcurrentMap<Long, LLVMPointer> value = pThreadKeyStorage.get(keyId);
         if (value != null) {
-            final long threadId = Thread.currentThread().getId();
             final LLVMPointer keyMapping = value.get(threadId);
             if (keyMapping != null && !keyMapping.isNull()) {
                 value.remove(threadId);
@@ -188,10 +201,16 @@ public final class LLVMPThreadContext {
     }
 
     @TruffleBoundary
+    @SuppressWarnings("deprecation") // GR-41711: we still need Thread.getId() for JDK17 support
     public Thread createThread(Runnable runnable) {
         synchronized (threadLock) {
             if (isCreateThreadAllowed) {
-                final Thread thread = env.createThread(runnable);
+                int initialRoundingMode = language.getCapability(PlatformCapability.class).getOS() == OS.DARWIN ? LLVMLanguage.DEFAULT_ROUNDING_MODE : language.getRoundingMode();
+                Runnable initializeFloatingPointEnvironment = () -> {
+                    language.setRoundingMode(initialRoundingMode);
+                    runnable.run();
+                };
+                final Thread thread = env.newTruffleThreadBuilder(initializeFloatingPointEnvironment).build();
                 threadStorage.put(thread.getId(), new WeakReference<>(thread));
                 return thread;
             } else {
@@ -231,5 +250,27 @@ public final class LLVMPThreadContext {
 
     public CallTarget getPthreadCallTarget() {
         return pthreadCallTarget;
+    }
+
+    @SuppressWarnings("deprecation") // GR-41711: we still need Thread.getId() for JDK17 support
+    public void callDestructors(LLVMContext context) {
+        callDestructors(context, Thread.currentThread().getId());
+    }
+
+    public void callDestructors(LLVMContext context, long threadId) {
+        for (int key = 1; key <= getNumberOfPthreadKeys(); key++) {
+            final LLVMPointer destructor = getDestructor(key);
+            if (destructor != null && !destructor.isNull()) {
+                final LLVMPointer keyMapping = getAndRemoveSpecificUnlessNull(key, threadId);
+                if (keyMapping != null) {
+                    if (context.isFinalized()) {
+                        throw new LLVMPolyglotException(null,
+                                        "Tried to call a pthread destructor, but the LLVMContext has already been finalized. Ensure that the context is still alive and that the thread was created using the Truffle API.");
+                    }
+                    assert !keyMapping.isNull();
+                    getPthreadCallTarget().call(destructor, keyMapping);
+                }
+            }
+        }
     }
 }

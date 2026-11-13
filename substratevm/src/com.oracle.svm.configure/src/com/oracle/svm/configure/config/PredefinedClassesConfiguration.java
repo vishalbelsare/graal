@@ -26,38 +26,83 @@
 package com.oracle.svm.configure.config;
 
 import java.io.IOException;
+import java.io.InputStream;
+import java.net.URI;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
+import java.util.EnumSet;
+import java.util.List;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
-import java.util.function.Predicate;
 
 import com.oracle.svm.configure.ConfigurationBase;
-import com.oracle.svm.configure.json.JsonWriter;
-import com.oracle.svm.core.configure.ConfigurationFile;
-import com.oracle.svm.core.hub.PredefinedClassesSupport;
+import com.oracle.svm.configure.ConfigurationFile;
+import com.oracle.svm.configure.ConfigurationParser;
+import com.oracle.svm.configure.ConfigurationParserOption;
+import com.oracle.svm.configure.PredefinedClassesConfigurationParser;
+import com.oracle.svm.configure.UnresolvedAccessCondition;
 
-public class PredefinedClassesConfiguration implements ConfigurationBase {
-    private final Path[] classDestinationDirs;
+import jdk.graal.compiler.phases.common.LazyValue;
+import jdk.graal.compiler.util.Digest;
+import jdk.graal.compiler.util.json.JsonWriter;
+
+public final class PredefinedClassesConfiguration extends ConfigurationBase<PredefinedClassesConfiguration, PredefinedClassesConfiguration.Predicate> {
+    private final List<LazyValue<Path>> classDestinationDirs;
     private final ConcurrentMap<String, ConfigurationPredefinedClass> classes = new ConcurrentHashMap<>();
-    private final Predicate<String> shouldExcludeClassWithHash;
+    private final java.util.function.Predicate<String> shouldExcludeClassWithHash;
 
-    public PredefinedClassesConfiguration(Path[] classDestinationDirs, Predicate<String> shouldExcludeClassWithHash) {
+    public PredefinedClassesConfiguration(List<LazyValue<Path>> classDestinationDirs, java.util.function.Predicate<String> shouldExcludeClassWithHash) {
         this.classDestinationDirs = classDestinationDirs;
         this.shouldExcludeClassWithHash = shouldExcludeClassWithHash;
     }
 
+    public PredefinedClassesConfiguration(PredefinedClassesConfiguration other) {
+        this.classDestinationDirs = other.classDestinationDirs;
+        classes.putAll(other.classes);
+        this.shouldExcludeClassWithHash = other.shouldExcludeClassWithHash;
+    }
+
+    @Override
+    public PredefinedClassesConfiguration copy() {
+        return new PredefinedClassesConfiguration(this);
+    }
+
+    @Override
+    protected void merge(PredefinedClassesConfiguration other) {
+        classes.putAll(other.classes);
+    }
+
+    @Override
+    protected void subtract(PredefinedClassesConfiguration other) {
+        classes.keySet().removeAll(other.classes.keySet());
+    }
+
+    @Override
+    protected void intersect(PredefinedClassesConfiguration other) {
+        classes.keySet().retainAll(other.classes.keySet());
+    }
+
+    @Override
+    protected void removeIf(Predicate predicate) {
+        classes.values().removeIf(predicate::testPredefinedClass);
+    }
+
+    @Override
+    public void mergeConditional(UnresolvedAccessCondition condition, PredefinedClassesConfiguration other) {
+        /* Not implemented with conditions yet */
+        classes.putAll(other.classes);
+    }
+
     public void add(String nameInfo, byte[] classData) {
-        ensureDestinationDirsExist();
-        String hash = PredefinedClassesSupport.hash(classData, 0, classData.length);
+        String hash = Digest.digest(classData);
         if (shouldExcludeClassWithHash != null && shouldExcludeClassWithHash.test(hash)) {
             return;
         }
         if (classDestinationDirs != null) {
-            for (Path dir : classDestinationDirs) {
+            for (LazyValue<Path> dir : classDestinationDirs) {
                 try {
-                    Files.write(dir.resolve(getFileName(hash)), classData);
+                    Files.write(dir.get().resolve(getFileName(hash)), classData);
                 } catch (IOException e) {
                     throw new RuntimeException(e);
                 }
@@ -67,19 +112,26 @@ public class PredefinedClassesConfiguration implements ConfigurationBase {
         classes.put(hash, clazz);
     }
 
-    public void add(String nameInfo, String hash, Path directory) {
+    public void add(String nameInfo, String hash, URI baseUri) {
         if (shouldExcludeClassWithHash != null && shouldExcludeClassWithHash.test(hash)) {
             return;
         }
         if (classDestinationDirs != null) {
-            ensureDestinationDirsExist();
-            for (Path destDir : classDestinationDirs) {
-                if (!destDir.equals(directory)) {
+            Path localBaseDir;
+            try {
+                localBaseDir = Path.of(baseUri);
+            } catch (Exception ignored) {
+                localBaseDir = null;
+            }
+            for (LazyValue<Path> destDir : classDestinationDirs) {
+                if (!destDir.get().equals(localBaseDir)) {
                     try {
                         String fileName = getFileName(hash);
-                        Path target = destDir.resolve(fileName);
-                        if (directory != null) {
-                            Files.copy(directory.resolve(fileName), target, StandardCopyOption.REPLACE_EXISTING);
+                        Path target = destDir.get().resolve(fileName);
+                        if (baseUri != null) {
+                            try (InputStream is = PredefinedClassesConfigurationParser.openClassdataStream(baseUri, hash)) {
+                                Files.copy(is, target, StandardCopyOption.REPLACE_EXISTING);
+                            }
                         } else if (!Files.exists(target)) {
                             throw new RuntimeException("Cannot copy class data file for predefined class " + nameInfo + " with hash " + hash + ": " +
                                             "source directory is unknown and file does not already exist in target directory.");
@@ -92,22 +144,6 @@ public class PredefinedClassesConfiguration implements ConfigurationBase {
         }
         ConfigurationPredefinedClass clazz = new ConfigurationPredefinedClass(nameInfo, hash);
         classes.put(hash, clazz);
-    }
-
-    private void ensureDestinationDirsExist() {
-        if (classDestinationDirs != null) {
-            for (Path dir : classDestinationDirs) {
-                if (!Files.isDirectory(dir)) {
-                    try {
-                        Files.createDirectory(dir);
-                    } catch (IOException e) {
-                        if (!Files.isDirectory(dir)) { // potential race
-                            throw new RuntimeException(e);
-                        }
-                    }
-                }
-            }
-        }
     }
 
     private static String getFileName(String hash) {
@@ -132,8 +168,21 @@ public class PredefinedClassesConfiguration implements ConfigurationBase {
     }
 
     @Override
+    public ConfigurationParser createParser(boolean combinedFileSchema, EnumSet<ConfigurationParserOption> parserOptions) {
+        if (combinedFileSchema) {
+            throw new IllegalArgumentException("Predefined classes configuration is only supported with the legacy metadata schema");
+        }
+        return new PredefinedClassesConfigurationParser(this::add, parserOptions);
+    }
+
+    @Override
     public boolean isEmpty() {
         return classes.isEmpty();
+    }
+
+    @Override
+    public boolean supportsCombinedFile() {
+        return false;
     }
 
     public boolean containsClassWithName(String className) {
@@ -142,5 +191,11 @@ public class PredefinedClassesConfiguration implements ConfigurationBase {
 
     public boolean containsClassWithHash(String hash) {
         return classes.containsKey(hash);
+    }
+
+    public interface Predicate {
+
+        boolean testPredefinedClass(ConfigurationPredefinedClass clazz);
+
     }
 }

@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2016, 2020, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2016, 2022, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * The Universal Permissive License (UPL), Version 1.0
@@ -157,7 +157,7 @@ public class SourceSectionListenerTest extends AbstractInstrumentationTest {
         assertEvents(impl.onlyExpressions, sourceSections3[2], sourceSections3[3], sourceSections3[4]);
     }
 
-    private SourceSection[] sections(String code, String... match) {
+    protected SourceSection[] sections(String code, String... match) {
         Source source = Source.newBuilder(InstrumentationTestLanguage.ID, code, "sourceSectionTest").buildLiteral();
 
         List<SourceSection> sections = new ArrayList<>();
@@ -186,7 +186,7 @@ public class SourceSectionListenerTest extends AbstractInstrumentationTest {
         return newArray;
     }
 
-    private static void assertEvents(List<LoadSourceSectionEvent> actualEvents, SourceSection... expectedSourceSections) {
+    protected static void assertEvents(List<LoadSourceSectionEvent> actualEvents, SourceSection... expectedSourceSections) {
         Assert.assertEquals(expectedSourceSections.length, actualEvents.size());
         for (int i = 0; i < expectedSourceSections.length; i++) {
             LoadSourceSectionEvent actualEvent = actualEvents.get(i);
@@ -346,7 +346,7 @@ public class SourceSectionListenerTest extends AbstractInstrumentationTest {
         mainThreadLatch2.await();
         /*
          * Wait for the third thread to stop on trying to acquire the AST lock. This should be
-         * fairly reliable because mainThreadLatch2 guarantees the the third thread is already
+         * fairly reliable because mainThreadLatch2 guarantees the third thread is already
          * running.
          */
         Thread.sleep(1000);
@@ -373,7 +373,7 @@ public class SourceSectionListenerTest extends AbstractInstrumentationTest {
         }
     };
 
-    private static class TestLoadSourceSectionExceptionClass extends RuntimeException {
+    private static final class TestLoadSourceSectionExceptionClass extends RuntimeException {
 
         private static final long serialVersionUID = 1L;
 

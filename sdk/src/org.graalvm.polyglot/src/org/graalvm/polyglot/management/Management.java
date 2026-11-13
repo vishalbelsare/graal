@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2019, 2021, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2019, 2024, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * The Universal Permissive License (UPL), Version 1.0
@@ -44,7 +44,8 @@ import java.lang.reflect.Method;
 
 import org.graalvm.polyglot.Engine;
 import org.graalvm.polyglot.impl.AbstractPolyglotImpl;
-import org.graalvm.polyglot.impl.AbstractPolyglotImpl.AbstractManagementDispatch;
+import org.graalvm.polyglot.impl.AbstractPolyglotImpl.AbstractExecutionEventDispatch;
+import org.graalvm.polyglot.impl.AbstractPolyglotImpl.AbstractExecutionListenerDispatch;
 import org.graalvm.polyglot.impl.AbstractPolyglotImpl.ManagementAccess;
 
 /*
@@ -52,53 +53,60 @@ import org.graalvm.polyglot.impl.AbstractPolyglotImpl.ManagementAccess;
  */
 final class Management {
 
+    static final ManagementAccessImpl ACCESS = new ManagementAccessImpl();
+
     private Management() {
     }
 
-    static final AbstractPolyglotImpl IMPL = initImpl();
+    /*
+     * ImplHolder is needed because at the time of initializing this Engine might not yet be fully
+     * initialized.
+     */
+    static class ImplHolder {
+        static final AbstractPolyglotImpl IMPL = initImpl();
 
-    private static AbstractPolyglotImpl initImpl() {
-        try {
-            Method method = Engine.class.getDeclaredMethod("getImpl");
-            method.setAccessible(true);
-            AbstractPolyglotImpl impl = (AbstractPolyglotImpl) method.invoke(null);
-            impl.setMonitoring(new ManagementAccessImpl());
-            return impl;
-        } catch (Exception e) {
-            throw new IllegalStateException("Failed to initialize execution listener class.", e);
+        private static AbstractPolyglotImpl initImpl() {
+            try {
+                Method method = Engine.class.getDeclaredMethod("getImpl");
+                method.setAccessible(true);
+                AbstractPolyglotImpl impl = (AbstractPolyglotImpl) method.invoke(null);
+                return impl;
+            } catch (Exception e) {
+                throw new IllegalStateException("Failed to initialize execution listener class.", e);
+            }
         }
     }
 
     private static final class ManagementAccessImpl extends ManagementAccess {
 
         @Override
-        public ExecutionListener newExecutionListener(AbstractManagementDispatch dispatch, Object receiver) {
-            return new ExecutionListener(dispatch, receiver);
+        public Object newExecutionListener(AbstractExecutionListenerDispatch dispatch, Object receiver, Engine engine) {
+            return new ExecutionListener(dispatch, receiver, engine);
         }
 
         @Override
-        public ExecutionEvent newExecutionEvent(AbstractManagementDispatch dispatch, Object event) {
+        public Object newExecutionEvent(AbstractExecutionEventDispatch dispatch, Object event) {
             return new ExecutionEvent(dispatch, event);
         }
 
         @Override
-        public Object getReceiver(ExecutionListener executionListener) {
-            return executionListener.receiver;
+        public Object getExecutionListenerReceiver(Object executionListener) {
+            return ((ExecutionListener) executionListener).receiver;
         }
 
         @Override
-        public AbstractManagementDispatch getDispatch(ExecutionListener executionListener) {
-            return executionListener.dispatch;
+        public AbstractExecutionListenerDispatch getExecutionListenerDispatch(Object executionListener) {
+            return ((ExecutionListener) executionListener).dispatch;
         }
 
         @Override
-        public Object getReceiver(ExecutionEvent executionEvent) {
-            return executionEvent.receiver;
+        public Object getExecutionEventReceiver(Object executionEvent) {
+            return ((ExecutionEvent) executionEvent).receiver;
         }
 
         @Override
-        public AbstractManagementDispatch getDispatch(ExecutionEvent executionEvent) {
-            return executionEvent.dispatch;
+        public AbstractExecutionEventDispatch getExecutionEventDispatch(Object executionEvent) {
+            return ((ExecutionEvent) executionEvent).dispatch;
         }
     }
 

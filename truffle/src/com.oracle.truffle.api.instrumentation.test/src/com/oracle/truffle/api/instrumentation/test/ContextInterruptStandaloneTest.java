@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2020, 2021, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2020, 2024, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * The Universal Permissive License (UPL), Version 1.0
@@ -39,6 +39,8 @@
  * SOFTWARE.
  */
 package com.oracle.truffle.api.instrumentation.test;
+
+import static org.junit.Assert.fail;
 
 import java.io.IOException;
 import java.time.Duration;
@@ -88,6 +90,10 @@ import com.oracle.truffle.api.test.polyglot.ProxyLanguage;
 public class ContextInterruptStandaloneTest extends AbstractPolyglotTest {
 
     @Rule public TestName testNameRule = new TestName();
+
+    public ContextInterruptStandaloneTest() {
+        ignoreCancelOnClose = true;
+    }
 
     @After
     public void checkInterrupted() {
@@ -141,7 +147,9 @@ public class ContextInterruptStandaloneTest extends AbstractPolyglotTest {
                     }
                 }
             });
-            beforeSleep.await();
+            if (!beforeSleep.await(10, TimeUnit.SECONDS)) {
+                fail("timeout");
+            }
             context.close(true);
             future.get();
         } finally {
@@ -240,6 +248,10 @@ public class ContextInterruptStandaloneTest extends AbstractPolyglotTest {
             beforeSleep.await();
             ctx.close(true);
             future.get();
+        } catch (PolyglotException pe) {
+            if (!pe.isCancelled()) {
+                throw pe;
+            }
         } finally {
             executorService.shutdownNow();
             executorService.awaitTermination(100, TimeUnit.SECONDS);
@@ -285,6 +297,10 @@ public class ContextInterruptStandaloneTest extends AbstractPolyglotTest {
             }
             for (Future<?> future : futures) {
                 future.get();
+            }
+        } catch (PolyglotException pe) {
+            if (!pe.isCancelled()) {
+                throw pe;
             }
         } finally {
             executorService.shutdownNow();
@@ -404,8 +420,9 @@ public class ContextInterruptStandaloneTest extends AbstractPolyglotTest {
             }
             Assert.fail();
         } catch (Exception e) {
-            Assert.assertTrue(e instanceof IllegalStateException);
-            Assert.assertEquals("Cannot interrupt context from a thread where its child context is active.", e.getMessage());
+            if (!(e instanceof IllegalStateException) || !"Cannot interrupt context from a thread where its child context is active.".equals(e.getMessage())) {
+                throw new AssertionError(e);
+            }
         } finally {
             ctx[0].close();
         }

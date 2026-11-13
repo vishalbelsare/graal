@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2021, 2021, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2021, 2026, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -24,24 +24,22 @@
  */
 package com.oracle.svm.core.jdk.localization.bundles;
 
-//Checkstyle: allow reflection
 import java.lang.reflect.Method;
 import java.util.HashMap;
 import java.util.Map;
 import java.util.ResourceBundle;
 
-import com.oracle.svm.core.util.VMError;
-import com.oracle.svm.util.ReflectionUtil;
+import com.oracle.svm.shared.util.ReflectionUtil;
 
 public class DelayedBundle implements StoredBundle {
 
     private final Method getContents;
 
-    public DelayedBundle(Class<?> clazz) {
+    public DelayedBundle(Class<?> clazz) throws ReflectiveOperationException {
         getContents = findGetContentsMethod(clazz);
     }
 
-    private static Method findGetContentsMethod(Class<?> clazz) {
+    public static Method findGetContentsMethod(Class<?> clazz) throws ReflectiveOperationException {
         /* The `getContents` method can be declared in a super class, so we search the hierarchy. */
         for (Class<?> c = clazz; ResourceBundle.class.isAssignableFrom(c); c = c.getSuperclass()) {
             Method method = ReflectionUtil.lookupMethod(true, c, "getContents");
@@ -49,7 +47,7 @@ public class DelayedBundle implements StoredBundle {
                 return method;
             }
         }
-        throw VMError.shouldNotReachHere("Failed to find method `getContents` in " + clazz);
+        throw new ReflectiveOperationException("Failed to find method `getContents` in " + clazz);
     }
 
     @Override

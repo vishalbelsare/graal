@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2017, 2021, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2017, 2026, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * The Universal Permissive License (UPL), Version 1.0
@@ -40,6 +40,7 @@
  */
 package org.graalvm.polyglot;
 
+import java.lang.ref.Reference;
 import java.math.BigDecimal;
 import java.math.BigInteger;
 import java.nio.ByteOrder;
@@ -48,6 +49,8 @@ import java.time.Instant;
 import java.time.LocalDate;
 import java.time.LocalDateTime;
 import java.time.LocalTime;
+import java.time.OffsetDateTime;
+import java.time.OffsetTime;
 import java.time.ZoneId;
 import java.time.ZonedDateTime;
 import java.time.zone.ZoneRules;
@@ -62,6 +65,7 @@ import java.util.function.Function;
 
 import org.graalvm.polyglot.HostAccess.TargetMappingPrecedence;
 import org.graalvm.polyglot.impl.AbstractPolyglotImpl.AbstractValueDispatch;
+import org.graalvm.polyglot.io.ByteSequence;
 import org.graalvm.polyglot.proxy.Proxy;
 
 /**
@@ -76,8 +80,9 @@ import org.graalvm.polyglot.proxy.Proxy;
  * languages might use a different name or use multiple values to represent <code>null</code> like
  * values.
  * <li>{@link #isNumber() Number}: This value represents a floating or fixed point number. The
- * number value may be accessed as {@link #asByte() byte}, {@link #asShort() short} {@link #asInt()
- * int} {@link #asLong() long}, {@link #asFloat() float} or {@link #asDouble() double} value.
+ * number value may be accessed as {@link #asByte() byte}, {@link #asShort() short}, {@link #asInt()
+ * int}, {@link #asLong() long}, {@link #asBigInteger()} BigInteger}, {@link #asFloat() float}, or
+ * {@link #asDouble() double} value.
  * <li>{@link #isBoolean() Boolean}. This value represents a boolean value. The boolean value can be
  * accessed using {@link #asBoolean()}.
  * <li>{@link #isString() String}: This value represents a string value. The string value can be
@@ -118,6 +123,8 @@ import org.graalvm.polyglot.proxy.Proxy;
  * {@link #isIterator() iterator} which can be used to {@link #getIteratorNextElement() iterate}
  * value elements. For example, Guest language arrays are iterable.
  * <li>{@link #hasHashEntries()} Hash Entries}: This value represents a map.
+ * <li>{@link #hasMetaParents()} Meta Parents}: This value represents Array Elements of Meta
+ * Objects.
  * </ul>
  * <p>
  * In addition to the language agnostic types, the language specific type can be accessed using
@@ -164,8 +171,8 @@ import org.graalvm.polyglot.proxy.Proxy;
  */
 public final class Value extends AbstractValue {
 
-    Value(AbstractValueDispatch dispatch, Object context, Object receiver) {
-        super(dispatch, context, receiver);
+    Value(AbstractValueDispatch dispatch, Object context, Object receiver, Context creatorContext) {
+        super(dispatch, context, receiver, creatorContext);
     }
 
     /**
@@ -186,7 +193,11 @@ public final class Value extends AbstractValue {
      * @since 19.0 revised in 20.1
      */
     public Value getMetaObject() {
-        return dispatch.getMetaObject(this.context, receiver);
+        try {
+            return (Value) dispatch.getMetaObject(this.context, receiver);
+        } finally {
+            Reference.reachabilityFence(creatorContext);
+        }
     }
 
     /**
@@ -213,7 +224,11 @@ public final class Value extends AbstractValue {
      * @since 20.1
      */
     public boolean isMetaObject() {
-        return dispatch.isMetaObject(this.context, receiver);
+        try {
+            return dispatch.isMetaObject(this.context, receiver);
+        } finally {
+            Reference.reachabilityFence(creatorContext);
+        }
     }
 
     /**
@@ -229,7 +244,11 @@ public final class Value extends AbstractValue {
      * @since 20.1
      */
     public String getMetaQualifiedName() {
-        return dispatch.getMetaQualifiedName(this.context, receiver);
+        try {
+            return dispatch.getMetaQualifiedName(this.context, receiver);
+        } finally {
+            Reference.reachabilityFence(creatorContext);
+        }
     }
 
     /**
@@ -243,7 +262,11 @@ public final class Value extends AbstractValue {
      * @since 20.1
      */
     public String getMetaSimpleName() {
-        return dispatch.getMetaSimpleName(this.context, receiver);
+        try {
+            return dispatch.getMetaSimpleName(this.context, receiver);
+        } finally {
+            Reference.reachabilityFence(creatorContext);
+        }
     }
 
     /**
@@ -262,7 +285,56 @@ public final class Value extends AbstractValue {
      * @since 20.1
      */
     public boolean isMetaInstance(Object instance) {
-        return dispatch.isMetaInstance(this.context, receiver, instance);
+        try {
+            return dispatch.isMetaInstance(this.context, receiver, instance);
+        } finally {
+            Reference.reachabilityFence(creatorContext);
+        }
+    }
+
+    /**
+     * Returns <code>true</code> if the value represents a metaobject and the metaobject has meta
+     * parents. Returns <code>false</code> by default.
+     * <p>
+     * <b>Sample interpretations:</b> In Java an instance of the type {@link Class} is a metaobject.
+     * Further, the superclass and the implemented interfaces types of that type constitute the meta
+     * parents. In JavaScript any function instance is a metaobject. For example, the metaobject of
+     * a JavaScript class is the associated constructor function.
+     * <p>
+     * This method does not cause any observable side-effects. If this method is implemented then
+     * also {@link #getMetaParents()} must be implemented as well.
+     *
+     * @throws IllegalStateException if the context is already closed.
+     * @throws PolyglotException if a guest language error occurred during execution.
+     * @see #getMetaParents()
+     * @since 22.2
+     */
+    public boolean hasMetaParents() {
+        try {
+            return dispatch.hasMetaParents(this.context, receiver);
+        } finally {
+            Reference.reachabilityFence(creatorContext);
+        }
+    }
+
+    /**
+     * Returns the meta parents of a meta object as an array object {@link #hasArrayElements()}.
+     * This method does not cause any observable side-effects. If this method is implemented then
+     * also {@link #hasMetaParents()} must be implemented as well.
+     *
+     * @throws IllegalStateException if the context is already closed.
+     * @throws UnsupportedOperationException if the value does not have any
+     *             {@link #hasMetaParents()} meta parents.
+     * @throws PolyglotException if a guest language error occurred during execution.
+     * @see #hasMetaParents()
+     * @since 22.2
+     */
+    public Value getMetaParents() {
+        try {
+            return (Value) dispatch.getMetaParents(this.context, receiver);
+        } finally {
+            Reference.reachabilityFence(creatorContext);
+        }
     }
 
     /**
@@ -276,7 +348,11 @@ public final class Value extends AbstractValue {
      * @since 19.0
      */
     public boolean hasArrayElements() {
-        return dispatch.hasArrayElements(this.context, receiver);
+        try {
+            return dispatch.hasArrayElements(this.context, receiver);
+        } finally {
+            Reference.reachabilityFence(creatorContext);
+        }
     }
 
     /**
@@ -292,7 +368,11 @@ public final class Value extends AbstractValue {
      * @since 19.0
      */
     public Value getArrayElement(long index) {
-        return dispatch.getArrayElement(this.context, receiver, index);
+        try {
+            return (Value) dispatch.getArrayElement(this.context, receiver, index);
+        } finally {
+            Reference.reachabilityFence(creatorContext);
+        }
     }
 
     /**
@@ -310,7 +390,11 @@ public final class Value extends AbstractValue {
      * @since 19.0
      */
     public void setArrayElement(long index, Object value) {
-        dispatch.setArrayElement(this.context, receiver, index, value);
+        try {
+            dispatch.setArrayElement(this.context, receiver, index, value);
+        } finally {
+            Reference.reachabilityFence(creatorContext);
+        }
     }
 
     /**
@@ -326,7 +410,11 @@ public final class Value extends AbstractValue {
      * @since 19.0
      */
     public boolean removeArrayElement(long index) {
-        return dispatch.removeArrayElement(this.context, receiver, index);
+        try {
+            return dispatch.removeArrayElement(this.context, receiver, index);
+        } finally {
+            Reference.reachabilityFence(creatorContext);
+        }
     }
 
     /**
@@ -339,7 +427,11 @@ public final class Value extends AbstractValue {
      * @since 19.0
      */
     public long getArraySize() {
-        return dispatch.getArraySize(this.context, receiver);
+        try {
+            return dispatch.getArraySize(this.context, receiver);
+        } finally {
+            Reference.reachabilityFence(creatorContext);
+        }
     }
 
     // region Buffer Methods
@@ -366,7 +458,11 @@ public final class Value extends AbstractValue {
      * @since 21.1
      */
     public boolean hasBufferElements() {
-        return dispatch.hasBufferElements(this.context, receiver);
+        try {
+            return dispatch.hasBufferElements(this.context, receiver);
+        } finally {
+            Reference.reachabilityFence(creatorContext);
+        }
     }
 
     /**
@@ -385,7 +481,11 @@ public final class Value extends AbstractValue {
      * @since 21.1
      */
     public boolean isBufferWritable() throws UnsupportedOperationException {
-        return dispatch.isBufferWritable(this.context, receiver);
+        try {
+            return dispatch.isBufferWritable(this.context, receiver);
+        } finally {
+            Reference.reachabilityFence(creatorContext);
+        }
     }
 
     /**
@@ -398,7 +498,11 @@ public final class Value extends AbstractValue {
      * @since 21.1
      */
     public long getBufferSize() throws UnsupportedOperationException {
-        return dispatch.getBufferSize(this.context, receiver);
+        try {
+            return dispatch.getBufferSize(this.context, receiver);
+        } finally {
+            Reference.reachabilityFence(creatorContext);
+        }
     }
 
     /**
@@ -413,7 +517,7 @@ public final class Value extends AbstractValue {
      *            be read.
      * @return the byte at the given byte offset from the start of the buffer.
      * @throws IndexOutOfBoundsException if and only if
-     *             <code>byteOffset < 0 || byteOffset >= </code>{@link #getBufferSize()}.
+     *             <code>byteOffset &lt; 0 || byteOffset &gt;= </code>{@link #getBufferSize()}.
      * @throws UnsupportedOperationException if the value does not have {@link #hasBufferElements
      *             buffer elements}.
      * @throws IllegalStateException if the context is already closed.
@@ -421,7 +525,61 @@ public final class Value extends AbstractValue {
      * @since 21.1
      */
     public byte readBufferByte(long byteOffset) throws UnsupportedOperationException, IndexOutOfBoundsException {
-        return dispatch.readBufferByte(this.context, receiver, byteOffset);
+        try {
+            return dispatch.readBufferByte(this.context, receiver, byteOffset);
+        } finally {
+            Reference.reachabilityFence(creatorContext);
+        }
+    }
+
+    /**
+     * Reads bytes from the receiver object into the specified byte array.
+     * <p>
+     * The access is <em>not</em> guaranteed to be atomic. Therefore, this message is <em>not</em>
+     * thread-safe.
+     * <p>
+     * Invoking this message does not cause any observable side-effects.
+     * <p>
+     * <b>Example</b> reading into an output stream using a 4k auxiliary byte array:
+     *
+     * <pre>
+     * Value val = ...
+     * assert val.hasBufferElements();
+     * try (OutputStream out = ...) {
+     *     byte[] aux = new byte[4096];
+     *     long bufferSize = val.getBufferSize();
+     *     for (long offset = 0; offset &lt; bufferSize; offset += aux.length) {
+     *         int bytesToRead = (int) Math.min(bufferSize - offset, aux.length);
+     *         val.readBuffer(offset, aux, 0, bytesToRead);
+     *         out.write(aux, 0, bytesToRead);
+     *     }
+     * }
+     * </pre>
+     *
+     * In case the goal is to read the whole contents into a single byte array, the easiest way is
+     * to do that through {@link ByteSequence}:
+     *
+     * <pre>
+     * byte[] byteArray = val.as(ByteSequence.class).toByteArray();
+     * </pre>
+     *
+     * @param byteOffset offset in the buffer to start reading from.
+     * @param destination byte array to write the read bytes into.
+     * @param destinationOffset offset in the destination array to start writing from.
+     * @param length number of bytes to read.
+     * @throws IndexOutOfBoundsException if and only if
+     *             <code>byteOffset &lt; 0 || length &lt; 0 || byteOffset + length &gt; </code>{@link #getBufferSize()}<code> || destinationOffset &lt; 0 || destinationOffset + length &gt; destination.length</code>
+     * @throws UnsupportedOperationException if the value does not have {@link #hasBufferElements
+     *             buffer elements}.
+     * @throws IllegalStateException if the context is already closed.
+     * @throws PolyglotException if a guest language error occurred during execution.
+     * @since 24.0
+     */
+    public void readBuffer(long byteOffset, byte[] destination, int destinationOffset, int length) throws UnsupportedOperationException, IndexOutOfBoundsException {
+        Objects.requireNonNull(destination, "destination");
+        Objects.checkFromIndexSize(destinationOffset, length, destination.length);
+        dispatch.readBuffer(this.context, receiver, byteOffset, destination, destinationOffset, length);
+        Reference.reachabilityFence(creatorContext);
     }
 
     /**
@@ -434,7 +592,7 @@ public final class Value extends AbstractValue {
      *            be written.
      * @param value the byte value to be written.
      * @throws IndexOutOfBoundsException if and only if
-     *             <code>byteOffset < 0 || byteOffset >= </code>{@link #getBufferSize()}.
+     *             <code>byteOffset &lt; 0 || byteOffset &gt;= </code>{@link #getBufferSize()}.
      * @throws UnsupportedOperationException if the value does not have {@link #hasBufferElements
      *             buffer elements} or is not {@link #isBufferWritable() modifiable}.
      * @throws IllegalStateException if the context is already closed.
@@ -443,6 +601,7 @@ public final class Value extends AbstractValue {
      */
     public void writeBufferByte(long byteOffset, byte value) throws UnsupportedOperationException, IndexOutOfBoundsException {
         dispatch.writeBufferByte(this.context, receiver, byteOffset, value);
+        Reference.reachabilityFence(creatorContext);
     }
 
     /**
@@ -461,7 +620,7 @@ public final class Value extends AbstractValue {
      *            will be read.
      * @return the short at the given byte offset from the start of the buffer.
      * @throws IndexOutOfBoundsException if and only if
-     *             <code>byteOffset < 0 || byteOffset >= {@link #getBufferSize()} - 1</code>.
+     *             <code>byteOffset &lt; 0 || byteOffset &gt;= {@link #getBufferSize()} - 1</code>.
      * @throws UnsupportedOperationException if the value does not have {@link #hasBufferElements
      *             buffer elements}.
      * @throws IllegalStateException if the context is already closed.
@@ -469,7 +628,11 @@ public final class Value extends AbstractValue {
      * @since 21.1
      */
     public short readBufferShort(ByteOrder order, long byteOffset) throws UnsupportedOperationException, IndexOutOfBoundsException {
-        return dispatch.readBufferShort(this.context, receiver, order, byteOffset);
+        try {
+            return dispatch.readBufferShort(this.context, receiver, order, byteOffset);
+        } finally {
+            Reference.reachabilityFence(creatorContext);
+        }
     }
 
     /**
@@ -486,7 +649,7 @@ public final class Value extends AbstractValue {
      *            will be written.
      * @param value the short value to be written.
      * @throws IndexOutOfBoundsException if and only if
-     *             <code>byteOffset < 0 || byteOffset >= {@link #getBufferSize()} - 1</code>.
+     *             <code>byteOffset &lt; 0 || byteOffset &gt;= {@link #getBufferSize()} - 1</code>.
      * @throws UnsupportedOperationException if the value does not have {@link #hasBufferElements
      *             buffer elements} or is not {@link #isBufferWritable() modifiable}.
      * @throws IllegalStateException if the context is already closed.
@@ -495,6 +658,7 @@ public final class Value extends AbstractValue {
      */
     public void writeBufferShort(ByteOrder order, long byteOffset, short value) throws UnsupportedOperationException, IndexOutOfBoundsException {
         dispatch.writeBufferShort(this.context, receiver, order, byteOffset, value);
+        Reference.reachabilityFence(creatorContext);
     }
 
     /**
@@ -512,7 +676,7 @@ public final class Value extends AbstractValue {
      *            be read.
      * @return the int at the given byte offset from the start of the buffer.
      * @throws IndexOutOfBoundsException if and only if
-     *             <code>byteOffset < 0 || byteOffset >= {@link #getBufferSize()} - 3</code>.
+     *             <code>byteOffset &lt; 0 || byteOffset &gt;= {@link #getBufferSize()} - 3</code>.
      * @throws UnsupportedOperationException if the value does not have {@link #hasBufferElements
      *             buffer elements}.
      * @throws IllegalStateException if the context is already closed.
@@ -520,7 +684,11 @@ public final class Value extends AbstractValue {
      * @since 21.1
      */
     public int readBufferInt(ByteOrder order, long byteOffset) throws UnsupportedOperationException, IndexOutOfBoundsException {
-        return dispatch.readBufferInt(this.context, receiver, order, byteOffset);
+        try {
+            return dispatch.readBufferInt(this.context, receiver, order, byteOffset);
+        } finally {
+            Reference.reachabilityFence(creatorContext);
+        }
     }
 
     /**
@@ -537,7 +705,7 @@ public final class Value extends AbstractValue {
      *            be written.
      * @param value the int value to be written.
      * @throws IndexOutOfBoundsException if and only if
-     *             <code>byteOffset < 0 || byteOffset >= {@link #getBufferSize()} - 3</code>.
+     *             <code>byteOffset &lt; 0 || byteOffset &gt;= {@link #getBufferSize()} - 3</code>.
      * @throws UnsupportedOperationException if the value does not have {@link #hasBufferElements
      *             buffer elements} or is not {@link #isBufferWritable() modifiable}.
      * @throws IllegalStateException if the context is already closed.
@@ -546,6 +714,7 @@ public final class Value extends AbstractValue {
      */
     public void writeBufferInt(ByteOrder order, long byteOffset, int value) throws UnsupportedOperationException, IndexOutOfBoundsException {
         dispatch.writeBufferInt(this.context, receiver, order, byteOffset, value);
+        Reference.reachabilityFence(creatorContext);
     }
 
     /**
@@ -563,7 +732,7 @@ public final class Value extends AbstractValue {
      *            be read.
      * @return the int at the given byte offset from the start of the buffer.
      * @throws IndexOutOfBoundsException if and only if
-     *             <code>byteOffset < 0 || byteOffset >= {@link #getBufferSize()} - 7</code>.
+     *             <code>byteOffset &lt; 0 || byteOffset &gt;= {@link #getBufferSize()} - 7</code>.
      * @throws UnsupportedOperationException if the value does not have {@link #hasBufferElements
      *             buffer elements}.
      * @throws IllegalStateException if the context is already closed.
@@ -571,7 +740,11 @@ public final class Value extends AbstractValue {
      * @since 21.1
      */
     public long readBufferLong(ByteOrder order, long byteOffset) throws UnsupportedOperationException, IndexOutOfBoundsException {
-        return dispatch.readBufferLong(this.context, receiver, order, byteOffset);
+        try {
+            return dispatch.readBufferLong(this.context, receiver, order, byteOffset);
+        } finally {
+            Reference.reachabilityFence(creatorContext);
+        }
     }
 
     /**
@@ -588,7 +761,7 @@ public final class Value extends AbstractValue {
      *            be written.
      * @param value the int value to be written.
      * @throws IndexOutOfBoundsException if and only if
-     *             <code>byteOffset < 0 || byteOffset >= {@link #getBufferSize()} - 7</code>.
+     *             <code>byteOffset &lt; 0 || byteOffset &gt;= {@link #getBufferSize()} - 7</code>.
      * @throws UnsupportedOperationException if the value does not have {@link #hasBufferElements
      *             buffer elements} or is not {@link #isBufferWritable() modifiable}.
      * @throws IllegalStateException if the context is already closed.
@@ -597,6 +770,7 @@ public final class Value extends AbstractValue {
      */
     public void writeBufferLong(ByteOrder order, long byteOffset, long value) throws UnsupportedOperationException, IndexOutOfBoundsException {
         dispatch.writeBufferLong(this.context, receiver, order, byteOffset, value);
+        Reference.reachabilityFence(creatorContext);
     }
 
     /**
@@ -615,7 +789,7 @@ public final class Value extends AbstractValue {
      *            will be read.
      * @return the float at the given byte offset from the start of the buffer.
      * @throws IndexOutOfBoundsException if and only if
-     *             <code>byteOffset < 0 || byteOffset >= {@link #getBufferSize()} - 3</code>.
+     *             <code>byteOffset &lt; 0 || byteOffset &gt;= {@link #getBufferSize()} - 3</code>.
      * @throws UnsupportedOperationException if the value does not have {@link #hasBufferElements
      *             buffer elements}.
      * @throws IllegalStateException if the context is already closed.
@@ -623,7 +797,11 @@ public final class Value extends AbstractValue {
      * @since 21.1
      */
     public float readBufferFloat(ByteOrder order, long byteOffset) throws UnsupportedOperationException, IndexOutOfBoundsException {
-        return dispatch.readBufferFloat(this.context, receiver, order, byteOffset);
+        try {
+            return dispatch.readBufferFloat(this.context, receiver, order, byteOffset);
+        } finally {
+            Reference.reachabilityFence(creatorContext);
+        }
     }
 
     /**
@@ -640,7 +818,7 @@ public final class Value extends AbstractValue {
      *            will be written.
      * @param value the float value to be written.
      * @throws IndexOutOfBoundsException if and only if
-     *             <code>byteOffset < 0 || byteOffset >= {@link #getBufferSize()} - 3</code>.
+     *             <code>byteOffset &lt; 0 || byteOffset &gt;= {@link #getBufferSize()} - 3</code>.
      * @throws UnsupportedOperationException if the value does not have {@link #hasBufferElements
      *             buffer elements} or is not {@link #isBufferWritable() modifiable}.
      * @throws IllegalStateException if the context is already closed.
@@ -649,6 +827,7 @@ public final class Value extends AbstractValue {
      */
     public void writeBufferFloat(ByteOrder order, long byteOffset, float value) throws UnsupportedOperationException, IndexOutOfBoundsException {
         dispatch.writeBufferFloat(this.context, receiver, order, byteOffset, value);
+        Reference.reachabilityFence(creatorContext);
     }
 
     /**
@@ -667,7 +846,7 @@ public final class Value extends AbstractValue {
      *            will be read.
      * @return the double at the given byte offset from the start of the buffer.
      * @throws IndexOutOfBoundsException if and only if
-     *             <code>byteOffset < 0 || byteOffset >= {@link #getBufferSize()} - 7</code>.
+     *             <code>byteOffset &lt; 0 || byteOffset &gt;= {@link #getBufferSize()} - 7</code>.
      * @throws UnsupportedOperationException if the value does not have {@link #hasBufferElements
      *             buffer elements}.
      * @throws IllegalStateException if the context is already closed.
@@ -675,7 +854,11 @@ public final class Value extends AbstractValue {
      * @since 21.1
      */
     public double readBufferDouble(ByteOrder order, long byteOffset) throws UnsupportedOperationException, IndexOutOfBoundsException {
-        return dispatch.readBufferDouble(this.context, receiver, order, byteOffset);
+        try {
+            return dispatch.readBufferDouble(this.context, receiver, order, byteOffset);
+        } finally {
+            Reference.reachabilityFence(creatorContext);
+        }
     }
 
     /**
@@ -692,7 +875,7 @@ public final class Value extends AbstractValue {
      *            will be written.
      * @param value the double value to be written.
      * @throws IndexOutOfBoundsException if and only if
-     *             <code>byteOffset < 0 || byteOffset >= {@link #getBufferSize()} - 7</code>.
+     *             <code>byteOffset &lt; 0 || byteOffset &gt;= {@link #getBufferSize()} - 7</code>.
      * @throws UnsupportedOperationException if the value does not have {@link #hasBufferElements
      *             buffer elements} or is not {@link #isBufferWritable() modifiable}.
      * @throws IllegalStateException if the context is already closed.
@@ -701,6 +884,7 @@ public final class Value extends AbstractValue {
      */
     public void writeBufferDouble(ByteOrder order, long byteOffset, double value) throws UnsupportedOperationException, IndexOutOfBoundsException {
         dispatch.writeBufferDouble(this.context, receiver, order, byteOffset, value);
+        Reference.reachabilityFence(creatorContext);
     }
 
     // endregion
@@ -722,7 +906,11 @@ public final class Value extends AbstractValue {
      * @since 19.0
      */
     public boolean hasMembers() {
-        return dispatch.hasMembers(this.context, receiver);
+        try {
+            return dispatch.hasMembers(this.context, receiver);
+        } finally {
+            Reference.reachabilityFence(creatorContext);
+        }
     }
 
     /**
@@ -736,7 +924,11 @@ public final class Value extends AbstractValue {
      */
     public boolean hasMember(String identifier) {
         Objects.requireNonNull(identifier, "identifier");
-        return dispatch.hasMember(this.context, receiver, identifier);
+        try {
+            return dispatch.hasMember(this.context, receiver, identifier);
+        } finally {
+            Reference.reachabilityFence(creatorContext);
+        }
     }
 
     /**
@@ -751,7 +943,11 @@ public final class Value extends AbstractValue {
      */
     public Value getMember(String identifier) {
         Objects.requireNonNull(identifier, "identifier");
-        return dispatch.getMember(this.context, receiver, identifier);
+        try {
+            return (Value) dispatch.getMember(this.context, receiver, identifier);
+        } finally {
+            Reference.reachabilityFence(creatorContext);
+        }
     }
 
     /**
@@ -768,7 +964,11 @@ public final class Value extends AbstractValue {
      * @since 19.0
      */
     public Set<String> getMemberKeys() {
-        return dispatch.getMemberKeys(this.context, receiver);
+        try {
+            return dispatch.getMemberKeys(this.context, receiver);
+        } finally {
+            Reference.reachabilityFence(creatorContext);
+        }
     }
 
     /**
@@ -787,6 +987,7 @@ public final class Value extends AbstractValue {
     public void putMember(String identifier, Object value) {
         Objects.requireNonNull(identifier, "identifier");
         dispatch.putMember(this.context, receiver, identifier, value);
+        Reference.reachabilityFence(creatorContext);
     }
 
     /**
@@ -802,7 +1003,60 @@ public final class Value extends AbstractValue {
      */
     public boolean removeMember(String identifier) {
         Objects.requireNonNull(identifier, "identifier");
-        return dispatch.removeMember(this.context, receiver, identifier);
+        try {
+            return dispatch.removeMember(this.context, receiver, identifier);
+        } finally {
+            Reference.reachabilityFence(creatorContext);
+        }
+    }
+
+    /**
+     * Returns {@code true} if this value is a {@linkplain #isMetaObject() meta object} that
+     * provides a {@linkplain #getStaticScope() static scope}. A static scope represents the static
+     * or class level members associated with the type described by this meta object, such as static
+     * fields or methods.
+     *
+     * @throws IllegalStateException if the context is already {@linkplain Context#close() closed}
+     * @throws PolyglotException if a guest language error occurs during execution
+     * @see #isMetaObject()
+     * @see #getStaticScope()
+     * @since 25.1
+     */
+    public boolean hasStaticScope() {
+        return dispatch.hasStaticScope(this.context, receiver);
+    }
+
+    /**
+     * Returns the static scope associated with this value. This value must be a
+     * {@linkplain #isMetaObject() meta-object}. A static scope is an object that exposes static
+     * members, members whose values or behavior are independent of any particular instance.
+     * <p>
+     * The returned static scope can be used to access static members using
+     * {@link #getMember(String)}, {@link #getMemberKeys()}, or
+     * {@link #invokeMember(String, Object...)}.
+     * <p>
+     * The returned static scope is always expected to provide {@link #hasMembers() members},
+     * representing the static context.
+     * <p>
+     * <b>Examples:</b>
+     * </p>
+     * <ul>
+     * <li>In Java, the static scope exposes static fields and methods of a class.</li>
+     * <li>In Python, the static scope exposes class-level attributes and methods, effectively
+     * corresponding to the members provided by the Python metaobject.</li>
+     * </ul>
+     *
+     * @throws UnsupportedOperationException if and only if this value does not
+     *             {@linkplain #hasStaticScope() have a static scope}
+     * @throws IllegalStateException if the context is already {@linkplain Context#close() closed}
+     * @throws PolyglotException if a guest language error occurs during execution
+     * @see #hasStaticScope()
+     * @see #isMetaObject()
+     * @see #hasMembers()
+     * @since 25.1
+     */
+    public Value getStaticScope() {
+        return (Value) dispatch.getStaticScope(this.context, receiver);
     }
 
     // executable
@@ -815,7 +1069,11 @@ public final class Value extends AbstractValue {
      * @since 19.0
      */
     public boolean canExecute() {
-        return dispatch.canExecute(this.context, receiver);
+        try {
+            return dispatch.canExecute(this.context, receiver);
+        } finally {
+            Reference.reachabilityFence(creatorContext);
+        }
     }
 
     /**
@@ -834,11 +1092,15 @@ public final class Value extends AbstractValue {
      * @since 19.0
      */
     public Value execute(Object... arguments) {
-        if (arguments.length == 0) {
-            // specialized entry point for zero argument execute calls
-            return dispatch.execute(this.context, receiver);
-        } else {
-            return dispatch.execute(this.context, receiver, arguments);
+        try {
+            if (arguments.length == 0) {
+                // specialized entry point for zero argument execute calls
+                return (Value) dispatch.execute(this.context, receiver);
+            } else {
+                return (Value) dispatch.execute(this.context, receiver, arguments);
+            }
+        } finally {
+            Reference.reachabilityFence(creatorContext);
         }
     }
 
@@ -862,6 +1124,7 @@ public final class Value extends AbstractValue {
         } else {
             dispatch.executeVoid(this.context, receiver, arguments);
         }
+        Reference.reachabilityFence(creatorContext);
     }
 
     /**
@@ -873,7 +1136,11 @@ public final class Value extends AbstractValue {
      * @since 19.0
      */
     public boolean canInstantiate() {
-        return dispatch.canInstantiate(this.context, receiver);
+        try {
+            return dispatch.canInstantiate(this.context, receiver);
+        } finally {
+            Reference.reachabilityFence(creatorContext);
+        }
     }
 
     /**
@@ -890,7 +1157,11 @@ public final class Value extends AbstractValue {
      */
     public Value newInstance(Object... arguments) {
         Objects.requireNonNull(arguments, "arguments");
-        return dispatch.newInstance(this.context, receiver, arguments);
+        try {
+            return (Value) dispatch.newInstance(this.context, receiver, arguments);
+        } finally {
+            Reference.reachabilityFence(creatorContext);
+        }
     }
 
     /**
@@ -907,7 +1178,11 @@ public final class Value extends AbstractValue {
      */
     public boolean canInvokeMember(String identifier) {
         Objects.requireNonNull(identifier, "identifier");
-        return dispatch.canInvoke(this.context, identifier, receiver);
+        try {
+            return dispatch.canInvoke(this.context, identifier, receiver);
+        } finally {
+            Reference.reachabilityFence(creatorContext);
+        }
     }
 
     /**
@@ -927,11 +1202,15 @@ public final class Value extends AbstractValue {
      */
     public Value invokeMember(String identifier, Object... arguments) {
         Objects.requireNonNull(identifier, "identifier");
-        if (arguments.length == 0) {
-            // specialized entry point for zero argument invoke calls
-            return dispatch.invoke(this.context, receiver, identifier);
-        } else {
-            return dispatch.invoke(this.context, receiver, identifier, arguments);
+        try {
+            if (arguments.length == 0) {
+                // specialized entry point for zero argument invoke calls
+                return (Value) dispatch.invoke(this.context, receiver, identifier);
+            } else {
+                return (Value) dispatch.invoke(this.context, receiver, identifier, arguments);
+            }
+        } finally {
+            Reference.reachabilityFence(creatorContext);
         }
     }
 
@@ -943,7 +1222,11 @@ public final class Value extends AbstractValue {
      * @since 19.0
      */
     public boolean isString() {
-        return dispatch.isString(this.context, receiver);
+        try {
+            return dispatch.isString(this.context, receiver);
+        } finally {
+            Reference.reachabilityFence(creatorContext);
+        }
     }
 
     /**
@@ -956,7 +1239,39 @@ public final class Value extends AbstractValue {
      * @since 19.0
      */
     public String asString() {
-        return dispatch.asString(this.context, receiver);
+        try {
+            return dispatch.asString(this.context, receiver);
+        } finally {
+            Reference.reachabilityFence(creatorContext);
+        }
+    }
+
+    /**
+     * Returns the bytes of a given string value without converting it to a Java {@link String}.
+     * <p>
+     * This method retrieves the raw bytes of the string in the specified {@link StringEncoding},
+     * avoiding intermediate conversions to a Java {@code String}. This is particularly useful for
+     * performance-sensitive scenarios where the overhead of creating a Java {@code String} is
+     * undesirable.
+     * <p>
+     * If the string is not already encoded in the specified encoding, it will be re-encoded before
+     * the bytes are returned. Note that re-encoding may involve additional computational overhead
+     * depending on the size of the string and the differences between its current encoding and the
+     * target encoding.
+     *
+     * <b>Usage Note:</b> The returned byte array represents the raw data of the string in the
+     * requested encoding. Modifications to the array will not affect the underlying string value.
+     *
+     * @param encoding the desired encoding for the string. Must not be <code>null</code>. Supported
+     *            encodings are defined in {@link StringEncoding}.
+     * @return a byte array containing the string's raw bytes in the specified encoding
+     * @throws NullPointerException if {@code encoding} is <code>null</code>
+     * @throws IllegalStateException if the string value is no longer valid (e.g., the associated
+     *             context has been closed)
+     * @since 24.2
+     */
+    public byte[] asStringBytes(StringEncoding encoding) {
+        return dispatch.asStringBytes(this.context, receiver, encoding.value);
     }
 
     /**
@@ -969,7 +1284,11 @@ public final class Value extends AbstractValue {
      * @since 19.0
      */
     public boolean fitsInInt() {
-        return dispatch.fitsInInt(this.context, receiver);
+        try {
+            return dispatch.fitsInInt(this.context, receiver);
+        } finally {
+            Reference.reachabilityFence(creatorContext);
+        }
     }
 
     /**
@@ -983,7 +1302,11 @@ public final class Value extends AbstractValue {
      * @since 19.0
      */
     public int asInt() {
-        return dispatch.asInt(this.context, receiver);
+        try {
+            return dispatch.asInt(this.context, receiver);
+        } finally {
+            Reference.reachabilityFence(creatorContext);
+        }
     }
 
     /**
@@ -995,7 +1318,11 @@ public final class Value extends AbstractValue {
      * @since 19.0
      */
     public boolean isBoolean() {
-        return dispatch.isBoolean(this.context, receiver);
+        try {
+            return dispatch.isBoolean(this.context, receiver);
+        } finally {
+            Reference.reachabilityFence(creatorContext);
+        }
     }
 
     /**
@@ -1009,7 +1336,11 @@ public final class Value extends AbstractValue {
      * @since 19.0
      */
     public boolean asBoolean() {
-        return dispatch.asBoolean(this.context, receiver);
+        try {
+            return dispatch.asBoolean(this.context, receiver);
+        } finally {
+            Reference.reachabilityFence(creatorContext);
+        }
     }
 
     /**
@@ -1023,7 +1354,11 @@ public final class Value extends AbstractValue {
      * @since 19.0
      */
     public boolean isNumber() {
-        return dispatch.isNumber(this.context, receiver);
+        try {
+            return dispatch.isNumber(this.context, receiver);
+        } finally {
+            Reference.reachabilityFence(creatorContext);
+        }
     }
 
     /**
@@ -1036,7 +1371,11 @@ public final class Value extends AbstractValue {
      * @since 19.0
      */
     public boolean fitsInLong() {
-        return dispatch.fitsInLong(this.context, receiver);
+        try {
+            return dispatch.fitsInLong(this.context, receiver);
+        } finally {
+            Reference.reachabilityFence(creatorContext);
+        }
     }
 
     /**
@@ -1050,7 +1389,46 @@ public final class Value extends AbstractValue {
      * @since 19.0
      */
     public long asLong() {
-        return dispatch.asLong(this.context, receiver);
+        try {
+            return dispatch.asLong(this.context, receiver);
+        } finally {
+            Reference.reachabilityFence(creatorContext);
+        }
+    }
+
+    /**
+     * Returns <code>true</code> if this value represents a {@link #isNumber() number} and the value
+     * fits in <code>BigInteger</code>, else <code>false</code>.
+     *
+     * @throws PolyglotException if a guest language error occurred during execution.
+     * @throws IllegalStateException if the underlying context was closed.
+     * @see #asBigInteger()
+     * @since 23.0
+     */
+    public boolean fitsInBigInteger() {
+        try {
+            return dispatch.fitsInBigInteger(this.context, receiver);
+        } finally {
+            Reference.reachabilityFence(creatorContext);
+        }
+    }
+
+    /**
+     * Returns a <code>BigInteger</code> representation of this value if it is {@link #isNumber()
+     * number} and the value {@link #fitsInBigInteger() fits}.
+     *
+     * @throws NullPointerException if this value represents {@link #isNull() null}.
+     * @throws ClassCastException if this value could not be converted to BigInteger.
+     * @throws PolyglotException if a guest language error occurred during execution.
+     * @throws IllegalStateException if the underlying context was closed.
+     * @since 23.0
+     */
+    public BigInteger asBigInteger() {
+        try {
+            return dispatch.asBigInteger(this.context, receiver);
+        } finally {
+            Reference.reachabilityFence(creatorContext);
+        }
     }
 
     /**
@@ -1063,7 +1441,11 @@ public final class Value extends AbstractValue {
      * @since 19.0
      */
     public boolean fitsInDouble() {
-        return dispatch.fitsInDouble(this.context, receiver);
+        try {
+            return dispatch.fitsInDouble(this.context, receiver);
+        } finally {
+            Reference.reachabilityFence(creatorContext);
+        }
     }
 
     /**
@@ -1077,7 +1459,11 @@ public final class Value extends AbstractValue {
      * @since 19.0
      */
     public double asDouble() {
-        return dispatch.asDouble(this.context, receiver);
+        try {
+            return dispatch.asDouble(this.context, receiver);
+        } finally {
+            Reference.reachabilityFence(creatorContext);
+        }
     }
 
     /**
@@ -1090,7 +1476,11 @@ public final class Value extends AbstractValue {
      * @since 19.0
      */
     public boolean fitsInFloat() {
-        return dispatch.fitsInFloat(this.context, receiver);
+        try {
+            return dispatch.fitsInFloat(this.context, receiver);
+        } finally {
+            Reference.reachabilityFence(creatorContext);
+        }
     }
 
     /**
@@ -1104,7 +1494,11 @@ public final class Value extends AbstractValue {
      * @since 19.0
      */
     public float asFloat() {
-        return dispatch.asFloat(this.context, receiver);
+        try {
+            return dispatch.asFloat(this.context, receiver);
+        } finally {
+            Reference.reachabilityFence(creatorContext);
+        }
     }
 
     /**
@@ -1117,7 +1511,11 @@ public final class Value extends AbstractValue {
      * @since 19.0
      */
     public boolean fitsInByte() {
-        return dispatch.fitsInByte(this.context, receiver);
+        try {
+            return dispatch.fitsInByte(this.context, receiver);
+        } finally {
+            Reference.reachabilityFence(creatorContext);
+        }
     }
 
     /**
@@ -1131,7 +1529,11 @@ public final class Value extends AbstractValue {
      * @since 19.0
      */
     public byte asByte() {
-        return dispatch.asByte(this.context, receiver);
+        try {
+            return dispatch.asByte(this.context, receiver);
+        } finally {
+            Reference.reachabilityFence(creatorContext);
+        }
     }
 
     /**
@@ -1144,7 +1546,11 @@ public final class Value extends AbstractValue {
      * @since 19.0
      */
     public boolean fitsInShort() {
-        return dispatch.fitsInShort(this.context, receiver);
+        try {
+            return dispatch.fitsInShort(this.context, receiver);
+        } finally {
+            Reference.reachabilityFence(creatorContext);
+        }
     }
 
     /**
@@ -1158,7 +1564,11 @@ public final class Value extends AbstractValue {
      * @since 19.0
      */
     public short asShort() {
-        return dispatch.asShort(this.context, receiver);
+        try {
+            return dispatch.asShort(this.context, receiver);
+        } finally {
+            Reference.reachabilityFence(creatorContext);
+        }
     }
 
     /**
@@ -1169,7 +1579,11 @@ public final class Value extends AbstractValue {
      * @since 19.0
      */
     public boolean isNull() {
-        return dispatch.isNull(this.context, receiver);
+        try {
+            return dispatch.isNull(this.context, receiver);
+        } finally {
+            Reference.reachabilityFence(creatorContext);
+        }
     }
 
     /**
@@ -1181,19 +1595,27 @@ public final class Value extends AbstractValue {
      * @since 19.0
      */
     public boolean isNativePointer() {
-        return dispatch.isNativePointer(this.context, receiver);
+        try {
+            return dispatch.isNativePointer(this.context, receiver);
+        } finally {
+            Reference.reachabilityFence(creatorContext);
+        }
     }
 
     /**
      * Returns the value of the pointer as <code>long</code> value.
      *
-     * @throws UnsupportedOperationException if the value is not a pointer.
+     * @throws ClassCastException if the value is not a pointer.
      * @throws PolyglotException if a guest language error occurred during execution.
      * @throws IllegalStateException if the underlying context was closed.
      * @since 19.0
      */
     public long asNativePointer() {
-        return dispatch.asNativePointer(this.context, receiver);
+        try {
+            return dispatch.asNativePointer(this.context, receiver);
+        } finally {
+            Reference.reachabilityFence(creatorContext);
+        }
     }
 
     /**
@@ -1205,20 +1627,30 @@ public final class Value extends AbstractValue {
      * @since 19.0
      */
     public boolean isHostObject() {
-        return dispatch.isHostObject(this.context, receiver);
+        try {
+            return dispatch.isHostObject(this.context, receiver);
+        } finally {
+            Reference.reachabilityFence(creatorContext);
+        }
     }
 
     /**
      * Returns the original Java host language object.
      *
-     * @throws UnsupportedOperationException if {@link #isHostObject()} is <code>false</code>.
+     * @throws ClassCastException if {@link #isHostObject()} is <code>false</code>
+     * @throws UnsupportedOperationException if Java host language object is allocated in a foreign
+     *             heap.
      * @throws PolyglotException if a guest language error occurred during execution.
      * @throws IllegalStateException if the underlying context was closed.
      * @since 19.0
      */
     @SuppressWarnings("unchecked")
     public <T> T asHostObject() {
-        return (T) dispatch.asHostObject(this.context, receiver);
+        try {
+            return (T) dispatch.asHostObject(this.context, receiver);
+        } finally {
+            Reference.reachabilityFence(creatorContext);
+        }
     }
 
     /**
@@ -1230,21 +1662,29 @@ public final class Value extends AbstractValue {
      * @since 19.0
      */
     public boolean isProxyObject() {
-        return dispatch.isProxyObject(this.context, receiver);
+        try {
+            return dispatch.isProxyObject(this.context, receiver);
+        } finally {
+            Reference.reachabilityFence(creatorContext);
+        }
     }
 
     /**
      * Returns the unboxed instance of the {@link Proxy}. Proxies are not automatically boxed to
      * {@link #isHostObject() host objects} on host language call boundaries (Java methods).
      *
-     * @throws UnsupportedOperationException if a value is not a proxy object.
+     * @throws ClassCastException if a value is not a proxy object.
      * @throws PolyglotException if a guest language error occurred during execution.
      * @throws IllegalStateException if the underlying context was closed.
      * @since 19.0
      */
     @SuppressWarnings("unchecked")
     public <T extends Proxy> T asProxyObject() {
-        return (T) dispatch.asProxyObject(this.context, receiver);
+        try {
+            return (T) dispatch.asProxyObject(this.context, receiver);
+        } finally {
+            Reference.reachabilityFence(creatorContext);
+        }
     }
 
     /**
@@ -1284,8 +1724,11 @@ public final class Value extends AbstractValue {
      * date} and {@link #isTime() time}.</li>
      * <li><code>{@link Instant}.class</code> is supported if the value is an {@link #isInstant()
      * instant}.</li>
-     * <li><code>{@link ZonedDateTime}.class</code> is supported if the value is a {@link #isDate()
-     * date}, {@link #isTime() time} and {@link #isTimeZone() timezone}.</li>
+     * <li><code>{@link ZonedDateTime}.class</code> and <code>{@link OffsetDateTime}.class</code> are
+     * supported if the value is a {@link #isDate() date}, {@link #isTime() time} and
+     * {@link #isTimeZone() timezone}.</li>
+     * <li><code>{@link OffsetTime}.class</code> is supported if the value is a {@link #isTime()
+     * time} and {@link #isTimeZone() timezone}.</li>
      * <li><code>{@link ZoneId}.class</code> is supported if the value is a {@link #isTimeZone()
      * timezone}.</li>
      * <li><code>{@link Duration}.class</code> is supported if the value is a {@link #isDuration()
@@ -1298,60 +1741,84 @@ public final class Value extends AbstractValue {
      * target type mappings} specified in the {@link HostAccess} configuration with precedence
      * {@link TargetMappingPrecedence#LOW}.
      * <li><code>{@link Object}.class</code> is always supported. See section Object mapping rules.
-     * <li><code>{@link Map}.class</code> is supported if the value has {@link #hasHashEntries()}
-     * hash entries}, {@link #hasMembers() members} or {@link #hasArrayElements() array elements}.
-     * The returned map can be safely cast to Map<Object, Object>. For value with
-     * {@link #hasMembers() members} the key type is {@link String}. For value with
-     * {@link #hasArrayElements() array elements} the key type is {@link Long}. It is recommended to
-     * use {@link #as(TypeLiteral) type literals} to specify the expected collection component
-     * types. With type literals the value type can be restricted, for example to
-     * <code>Map<String, String></code>. If the raw <code>{@link Map}.class</code> or an Object
-     * component type is used, then the return types of the the list are subject to Object target
-     * type mapping rules recursively.
-     * <li><code>{@link List}.class</code> is supported if the value has {@link #hasArrayElements()
-     * array elements} and it has an {@link Value#getArraySize() array size} that is smaller or
-     * equal than {@link Integer#MAX_VALUE}. The returned list can be safely cast to
+     * <li><code>{@link Map}.class</code> is supported if
+     * {@link HostAccess.MutableTargetMapping#MEMBERS_TO_JAVA_MAP} respectively
+     * {@link HostAccess.MutableTargetMapping#HASH_TO_JAVA_MAP} are
+     * {@link HostAccess.Builder#allowMutableTargetMappings(HostAccess.MutableTargetMapping...)
+     * allowed} and the value has {@link #hasHashEntries()} hash entries}, {@link #hasMembers()
+     * members} or {@link #hasArrayElements() array elements}. The returned map can be safely cast
+     * to Map&lt;Object, Object&gt;. For value with {@link #hasMembers() members} the key type is
+     * {@link String}. For value with {@link #hasArrayElements() array elements} the key type is
+     * {@link Long}. It is recommended to use {@link #as(TypeLiteral) type literals} to specify the
+     * expected collection component types. With type literals the value type can be restricted, for
+     * example to <code>Map&lt;String, String&gt;</code>. If the raw <code>{@link Map}.class</code>
+     * or an Object component type is used, then the return types of the list are subject to
+     * Object target type mapping rules recursively.
+     * <li><code>{@link List}.class</code> is supported if
+     * {@link HostAccess.MutableTargetMapping#ARRAY_TO_JAVA_LIST} is
+     * {@link HostAccess.Builder#allowMutableTargetMappings(HostAccess.MutableTargetMapping...)
+     * allowed} and the value has {@link #hasArrayElements() array elements} and it has an
+     * {@link Value#getArraySize() array size} that is smaller or equal to
+     * {@link Integer#MAX_VALUE}. The returned list can be safely cast to
      * <code>List&lt;Object&gt;</code>. It is recommended to use {@link #as(TypeLiteral) type
      * literals} to specify the expected component type. With type literals the value type can be
      * restricted to any supported target type, for example to <code>List&lt;Integer&gt;</code>. If
      * the raw <code>{@link List}.class</code> or an Object component type is used, then the return
-     * types of the the list are recursively subject to Object target type mapping rules.
+     * types of the list are recursively subject to Object target type mapping rules.
+     * <li><code>{@link ByteSequence}.class</code> is supported if the value has
+     * {@link #hasBufferElements() buffer elements} and it has a {@link Value#getBufferSize() buffer
+     * size} that is smaller or equal to {@link Integer#MAX_VALUE}.
+     * <li><code>byte[].class</code> is supported if the value has {@link #hasBufferElements()
+     * buffer elements} and it has a {@link Value#getBufferSize() buffer size} that is smaller or
+     * equal to <code>{@link Integer#MAX_VALUE} - 8</code>. The contents of the buffer will be
+     * copied to a new byte array with appropriate size.
      * <li>Any Java array type of a supported target type. The values of the value will be eagerly
      * coerced and copied into a new instance of the provided array type. This means that changes in
      * returned array will not be reflected in the original value. Since conversion to a Java array
      * might be an expensive operation it is recommended to use the `List` or `Collection` target
      * type if possible.
-     * <li><code>{@link Iterable}.class</code> is supported if the value has an
-     * {@link #hasIterator() iterator}. The returned iterable can be safely cast to
-     * <code>Iterable&lt;Object&gt;</code>. It is recommended to use {@link #as(TypeLiteral) type
-     * literals} to specify the expected component type. With type literals the value type can be
-     * restricted to any supported target type, for example to <code>Iterable&lt;Integer&gt;</code>.
-     * <li><code>{@link Iterator}.class</code> is supported if the value is an {@link #isIterator()
-     * iterator} The returned iterator can be safely cast to <code>Iterator&lt;Object&gt;</code>. It
-     * is recommended to use {@link #as(TypeLiteral) type literals} to specify the expected
-     * component type. With type literals the value type can be restricted to any supported target
-     * type, for example to <code>Iterator&lt;Integer&gt;</code>. If the raw
-     * <code>{@link Iterator}.class</code> or an Object component type is used, then the return
-     * types of the the iterator are recursively subject to Object target type mapping rules. The
-     * returned iterator's {@link Iterator#next() next} method may throw a
-     * {@link ConcurrentModificationException} when an underlying iterable has changed or
-     * {@link UnsupportedOperationException} when the iterator's current element is not readable.
-     * <li>Any {@link FunctionalInterface functional} interface if the value can be
-     * {@link #canExecute() executed} or {@link #canInstantiate() instantiated} and the interface
-     * type is {@link HostAccess implementable}. Note that {@link FunctionalInterface} are
-     * implementable by default in with the {@link HostAccess#EXPLICIT explicit} host access policy.
-     * In case a value can be executed and instantiated then the returned implementation of the
-     * interface will be {@link #execute(Object...) executed}. The coercion to the parameter types
-     * of functional interface method is converted using the semantics of {@link #as(Class)}. If a
-     * standard functional interface like {@link Function} is used, it is recommended to use
+     * <li><code>{@link Iterable}.class</code> is supported if
+     * {@link HostAccess.MutableTargetMapping#ITERATOR_TO_JAVA_ITERATOR} is
+     * {@link HostAccess.Builder#allowMutableTargetMappings(HostAccess.MutableTargetMapping...)
+     * allowed} and the value has an {@link #hasIterator() iterator}. The returned iterable can be
+     * safely cast to <code>Iterable&lt;Object&gt;</code>. It is recommended to use
+     * {@link #as(TypeLiteral) type literals} to specify the expected component type. With type
+     * literals the value type can be restricted to any supported target type, for example to
+     * <code>Iterable&lt;Integer&gt;</code>.
+     * <li><code>{@link Iterator}.class</code> is supported if
+     * {@link HostAccess.MutableTargetMapping#ITERATOR_TO_JAVA_ITERATOR} is
+     * {@link HostAccess.Builder#allowMutableTargetMappings(HostAccess.MutableTargetMapping...)
+     * allowed} and the value is an {@link #isIterator() iterator} The returned iterator can be
+     * safely cast to <code>Iterator&lt;Object&gt;</code>. It is recommended to use
+     * {@link #as(TypeLiteral) type literals} to specify the expected component type. With type
+     * literals the value type can be restricted to any supported target type, for example to
+     * <code>Iterator&lt;Integer&gt;</code>. If the raw <code>{@link Iterator}.class</code> or an
+     * Object component type is used, then the return types of the iterator are recursively
+     * subject to Object target type mapping rules. The returned iterator's {@link Iterator#next()
+     * next} method may throw a {@link ConcurrentModificationException} when an underlying iterable
+     * has changed or {@link UnsupportedOperationException} when the iterator's current element is
+     * not readable.
+     * <li>Any {@link FunctionalInterface functional} interface if
+     * {@link HostAccess.MutableTargetMapping#EXECUTABLE_TO_JAVA_INTERFACE} is
+     * {@link HostAccess.Builder#allowMutableTargetMappings(HostAccess.MutableTargetMapping...)
+     * allowed} and the value can be {@link #canExecute() executed} or {@link #canInstantiate()
+     * instantiated} and the interface type is {@link HostAccess implementable}. Note that
+     * {@link FunctionalInterface} are implementable by default in with the
+     * {@link HostAccess#EXPLICIT explicit} host access policy. In case a value can be executed and
+     * instantiated then the returned implementation of the interface will be
+     * {@link #execute(Object...) executed}. The coercion to the parameter types of functional
+     * interface method is converted using the semantics of {@link #as(Class)}. If a standard
+     * functional interface like {@link Function} is used, it is recommended to use
      * {@link #as(TypeLiteral) type literals} to specify the expected generic method parameter and
      * return type.
      * <li>Any interface if the value {@link #hasMembers() has members} and the interface type is
-     * {@link HostAccess.Implementable implementable}. Each interface method maps to one
-     * {@link #getMember(String) member} of the value. Whenever a method of the interface is
-     * executed a member with the method or field name must exist otherwise an
-     * {@link UnsupportedOperationException} is thrown when the method is executed. If one of the
-     * parameters or the return value cannot be mapped to the target type a
+     * {@link HostAccess.Implementable implementable} and
+     * {@link HostAccess.MutableTargetMapping#MEMBERS_TO_JAVA_INTERFACE} is
+     * {@link HostAccess.Builder#allowMutableTargetMappings(HostAccess.MutableTargetMapping...)
+     * allowed}. Each interface method maps to one {@link #getMember(String) member} of the value.
+     * Whenever a method of the interface is executed a member with the method or field name must
+     * exist otherwise an {@link UnsupportedOperationException} is thrown when the method is
+     * executed. If one of the parameters or the return value cannot be mapped to the target type a
      * {@link ClassCastException} or a {@link NullPointerException} is thrown.
      * <li>JVM only: Any abstract class with an accessible default constructor if the value
      * {@link #hasMembers() has members} and the class is {@link HostAccess.Implementable
@@ -1376,6 +1843,8 @@ public final class Value extends AbstractValue {
      * assert context.eval("js", "42").as(Integer.class) == 42;
      * assert context.eval("js", "({foo:'bar'})").as(Map.class).get("foo").equals("bar");
      * assert context.eval("js", "[42]").as(List.class).get(0).equals(42);
+     * assert Arrays.equals(context.eval("js", "([0, 1, 127])").as(byte[].class), new byte[]{0, 1, 127});
+     * assert Arrays.equals(context.eval("js", "(new Uint8Array([0, 1, 127, 255]))").getMember("buffer").as(byte[].class), new byte[]{0, 1, 127, -1});
      * assert ((Map&lt;String, Object>) context.eval("js", "[{foo:'bar'}]").as(List.class).get(0)).get("foo").equals("bar");
      *
      * &#64;FunctionalInterface
@@ -1418,6 +1887,12 @@ public final class Value extends AbstractValue {
      * any Number subclass including {@link BigInteger} or {@link BigDecimal}. It is recommended to
      * cast to {@link Number} and then convert to a Java primitive like with
      * {@link Number#longValue()}.
+     * <li>If the value has {@link #hasArrayElements() array elements} and it has an
+     * {@link Value#getArraySize() array size} that is smaller or equal than
+     * {@link Integer#MAX_VALUE} then the result value will implement {@link List}. Every array
+     * element of the value maps to one list element. The size of the returned list maps to the
+     * array size of the value. The returned value may also implement {@link Function} if the value
+     * can be {@link #canExecute() executed} or {@link #canInstantiate() instantiated}.
      * <li>If the value has {@link #hasHashEntries() hash entries} then the result value will
      * implement {@link Map}. The {@link Map#size() size} of the returned {@link Map} is equal to
      * the {@link #getHashSize() hash entries count}. The returned value may also implement
@@ -1428,12 +1903,6 @@ public final class Value extends AbstractValue {
      * using {@link String} keys. The {@link Map#size() size} of the returned {@link Map} is equal
      * to the count of all members. The returned value may also implement {@link Function} if the
      * value can be {@link #canExecute() executed} or {@link #canInstantiate() instantiated}.
-     * <li>If the value has {@link #hasArrayElements() array elements} and it has an
-     * {@link Value#getArraySize() array size} that is smaller or equal than
-     * {@link Integer#MAX_VALUE} then the result value will implement {@link List}. Every array
-     * element of the value maps to one list element. The size of the returned list maps to the
-     * array size of the value. The returned value may also implement {@link Function} if the value
-     * can be {@link #canExecute() executed} or {@link #canInstantiate() instantiated}.
      * <li>If the value has an {@link #hasIterator()} iterator} then the result value will implement
      * {@link Iterable}. The returned value may also implement {@link Function} if the value can be
      * {@link #canExecute() executed} or {@link #canInstantiate() instantiated}.
@@ -1444,8 +1913,12 @@ public final class Value extends AbstractValue {
      * instantiated} then the result value implements {@link Function Function}. By default the
      * argument of the function will be used as single argument to the function when executed. If a
      * value of type {@link Object Object[]} is provided then the function will be executed with
-     * those arguments. The returned function may also implement {@link Map} if the value has
-     * {@link #hasArrayElements() array elements} or {@link #hasMembers() members}.
+     * those arguments. The returned function may also implement {@link List} or {@link Map} if the
+     * value has {@link #hasArrayElements() array elements} or {@link #hasMembers() members},
+     * respectively.
+     * <li>Mappings to mutable target types such as {@link List}, {@link Map}, {@link Iterator} and
+     * {@link Iterable} are only available if the corresponding mappings are enabled (see
+     * {@link org.graalvm.polyglot.HostAccess.Builder#allowMutableTargetMappings(org.graalvm.polyglot.HostAccess.MutableTargetMapping...)}).
      * <li>If none of the above rules apply then this {@link Value} instance is returned.
      * </ol>
      * Returned {@link #isHostObject() host objects}, {@link String}, {@link Number},
@@ -1502,7 +1975,11 @@ public final class Value extends AbstractValue {
         if (targetType == Value.class) {
             return (T) this;
         }
-        return dispatch.as(this.context, receiver, targetType);
+        try {
+            return dispatch.asClass(this.context, receiver, targetType);
+        } finally {
+            Reference.reachabilityFence(creatorContext);
+        }
     }
 
     /**
@@ -1528,7 +2005,11 @@ public final class Value extends AbstractValue {
      */
     public <T> T as(TypeLiteral<T> targetType) {
         Objects.requireNonNull(targetType, "targetType");
-        return dispatch.as(this.context, receiver, targetType);
+        try {
+            return dispatch.asTypeLiteral(this.context, receiver, targetType.getRawType(), targetType.getType());
+        } finally {
+            Reference.reachabilityFence(creatorContext);
+        }
     }
 
     /**
@@ -1552,7 +2033,11 @@ public final class Value extends AbstractValue {
      * @since 19.0
      */
     public SourceSection getSourceLocation() {
-        return dispatch.getSourceLocation(this.context, receiver);
+        try {
+            return (SourceSection) dispatch.getSourceLocation(this.context, receiver);
+        } finally {
+            Reference.reachabilityFence(creatorContext);
+        }
     }
 
     /**
@@ -1567,7 +2052,11 @@ public final class Value extends AbstractValue {
      * @since 19.2.0
      */
     public boolean isDate() {
-        return dispatch.isDate(this.context, receiver);
+        try {
+            return dispatch.isDate(this.context, receiver);
+        } finally {
+            Reference.reachabilityFence(creatorContext);
+        }
     }
 
     /**
@@ -1582,7 +2071,11 @@ public final class Value extends AbstractValue {
      * @since 19.2.0
      */
     public LocalDate asDate() {
-        return dispatch.asDate(this.context, receiver);
+        try {
+            return dispatch.asDate(this.context, receiver);
+        } finally {
+            Reference.reachabilityFence(creatorContext);
+        }
     }
 
     /**
@@ -1594,7 +2087,11 @@ public final class Value extends AbstractValue {
      * @since 19.2.0
      */
     public boolean isTime() {
-        return dispatch.isTime(this.context, receiver);
+        try {
+            return dispatch.isTime(this.context, receiver);
+        } finally {
+            Reference.reachabilityFence(creatorContext);
+        }
     }
 
     /**
@@ -1609,7 +2106,11 @@ public final class Value extends AbstractValue {
      * @since 19.2.0
      */
     public LocalTime asTime() {
-        return dispatch.asTime(this.context, receiver);
+        try {
+            return dispatch.asTime(this.context, receiver);
+        } finally {
+            Reference.reachabilityFence(creatorContext);
+        }
     }
 
     /**
@@ -1620,7 +2121,7 @@ public final class Value extends AbstractValue {
      * This method is short-hand for:
      *
      * <pre>
-     * v.{@linkplain #isDate() isDate}() && v.{@link #isTime() isTime}() && v.{@link #isTimeZone() isTimeZone}()
+     * v.{@linkplain #isDate() isDate}() &amp;&amp; v.{@link #isTime() isTime}() &amp;&amp; v.{@link #isTimeZone() isTimeZone}()
      * </pre>
      *
      * @throws IllegalStateException if the underlying context is already closed.
@@ -1631,7 +2132,11 @@ public final class Value extends AbstractValue {
      * @since 19.2.0
      */
     public boolean isInstant() {
-        return isDate() && isTime() && isTimeZone();
+        try {
+            return isDate() && isTime() && isTimeZone();
+        } finally {
+            Reference.reachabilityFence(creatorContext);
+        }
     }
 
     /**
@@ -1659,7 +2164,11 @@ public final class Value extends AbstractValue {
      * @since 19.2.0
      */
     public Instant asInstant() {
-        return dispatch.asInstant(this.context, receiver);
+        try {
+            return dispatch.asInstant(this.context, receiver);
+        } finally {
+            Reference.reachabilityFence(creatorContext);
+        }
     }
 
     /**
@@ -1684,7 +2193,11 @@ public final class Value extends AbstractValue {
      * @since 19.2.0
      */
     public boolean isTimeZone() {
-        return dispatch.isTimeZone(this.context, receiver);
+        try {
+            return dispatch.isTimeZone(this.context, receiver);
+        } finally {
+            Reference.reachabilityFence(creatorContext);
+        }
     }
 
     /**
@@ -1698,7 +2211,11 @@ public final class Value extends AbstractValue {
      * @since 19.2.0
      */
     public ZoneId asTimeZone() {
-        return dispatch.asTimeZone(this.context, receiver);
+        try {
+            return dispatch.asTimeZone(this.context, receiver);
+        } finally {
+            Reference.reachabilityFence(creatorContext);
+        }
     }
 
     /**
@@ -1710,7 +2227,11 @@ public final class Value extends AbstractValue {
      * @since 19.2.0
      */
     public boolean isDuration() {
-        return dispatch.isDuration(this.context, receiver);
+        try {
+            return dispatch.isDuration(this.context, receiver);
+        } finally {
+            Reference.reachabilityFence(creatorContext);
+        }
     }
 
     /**
@@ -1724,7 +2245,11 @@ public final class Value extends AbstractValue {
      * @since 19.2.0
      */
     public Duration asDuration() {
-        return dispatch.asDuration(this.context, receiver);
+        try {
+            return dispatch.asDuration(this.context, receiver);
+        } finally {
+            Reference.reachabilityFence(creatorContext);
+        }
     }
 
     /**
@@ -1735,7 +2260,11 @@ public final class Value extends AbstractValue {
      * @since 19.3
      */
     public boolean isException() {
-        return dispatch.isException(this.context, receiver);
+        try {
+            return dispatch.isException(this.context, receiver);
+        } finally {
+            Reference.reachabilityFence(creatorContext);
+        }
     }
 
     /**
@@ -1747,7 +2276,11 @@ public final class Value extends AbstractValue {
      * @since 19.3
      */
     public RuntimeException throwException() {
-        return dispatch.throwException(this.context, receiver);
+        try {
+            return dispatch.throwException(this.context, receiver);
+        } finally {
+            Reference.reachabilityFence(creatorContext);
+        }
     }
 
     /**
@@ -1765,11 +2298,10 @@ public final class Value extends AbstractValue {
      * @since 19.3.0
      */
     public Context getContext() {
-        Context c = dispatch.getContext(this.context);
-        if (c != null && c.currentAPI != null) {
-            return c.currentAPI;
+        if (creatorContext != null && creatorContext.currentAPI != null) {
+            return creatorContext.currentAPI;
         } else {
-            return c;
+            return creatorContext;
         }
     }
 
@@ -1810,7 +2342,11 @@ public final class Value extends AbstractValue {
      * @since 21.1
      */
     public boolean hasIterator() {
-        return dispatch.hasIterator(this.context, receiver);
+        try {
+            return dispatch.hasIterator(this.context, receiver);
+        } finally {
+            Reference.reachabilityFence(creatorContext);
+        }
     }
 
     /**
@@ -1825,7 +2361,11 @@ public final class Value extends AbstractValue {
      * @since 21.1
      */
     public Value getIterator() {
-        return dispatch.getIterator(this.context, receiver);
+        try {
+            return (Value) dispatch.getIterator(this.context, receiver);
+        } finally {
+            Reference.reachabilityFence(creatorContext);
+        }
     }
 
     /**
@@ -1840,7 +2380,11 @@ public final class Value extends AbstractValue {
      * @since 21.1
      */
     public boolean isIterator() {
-        return dispatch.isIterator(this.context, receiver);
+        try {
+            return dispatch.isIterator(this.context, receiver);
+        } finally {
+            Reference.reachabilityFence(creatorContext);
+        }
     }
 
     /**
@@ -1857,7 +2401,11 @@ public final class Value extends AbstractValue {
      * @since 21.1
      */
     public boolean hasIteratorNextElement() {
-        return dispatch.hasIteratorNextElement(this.context, receiver);
+        try {
+            return dispatch.hasIteratorNextElement(this.context, receiver);
+        } finally {
+            Reference.reachabilityFence(creatorContext);
+        }
     }
 
     /**
@@ -1879,7 +2427,11 @@ public final class Value extends AbstractValue {
      * @since 21.1
      */
     public Value getIteratorNextElement() {
-        return dispatch.getIteratorNextElement(this.context, receiver);
+        try {
+            return (Value) dispatch.getIteratorNextElement(this.context, receiver);
+        } finally {
+            Reference.reachabilityFence(creatorContext);
+        }
     }
 
     /**
@@ -1894,7 +2446,11 @@ public final class Value extends AbstractValue {
      * @since 21.1
      */
     public boolean hasHashEntries() {
-        return dispatch.hasHashEntries(this.context, receiver);
+        try {
+            return dispatch.hasHashEntries(this.context, receiver);
+        } finally {
+            Reference.reachabilityFence(creatorContext);
+        }
     }
 
     /**
@@ -1907,7 +2463,11 @@ public final class Value extends AbstractValue {
      * @since 21.1
      */
     public long getHashSize() throws UnsupportedOperationException {
-        return dispatch.getHashSize(this.context, receiver);
+        try {
+            return dispatch.getHashSize(this.context, receiver);
+        } finally {
+            Reference.reachabilityFence(creatorContext);
+        }
     }
 
     /**
@@ -1921,7 +2481,11 @@ public final class Value extends AbstractValue {
      * @since 21.1
      */
     public boolean hasHashEntry(Object key) {
-        return dispatch.hasHashEntry(this.context, receiver, key);
+        try {
+            return dispatch.hasHashEntry(this.context, receiver, key);
+        } finally {
+            Reference.reachabilityFence(creatorContext);
+        }
     }
 
     /**
@@ -1936,7 +2500,11 @@ public final class Value extends AbstractValue {
      * @since 21.1
      */
     public Value getHashValue(Object key) throws UnsupportedOperationException {
-        return dispatch.getHashValue(this.context, receiver, key);
+        try {
+            return (Value) dispatch.getHashValue(this.context, receiver, key);
+        } finally {
+            Reference.reachabilityFence(creatorContext);
+        }
     }
 
     /**
@@ -1951,7 +2519,11 @@ public final class Value extends AbstractValue {
      * @since 21.1
      */
     public Value getHashValueOrDefault(Object key, Object defaultValue) throws UnsupportedOperationException {
-        return dispatch.getHashValueOrDefault(this.context, receiver, key, defaultValue);
+        try {
+            return (Value) dispatch.getHashValueOrDefault(this.context, receiver, key, defaultValue);
+        } finally {
+            Reference.reachabilityFence(creatorContext);
+        }
     }
 
     /**
@@ -1969,6 +2541,7 @@ public final class Value extends AbstractValue {
      */
     public void putHashEntry(Object key, Object value) throws IllegalArgumentException, UnsupportedOperationException {
         dispatch.putHashEntry(this.context, receiver, key, value);
+        Reference.reachabilityFence(creatorContext);
     }
 
     /**
@@ -1984,7 +2557,11 @@ public final class Value extends AbstractValue {
      * @since 21.1
      */
     public boolean removeHashEntry(Object key) throws UnsupportedOperationException {
-        return dispatch.removeHashEntry(this.context, receiver, key);
+        try {
+            return dispatch.removeHashEntry(this.context, receiver, key);
+        } finally {
+            Reference.reachabilityFence(creatorContext);
+        }
     }
 
     /**
@@ -2003,7 +2580,11 @@ public final class Value extends AbstractValue {
      * @since 21.1
      */
     public Value getHashEntriesIterator() throws UnsupportedOperationException {
-        return dispatch.getHashEntriesIterator(this.context, receiver);
+        try {
+            return (Value) dispatch.getHashEntriesIterator(this.context, receiver);
+        } finally {
+            Reference.reachabilityFence(creatorContext);
+        }
     }
 
     /**
@@ -2018,7 +2599,11 @@ public final class Value extends AbstractValue {
      * @since 21.1
      */
     public Value getHashKeysIterator() throws UnsupportedOperationException {
-        return dispatch.getHashKeysIterator(this.context, receiver);
+        try {
+            return (Value) dispatch.getHashKeysIterator(this.context, receiver);
+        } finally {
+            Reference.reachabilityFence(creatorContext);
+        }
     }
 
     /**
@@ -2033,7 +2618,11 @@ public final class Value extends AbstractValue {
      * @since 21.1
      */
     public Value getHashValuesIterator() throws UnsupportedOperationException {
-        return dispatch.getHashValuesIterator(this.context, receiver);
+        try {
+            return (Value) dispatch.getHashValuesIterator(this.context, receiver);
+        } finally {
+            Reference.reachabilityFence(creatorContext);
+        }
     }
 
     /**
@@ -2052,7 +2641,7 @@ public final class Value extends AbstractValue {
         if (o instanceof Value) {
             return (Value) o;
         }
-        return Engine.getImpl().asValue(o);
+        return (Value) Engine.getImpl().asValue(o);
     }
 
     /**
@@ -2069,7 +2658,184 @@ public final class Value extends AbstractValue {
      */
     public void pin() {
         dispatch.pin(this.context, receiver);
+        Reference.reachabilityFence(creatorContext);
     }
+
+    /**
+     * Creates a byte-based string value that can be passed to polyglot languages.
+     * <p>
+     * The returned value is guaranteed to return <code>true</code> for {@link Value#isString()}.
+     * The string can later be retrieved as a byte array using
+     * {@link Value#asStringBytes(StringEncoding)}. This method ensures immutability by
+     * conservatively copying the byte array before passing it to the underlying implementation.
+     * </p>
+     *
+     * <b>Performance Note:</b> Copying the byte array can have a performance impact. Use this
+     * method when immutability is required, or use the more flexible overloaded method
+     * {@link #fromByteBasedString(byte[], int, int, StringEncoding, boolean)} to control copying
+     * behavior.
+     *
+     * @param bytes the byte array representing the string
+     * @param encoding the encoding of the byte array
+     * @return a polyglot string {@link Value}
+     * @throws NullPointerException if either {@code bytes} or {@code encoding} is null
+     * @since 24.2
+     */
+    public static Value fromByteBasedString(byte[] bytes, StringEncoding encoding) {
+        Objects.requireNonNull(bytes);
+        Objects.requireNonNull(encoding);
+        return Engine.getImpl().fromByteBasedString(bytes, 0, bytes.length, encoding.value, true);
+    }
+
+    /**
+     * Creates a byte-based string value with more granular control over the byte array's usage.
+     * <p>
+     * This method provides additional flexibility by allowing a subset of the byte array to be
+     * passed and controlling whether the byte array should be copied to ensure immutability.
+     *
+     * @param bytes the byte array representing the string
+     * @param offset the starting offset in the byte array
+     * @param length the number of bytes to include starting from {@code offset}
+     * @param encoding the encoding of the byte array
+     * @param copy whether to copy the byte array to ensure immutability
+     * @return a polyglot string {@link Value}
+     * @since 24.2
+     */
+    public static Value fromByteBasedString(byte[] bytes, int offset, int length, StringEncoding encoding, boolean copy) {
+        Objects.requireNonNull(bytes);
+        Objects.requireNonNull(encoding);
+        if (offset < 0) {
+            throw new IndexOutOfBoundsException("byteLength must not be negative");
+        }
+        if (length < 0) {
+            throw new IndexOutOfBoundsException("byteOffset must not be negative");
+        }
+        if (offset + length > bytes.length) {
+            throw new IndexOutOfBoundsException("byte index is out of bounds");
+        }
+        return Engine.getImpl().fromByteBasedString(bytes, offset, length, encoding.value, copy);
+    }
+
+    /**
+     * Creates a native string object that can be passed to polyglot languages.
+     * <p>
+     * Native strings avoid copying, offering better performance for certain use cases. However,
+     * clients must guarantee the lifetime of the native string as long as the {@link Value} is
+     * alive. The returned value is guaranteed to return <code>true</code> for
+     * {@link Value#isString()}.
+     * <p>
+     * <b>Usage Warning:</b> The polyglot context or engine does not manage the lifetime of the
+     * native pointer. Clients must ensure that the pointer remains valid and that the memory is not
+     * deallocated while the string is in use. Passing a deallocated or invalid pointer can result
+     * in crashes or undefined behavior.
+     * <p>
+     * <b>Note:</b> Whenever possible, use {@link #fromByteBasedString(byte[], StringEncoding)} to
+     * avoid the risks associated with native memory management.
+     *
+     * <ul>
+     * <li>The native string's memory must remain valid for the lifetime of the context it is passed
+     * to.
+     * <li>The native bytes must not be mutated after being passed to this method.
+     * <li>The bytes must already be encoded with the specified encoding.
+     * </ul>
+     *
+     * @param basePointer the raw base pointer to the native string in memory
+     * @param byteLength the length of the string in bytes
+     * @param encoding the encoding of the native string
+     * @param copy whether to copy the native string bytes for additional safety
+     * @return a polyglot string {@link Value}
+     * @since 24.2
+     */
+    public static Value fromNativeString(long basePointer, int byteOffset, int byteLength, StringEncoding encoding, boolean copy) {
+        Objects.requireNonNull(encoding);
+        if (basePointer == 0L) {
+            throw new NullPointerException("Null base pointer provided.");
+        }
+        if (byteLength < 0) {
+            throw new IndexOutOfBoundsException("byteLength must not be negative");
+        }
+        if (byteOffset < 0) {
+            throw new IndexOutOfBoundsException("byteOffset must not be negative");
+        }
+        return Engine.getImpl().fromNativeString(basePointer, byteOffset, byteLength, encoding.value, copy);
+    }
+
+    /**
+     * Creates a native string object with default safety settings.
+     * <p>
+     * This method is equivalent to calling
+     * {@link #fromNativeString(long, int, int, StringEncoding, boolean)} with {@code copy} set to
+     * {@code true}.
+     * </p>
+     *
+     * @param basePointer the raw base pointer to the native string in memory
+     * @param byteLength the length of the string in bytes
+     * @param encoding the encoding of the native string
+     * @return a polyglot string {@link Value}
+     * @since 24.2
+     */
+    public static Value fromNativeString(long basePointer, int byteLength, StringEncoding encoding) {
+        return fromNativeString(basePointer, 0, byteLength, encoding, true);
+    }
+
+    /**
+     * Enum like class representing the supported string encodings. The encodings determine how byte
+     * arrays or native strings are interpreted when creating or retrieving string values. This
+     * class is not directly a enum to support compatible evolution.
+     *
+     * @since 24.2
+     */
+    public static final class StringEncoding {
+
+        /**
+         * @since 24.2
+         */
+        public static final StringEncoding UTF_8 = new StringEncoding(0);
+
+        /**
+         * @since 24.2
+         */
+        public static final StringEncoding UTF_16_LITTLE_ENDIAN = new StringEncoding(1);
+        /**
+         * @since 24.2
+         */
+        public static final StringEncoding UTF_16_BIG_ENDIAN = new StringEncoding(2);
+        /**
+         * @since 24.2
+         */
+        public static final StringEncoding UTF_32_LITTLE_ENDIAN = new StringEncoding(3);
+        /**
+         * @since 24.2
+         */
+        public static final StringEncoding UTF_32_BIG_ENDIAN = new StringEncoding(4);
+
+        /**
+         * The native UTF 16 encoding for the current platform.
+         *
+         * @see ByteOrder#nativeOrder()
+         * @since 24.2
+         */
+        public static final StringEncoding UTF_16 = ByteOrder.nativeOrder() == ByteOrder.LITTLE_ENDIAN ? UTF_16_LITTLE_ENDIAN : UTF_16_BIG_ENDIAN;
+
+        /**
+         * The native UTF 32 encoding for the current platform.
+         *
+         * @see ByteOrder#nativeOrder()
+         * @since 24.2
+         */
+        public static final StringEncoding UTF_32 = ByteOrder.nativeOrder() == ByteOrder.LITTLE_ENDIAN ? UTF_32_LITTLE_ENDIAN : UTF_32_BIG_ENDIAN;
+
+        /*
+         * Mapping table to PolyglotImpl.LazyEncodings.TABLE. Keep in sync.
+         */
+        final int value;
+
+        private StringEncoding(int value) {
+            this.value = value;
+        }
+
+    }
+
 }
 
 abstract class AbstractValue {
@@ -2077,11 +2843,18 @@ abstract class AbstractValue {
     final Object receiver;
     final Object context;
     final AbstractValueDispatch dispatch;
+    /**
+     * Strong reference to the creator {@link Context} to prevent it from being garbage collected
+     * and closed while {@link Value} is still reachable.
+     */
+    final Context creatorContext;
 
-    AbstractValue(AbstractValueDispatch dispatch, Object context, Object receiver) {
+    AbstractValue(AbstractValueDispatch dispatch, Object context, Object receiver, Context creatorContext) {
+        assert (context == null) == (creatorContext == null);
         this.context = context;
         this.dispatch = dispatch;
         this.receiver = receiver;
+        this.creatorContext = creatorContext;
     }
 
     @Override
@@ -2089,16 +2862,28 @@ abstract class AbstractValue {
         if (!(obj instanceof AbstractValue)) {
             return false;
         }
-        return dispatch.equalsImpl(this.context, receiver, ((AbstractValue) obj).receiver);
+        try {
+            return dispatch.equalsImpl(this.context, receiver, ((AbstractValue) obj).receiver);
+        } finally {
+            Reference.reachabilityFence(creatorContext);
+        }
     }
 
     @Override
     public int hashCode() {
-        return dispatch.hashCodeImpl(this.context, receiver);
+        try {
+            return dispatch.hashCodeImpl(this.context, receiver);
+        } finally {
+            Reference.reachabilityFence(creatorContext);
+        }
     }
 
     @Override
     public String toString() {
-        return dispatch.toString(this.context, receiver);
+        try {
+            return dispatch.toString(this.context, receiver);
+        } finally {
+            Reference.reachabilityFence(creatorContext);
+        }
     }
 }

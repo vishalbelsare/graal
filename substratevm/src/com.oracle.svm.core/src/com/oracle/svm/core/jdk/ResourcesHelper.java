@@ -27,58 +27,36 @@ package com.oracle.svm.core.jdk;
 import java.io.IOException;
 import java.io.InputStream;
 import java.net.URL;
-import java.net.URLConnection;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.Enumeration;
 import java.util.List;
+import java.util.Objects;
 
-import org.graalvm.nativeimage.ImageSingletons;
+import org.graalvm.nativeimage.ImageInfo;
 
-import com.oracle.svm.core.util.VMError;
+import com.oracle.svm.core.jdk.resources.ResourceStorageEntryBase;
+import com.oracle.svm.shared.util.SubstrateUtil;
+import com.oracle.svm.shared.util.VMError;
 
-@SuppressWarnings("unchecked")
 public class ResourcesHelper {
-
-    private static <T> T urlToResource(String resourceName, URL url) {
-        try {
-            if (url == null) {
-                return null;
-            }
-            URLConnection urlConnection = url.openConnection();
-            Object resource = ImageSingletons.lookup(JDKVersionSpecificResourceBuilder.class).buildResource(resourceName, url, urlConnection);
-            VMError.guarantee(resource != null);
-            return (T) resource;
-        } catch (IOException e) {
-            return null;
-        } catch (ClassCastException classCastException) {
-            throw VMError.shouldNotReachHere(classCastException);
-        }
-    }
-
-    public static <T> T nameToResource(String resourceName) {
-        return urlToResource(resourceName, nameToResourceURL(resourceName));
-    }
-
-    public static <T> Enumeration<T> nameToResources(String resourceName) {
-        Enumeration<URL> urls = Resources.createURLs(resourceName);
-        List<T> resourceURLs = new ArrayList<>();
-        while (urls.hasMoreElements()) {
-            resourceURLs.add(urlToResource(resourceName, urls.nextElement()));
-        }
-        return Collections.enumeration(resourceURLs);
-    }
 
     public static URL nameToResourceURL(String resourceName) {
         return Resources.createURL(resourceName);
     }
 
-    public static URL nameToResourceURL(String moduleName, String resourceName) {
-        return Resources.createURL(moduleName, resourceName);
+    public static URL nameToResourceURL(Module module, String resourceName) {
+        return Resources.createURL(module, resourceName);
     }
 
-    public static InputStream nameToResourceInputStream(String resourceName) throws IOException {
-        URL url = nameToResourceURL(resourceName);
+    public static URL nameToResourceURL(ClassLoader loader, String resourceName) {
+        return Resources.createURL(loader, resourceName);
+    }
+
+    public static InputStream nameToResourceInputStream(String mn, String resourceName) throws IOException {
+        VMError.guarantee(ImageInfo.inImageRuntimeCode(), "ResourcesHelper code should only be used at runtime");
+        Module module = mn == null ? null : ModuleLayer.boot().findModule(mn).orElse(null);
+        URL url = nameToResourceURL(module, resourceName);
         return url != null ? url.openStream() : null;
     }
 
@@ -89,6 +67,36 @@ public class ResourcesHelper {
             resourceURLs.add(urls.nextElement());
         }
         return resourceURLs;
+    }
+
+    public static List<URL> nameToResourceListURLs(ClassLoader loader, String resourcesName) {
+        Enumeration<URL> urls = Resources.createURLs(loader, resourcesName);
+        List<URL> resourceURLs = new ArrayList<>();
+        while (urls.hasMoreElements()) {
+            resourceURLs.add(urls.nextElement());
+        }
+        return resourceURLs;
+    }
+
+    static boolean findEmbeddedResourceEntry(String resourceName) {
+        Objects.requireNonNull(resourceName);
+        ResourceStorageEntryBase entry = Resources.getAtRuntime((Module) null, resourceName, true);
+        return entry != null && entry != Resources.NEGATIVE_QUERY_MARKER && entry != Resources.MISSING_METADATA_MARKER;
+    }
+
+    static boolean findEmbeddedResourceEntry(ClassLoader loader, String resourceName) {
+        Objects.requireNonNull(resourceName);
+        ResourceStorageEntryBase entry = Resources.getAtRuntime(loader, resourceName, true);
+        return entry != null && entry != Resources.NEGATIVE_QUERY_MARKER && entry != Resources.MISSING_METADATA_MARKER;
+    }
+
+    static void reportMissingEmbeddedResourceMetadata(ClassLoader loader, String resourceName) {
+        Objects.requireNonNull(resourceName);
+        Resources.getAtRuntime(loader, resourceName, false);
+    }
+
+    static boolean isBootLoader(ClassLoader loader) {
+        return loader == SubstrateUtil.cast(Target_jdk_internal_loader_ClassLoaders.bootLoader(), ClassLoader.class);
     }
 
     public static Enumeration<URL> nameToResourceEnumerationURLs(String resourcesName) {

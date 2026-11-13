@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2020, 2021, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2020, 2024, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * The Universal Permissive License (UPL), Version 1.0
@@ -49,6 +49,7 @@ import java.time.ZoneId;
 import java.util.NoSuchElementException;
 
 import org.graalvm.polyglot.Value;
+import org.graalvm.polyglot.impl.AbstractPolyglotImpl.APIAccess;
 import org.graalvm.polyglot.proxy.ProxyArray;
 import org.graalvm.polyglot.proxy.ProxyDate;
 import org.graalvm.polyglot.proxy.ProxyDuration;
@@ -74,21 +75,26 @@ import com.oracle.truffle.api.interop.UnsupportedMessageException;
 import com.oracle.truffle.host.HostMethodDesc.SingleMethod;
 import com.oracle.truffle.host.HostMethodDesc.SingleMethod.MHBase;
 
-final class GuestToHostCodeCache {
+final class GuestToHostCodeCache extends GuestToHostCodeCacheBase {
 
     final HostLanguage language;
 
     GuestToHostCodeCache(HostLanguage language) {
+        super(language.polyglot.getAPIAccess());
         this.language = language;
     }
 
-    final CallTarget methodHandleHostInvoke = new GuestToHostRootNode(HostObject.class, "doInvoke") {
+    static class GuestToHostInvokeHandle extends GuestToHostRootNode {
+
+        protected GuestToHostInvokeHandle() {
+            super(HostObject.class, "doInvoke");
+        }
+
         @Override
         protected Object executeImpl(Object receiver, Object[] callArguments) {
             if (TruffleOptions.AOT) {
                 throw CompilerDirectives.shouldNotReachHere("MHBase.invokeHandle can only be used in non AOT mode.");
             }
-
             MethodHandle methodHandle = (MethodHandle) callArguments[ARGUMENT_OFFSET];
             Object[] arguments = (Object[]) callArguments[ARGUMENT_OFFSET + 1];
             Object ret;
@@ -99,9 +105,16 @@ final class GuestToHostCodeCache {
             }
             return ret;
         }
-    }.getCallTarget();
+    }
 
-    final CallTarget reflectionHostInvoke = new GuestToHostRootNode(HostObject.class, "doInvoke") {
+    final CallTarget methodHandleHostInvoke = new GuestToHostInvokeHandle().getCallTarget();
+
+    static class GuestToHostInvokeReflect extends GuestToHostRootNode {
+
+        protected GuestToHostInvokeReflect() {
+            super(HostObject.class, "doInvoke");
+        }
+
         @Override
         protected Object executeImpl(Object obj, Object[] callArguments) {
             SingleMethod.ReflectBase method = (SingleMethod.ReflectBase) callArguments[ARGUMENT_OFFSET];
@@ -114,37 +127,35 @@ final class GuestToHostCodeCache {
             }
             return ret;
         }
-    }.getCallTarget();
+    }
+
+    final CallTarget reflectionHostInvoke = new GuestToHostInvokeReflect().getCallTarget();
 
     final CallTarget execute = new GuestToHostRootNode(ProxyExecutable.class, "execute") {
 
         @Override
-        @TruffleBoundary
+        @TruffleBoundary(allowInlining = true)
         protected Object executeImpl(Object proxy, Object[] arguments) throws UnsupportedMessageException {
-            try {
-                return ((ProxyExecutable) proxy).execute((Value[]) arguments[ARGUMENT_OFFSET]);
-            } catch (UnsupportedOperationException e) {
-                throw UnsupportedMessageException.create();
-            }
+            return api.callProxyExecutableExecute(proxy, (Object[]) arguments[ARGUMENT_OFFSET]);
         }
     }.getCallTarget();
 
     final CallTarget asPointer = new GuestToHostRootNode(ProxyNativeObject.class, "asPointer") {
 
         @Override
-        @TruffleBoundary
+        @TruffleBoundary(allowInlining = true)
         protected Object executeImpl(Object proxy, Object[] arguments) {
-            return ((ProxyNativeObject) proxy).asPointer();
+            return api.callProxyNativeObjectAsPointer(proxy);
         }
     }.getCallTarget();
 
     final CallTarget instantiate = new GuestToHostRootNode(ProxyInstantiable.class, "newInstance") {
 
         @Override
-        @TruffleBoundary
+        @TruffleBoundary(allowInlining = true)
         protected Object executeImpl(Object proxy, Object[] arguments) throws UnsupportedMessageException {
             try {
-                return ((ProxyInstantiable) proxy).newInstance((Value[]) arguments[ARGUMENT_OFFSET]);
+                return api.callProxyInstantiableNewInstance(proxy, (Object[]) arguments[ARGUMENT_OFFSET]);
             } catch (UnsupportedOperationException e) {
                 throw UnsupportedMessageException.create();
             }
@@ -165,9 +176,9 @@ final class GuestToHostCodeCache {
             }
         }
 
-        @TruffleBoundary
+        @TruffleBoundary(allowInlining = true)
         private Object boundaryGet(ProxyArray proxy, long index) {
-            return proxy.get(index);
+            return api.callProxyArrayGet(proxy, index);
         }
     }.getCallTarget();
 
@@ -186,9 +197,9 @@ final class GuestToHostCodeCache {
             return null;
         }
 
-        @TruffleBoundary
+        @TruffleBoundary(allowInlining = true)
         private void boundarySet(ProxyArray proxy, long index, Value value) {
-            proxy.set(index, value);
+            api.callProxyArraySet(proxy, index, value);
         }
     }.getCallTarget();
 
@@ -206,27 +217,28 @@ final class GuestToHostCodeCache {
             }
         }
 
-        @TruffleBoundary
+        @TruffleBoundary(allowInlining = true)
         private boolean boundaryRemove(ProxyArray proxy, long index) {
-            return proxy.remove(index);
+            return api.callProxyArrayRemove(proxy, index);
         }
     }.getCallTarget();
 
     final CallTarget arraySize = new GuestToHostRootNode(ProxyArray.class, "getSize") {
 
         @Override
-        @TruffleBoundary
+        @TruffleBoundary(allowInlining = true)
         protected Object executeImpl(Object proxy, Object[] arguments) {
-            return ((ProxyArray) proxy).getSize();
+            return api.callProxyArraySize(proxy);
         }
+
     }.getCallTarget();
 
     final CallTarget memberKeys = new GuestToHostRootNode(ProxyObject.class, "getMemberKeys") {
 
         @Override
-        @TruffleBoundary
+        @TruffleBoundary(allowInlining = true)
         protected Object executeImpl(Object proxy, Object[] arguments) {
-            return ((ProxyObject) proxy).getMemberKeys();
+            return api.callProxyObjectMemberKeys(proxy);
         }
     }.getCallTarget();
 
@@ -235,15 +247,15 @@ final class GuestToHostCodeCache {
         @Override
         protected Object executeImpl(Object proxy, Object[] arguments) throws UnsupportedMessageException {
             try {
-                return boundaryGetMember((ProxyObject) proxy, (String) arguments[ARGUMENT_OFFSET]);
+                return boundaryGetMember(proxy, (String) arguments[ARGUMENT_OFFSET]);
             } catch (UnsupportedOperationException e) {
                 throw UnsupportedMessageException.create();
             }
         }
 
-        @TruffleBoundary
-        private Object boundaryGetMember(ProxyObject proxy, String argument) {
-            return proxy.getMember(argument);
+        @TruffleBoundary(allowInlining = true)
+        private Object boundaryGetMember(Object proxy, String argument) {
+            return api.callProxyObjectGetMember(proxy, argument);
         }
     }.getCallTarget();
 
@@ -252,16 +264,16 @@ final class GuestToHostCodeCache {
         @Override
         protected Object executeImpl(Object proxy, Object[] arguments) throws UnsupportedMessageException {
             try {
-                boundaryPutMember((ProxyObject) proxy, (String) arguments[ARGUMENT_OFFSET], (Value) arguments[ARGUMENT_OFFSET + 1]);
+                boundaryPutMember(proxy, (String) arguments[ARGUMENT_OFFSET], arguments[ARGUMENT_OFFSET + 1]);
             } catch (UnsupportedOperationException e) {
                 throw UnsupportedMessageException.create();
             }
             return null;
         }
 
-        @TruffleBoundary
-        private void boundaryPutMember(ProxyObject proxy, String member, Value value) {
-            proxy.putMember(member, value);
+        @TruffleBoundary(allowInlining = true)
+        private void boundaryPutMember(Object proxy, String member, Object value) {
+            api.callProxyObjectPutMember(proxy, member, value);
         }
     }.getCallTarget();
 
@@ -270,33 +282,33 @@ final class GuestToHostCodeCache {
         @Override
         protected Object executeImpl(Object proxy, Object[] arguments) throws UnsupportedMessageException {
             try {
-                return removeBoundary((ProxyObject) proxy, (String) arguments[ARGUMENT_OFFSET]);
+                return removeBoundary(proxy, (String) arguments[ARGUMENT_OFFSET]);
             } catch (UnsupportedOperationException e) {
                 throw UnsupportedMessageException.create();
             }
         }
 
-        @TruffleBoundary
-        private boolean removeBoundary(ProxyObject proxy, String member) {
-            return proxy.removeMember(member);
+        @TruffleBoundary(allowInlining = true)
+        private boolean removeBoundary(Object proxy, String member) {
+            return api.callProxyObjectRemoveMember(proxy, member);
         }
     }.getCallTarget();
 
     final CallTarget hasMember = new GuestToHostRootNode(ProxyObject.class, "hasMember") {
 
         @Override
-        @TruffleBoundary
+        @TruffleBoundary(allowInlining = true)
         protected Object executeImpl(Object proxy, Object[] arguments) {
-            return ((ProxyObject) proxy).hasMember((String) arguments[ARGUMENT_OFFSET]);
+            return api.callProxyObjectHasMember(proxy, (String) arguments[ARGUMENT_OFFSET]);
         }
     }.getCallTarget();
 
     final CallTarget asTimezone = new GuestToHostRootNode(ProxyTimeZone.class, "asTimeZone") {
 
         @Override
-        @TruffleBoundary
+        @TruffleBoundary(allowInlining = true)
         protected Object executeImpl(Object proxy, Object[] arguments) {
-            ZoneId zone = ((ProxyTimeZone) proxy).asTimeZone();
+            ZoneId zone = api.callProxyTimeZoneAsTimeZone(proxy);
             if (zone == null) {
                 throw CompilerDirectives.shouldNotReachHere("The returned zone must not be null.");
             }
@@ -307,9 +319,9 @@ final class GuestToHostCodeCache {
     final CallTarget asDate = new GuestToHostRootNode(ProxyDate.class, "asDate") {
 
         @Override
-        @TruffleBoundary
+        @TruffleBoundary(allowInlining = true)
         protected Object executeImpl(Object proxy, Object[] arguments) {
-            LocalDate date = ((ProxyDate) proxy).asDate();
+            LocalDate date = api.callProxyDateAsDate(proxy);
             if (date == null) {
                 throw new AssertionError("The returned date must not be null.");
             }
@@ -320,9 +332,9 @@ final class GuestToHostCodeCache {
     final CallTarget asTime = new GuestToHostRootNode(ProxyTime.class, "asTime") {
 
         @Override
-        @TruffleBoundary
+        @TruffleBoundary(allowInlining = true)
         protected Object executeImpl(Object proxy, Object[] arguments) {
-            LocalTime time = ((ProxyTime) proxy).asTime();
+            LocalTime time = api.callProxyTimeAsTime(proxy);
             if (time == null) {
                 throw new AssertionError("The returned time must not be null.");
             }
@@ -333,9 +345,9 @@ final class GuestToHostCodeCache {
     final CallTarget asInstant = new GuestToHostRootNode(ProxyInstant.class, "asInstant") {
 
         @Override
-        @TruffleBoundary
+        @TruffleBoundary(allowInlining = true)
         protected Object executeImpl(Object proxy, Object[] arguments) {
-            Instant instant = ((ProxyInstant) proxy).asInstant();
+            Instant instant = api.callProxyInstantAsInstant(proxy);
             if (instant == null) {
                 throw new AssertionError("The returned instant must not be null.");
             }
@@ -346,9 +358,9 @@ final class GuestToHostCodeCache {
     final CallTarget asDuration = new GuestToHostRootNode(ProxyDuration.class, "asDuration") {
 
         @Override
-        @TruffleBoundary
+        @TruffleBoundary(allowInlining = true)
         protected Object executeImpl(Object proxy, Object[] arguments) {
-            Duration duration = ((ProxyDuration) proxy).asDuration();
+            Duration duration = api.callProxyDurationAsDuration(proxy);
             if (duration == null) {
                 throw new AssertionError("The returned duration must not be null.");
             }
@@ -359,28 +371,28 @@ final class GuestToHostCodeCache {
     final CallTarget getIterator = new GuestToHostRootNode(ProxyIterable.class, "getIterator") {
 
         @Override
-        @TruffleBoundary
+        @TruffleBoundary(allowInlining = true)
         protected Object executeImpl(Object proxy, Object[] arguments) {
-            return ((ProxyIterable) proxy).getIterator();
+            return api.callProxyIterableGetIterator(proxy);
         }
     }.getCallTarget();
 
     final CallTarget hasIteratorNextElement = new GuestToHostRootNode(ProxyIterator.class, "hasIteratorNextElement") {
 
         @Override
-        @TruffleBoundary
+        @TruffleBoundary(allowInlining = true)
         protected Object executeImpl(Object proxy, Object[] arguments) {
-            return ((ProxyIterator) proxy).hasNext();
+            return api.callProxyIteratorHasNext(proxy);
         }
     }.getCallTarget();
 
     final CallTarget getIteratorNextElement = new GuestToHostRootNode(ProxyIterator.class, "getIteratorNextElement") {
 
         @Override
-        @TruffleBoundary
+        @TruffleBoundary(allowInlining = true)
         protected Object executeImpl(Object proxy, Object[] arguments) throws StopIterationException, UnsupportedMessageException {
             try {
-                return ((ProxyIterator) proxy).getNext();
+                return api.callProxyIteratorGetNext(proxy);
             } catch (NoSuchElementException e) {
                 throw StopIterationException.create();
             } catch (UnsupportedOperationException e) {
@@ -392,27 +404,27 @@ final class GuestToHostCodeCache {
     final CallTarget hasHashEntry = new GuestToHostRootNode(ProxyHashMap.class, "hasEntry") {
 
         @Override
-        @TruffleBoundary
-        protected Object executeImpl(Object receiver, Object[] arguments) throws InteropException {
-            return ((ProxyHashMap) receiver).hasHashEntry((Value) arguments[ARGUMENT_OFFSET]);
+        @TruffleBoundary(allowInlining = true)
+        protected Object executeImpl(Object proxy, Object[] arguments) throws InteropException {
+            return api.callProxyHashMapHasHashEntry(proxy, arguments[ARGUMENT_OFFSET]);
         }
     }.getCallTarget();
 
     final CallTarget getHashSize = new GuestToHostRootNode(ProxyHashMap.class, "getSize") {
 
         @Override
-        @TruffleBoundary
-        protected Object executeImpl(Object receiver, Object[] arguments) throws InteropException {
-            return ((ProxyHashMap) receiver).getHashSize();
+        @TruffleBoundary(allowInlining = true)
+        protected Object executeImpl(Object proxy, Object[] arguments) throws InteropException {
+            return api.callProxyHashMapGetHashSize(proxy);
         }
     }.getCallTarget();
 
     final CallTarget getHashValue = new GuestToHostRootNode(ProxyHashMap.class, "getValue") {
         @Override
-        @TruffleBoundary
-        protected Object executeImpl(Object receiver, Object[] arguments) throws InteropException {
+        @TruffleBoundary(allowInlining = true)
+        protected Object executeImpl(Object proxy, Object[] arguments) throws InteropException {
             try {
-                return ((ProxyHashMap) receiver).getHashValue((Value) arguments[ARGUMENT_OFFSET]);
+                return api.callProxyHashMapGetHashValue(proxy, arguments[ARGUMENT_OFFSET]);
             } catch (UnsupportedOperationException e) {
                 throw UnsupportedMessageException.create();
             }
@@ -421,10 +433,10 @@ final class GuestToHostCodeCache {
 
     final CallTarget putHashEntry = new GuestToHostRootNode(ProxyHashMap.class, "putEntry") {
         @Override
-        @TruffleBoundary
-        protected Object executeImpl(Object receiver, Object[] arguments) throws InteropException {
+        @TruffleBoundary(allowInlining = true)
+        protected Object executeImpl(Object proxy, Object[] arguments) throws InteropException {
             try {
-                ((ProxyHashMap) receiver).putHashEntry((Value) arguments[ARGUMENT_OFFSET], (Value) arguments[ARGUMENT_OFFSET + 1]);
+                api.callProxyHashMapPutHashEntry(proxy, arguments[ARGUMENT_OFFSET], arguments[ARGUMENT_OFFSET + 1]);
                 return null;
             } catch (UnsupportedOperationException e) {
                 throw UnsupportedMessageException.create();
@@ -434,10 +446,10 @@ final class GuestToHostCodeCache {
 
     final CallTarget removeHashEntry = new GuestToHostRootNode(ProxyHashMap.class, "removeEntry") {
         @Override
-        @TruffleBoundary
-        protected Object executeImpl(Object receiver, Object[] arguments) throws InteropException {
+        @TruffleBoundary(allowInlining = true)
+        protected Object executeImpl(Object proxy, Object[] arguments) throws InteropException {
             try {
-                return ((ProxyHashMap) receiver).removeHashEntry((Value) arguments[ARGUMENT_OFFSET]);
+                return api.callProxyHashMapRemoveHashEntry(proxy, arguments[ARGUMENT_OFFSET]);
             } catch (UnsupportedOperationException e) {
                 throw UnsupportedMessageException.create();
             }
@@ -446,9 +458,17 @@ final class GuestToHostCodeCache {
 
     final CallTarget getHashEntriesIterator = new GuestToHostRootNode(ProxyHashMap.class, "getEntriesIterator") {
         @Override
-        @TruffleBoundary
-        protected Object executeImpl(Object receiver, Object[] arguments) throws InteropException {
-            return ((ProxyHashMap) receiver).getHashEntriesIterator();
+        @TruffleBoundary(allowInlining = true)
+        protected Object executeImpl(Object proxy, Object[] arguments) throws InteropException {
+            return api.callProxyHashMapGetEntriesIterator(proxy);
         }
     }.getCallTarget();
+}
+
+class GuestToHostCodeCacheBase {
+    final APIAccess api;
+
+    GuestToHostCodeCacheBase(APIAccess api) {
+        this.api = api;
+    }
 }

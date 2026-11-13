@@ -32,23 +32,27 @@ import java.util.List;
 import org.graalvm.nativeimage.Platform;
 import org.graalvm.nativeimage.c.CContext;
 
-import com.oracle.svm.core.util.VMError;
+import com.oracle.svm.shared.util.VMError;
 
 public class PosixDirectives implements CContext.Directives {
     private static final String[] commonLibs = new String[]{
                     "<dlfcn.h>",
+                    "<dirent.h>",
                     "<fcntl.h>",
                     "<limits.h>",
                     "<locale.h>",
                     "<pthread.h>",
                     "<pwd.h>",
+                    "<semaphore.h>",
                     "<signal.h>",
                     "<errno.h>",
+                    "<sys/file.h>",
                     "<sys/mman.h>",
                     "<sys/resource.h>",
                     "<sys/stat.h>",
                     "<sys/time.h>",
                     "<sys/times.h>",
+                    "<sys/types.h>",
                     "<sys/utsname.h>",
                     "<time.h>",
                     "<unistd.h>",
@@ -57,6 +61,7 @@ public class PosixDirectives implements CContext.Directives {
     private static final String[] darwinLibs = new String[]{
                     "<Foundation/Foundation.h>",
                     "<mach/mach.h>",
+                    "<mach/semaphore.h>",
                     "<mach/mach_time.h>",
                     "<mach-o/dyld.h>",
                     "<sys/sysctl.h>",

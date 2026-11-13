@@ -20,13 +20,11 @@
  * or visit www.oracle.com if you need additional information or have any
  * questions.
  */
-
 package com.oracle.truffle.espresso.analysis.hierarchy;
 
 import com.oracle.truffle.api.Assumption;
 import com.oracle.truffle.api.CompilerAsserts;
 import com.oracle.truffle.api.Truffle;
-import com.oracle.truffle.api.utilities.NeverValidAssumption;
 
 /**
  * Represents an immutable value whose correctness is determined by the assumption. The value is
@@ -52,7 +50,7 @@ public final class AssumptionGuardedValue<T> {
 
     public static <T> AssumptionGuardedValue<T> createInvalid() {
         CompilerAsserts.neverPartOfCompilation();
-        return new AssumptionGuardedValue<>(NeverValidAssumption.INSTANCE, null);
+        return new AssumptionGuardedValue<>(Assumption.NEVER_VALID, null);
     }
 
     private AssumptionGuardedValue(Assumption hasValue, T value) {

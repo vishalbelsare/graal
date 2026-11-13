@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2014, 2018, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2014, 2022, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * The Universal Permissive License (UPL), Version 1.0
@@ -49,6 +49,7 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 
+import com.oracle.truffle.api.CompilerDirectives;
 import org.junit.BeforeClass;
 import org.junit.Ignore;
 import org.junit.Test;
@@ -152,6 +153,7 @@ public class ThreadSafetyTest {
         int execute(VirtualFrame frame) {
             boolean replace = random.nextBoolean();
             if (replace) {
+                CompilerDirectives.transferToInterpreterAndInvalidate();
                 ValueNode newNode = this.replace(new OtherRewritingNode(child, random));
                 return newNode.execute(frame);
             }
@@ -173,6 +175,7 @@ public class ThreadSafetyTest {
         int execute(VirtualFrame frame) {
             boolean replace = random.nextBoolean();
             if (replace) {
+                CompilerDirectives.transferToInterpreterAndInvalidate();
                 ValueNode newNode = this.replace(new RewritingNode(child, random));
                 return newNode.execute(frame);
             }

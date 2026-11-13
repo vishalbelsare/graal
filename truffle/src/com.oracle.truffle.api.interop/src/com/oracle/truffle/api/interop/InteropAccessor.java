@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2017, 2021, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2017, 2024, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * The Universal Permissive License (UPL), Version 1.0
@@ -45,15 +45,13 @@ import com.oracle.truffle.api.CompilerDirectives.TruffleBoundary;
 import com.oracle.truffle.api.impl.Accessor;
 import com.oracle.truffle.api.nodes.Node;
 
-@SuppressWarnings("deprecation")
 final class InteropAccessor extends Accessor {
 
     static final InteropAccessor ACCESSOR = new InteropAccessor();
-    static final LanguageSupport LANGUAGE = ACCESSOR.languageSupport();
+    static final EngineSupport ENGINE = ACCESSOR.engineSupport();
     static final ExceptionSupport EXCEPTION = ACCESSOR.exceptionSupport();
     static final InstrumentSupport INSTRUMENT = ACCESSOR.instrumentSupport();
     static final NodeSupport NODES = ACCESSOR.nodeSupport();
-    static final HostSupport HOST = ACCESSOR.hostSupport();
 
     private InteropAccessor() {
     }
@@ -118,6 +116,31 @@ final class InteropAccessor extends Accessor {
         @Override
         public Object createDefaultIterator(Object receiver) {
             return new ArrayIterator(receiver);
+        }
+
+        @Override
+        public Node createDispatchedInteropLibrary(int limit) {
+            return InteropLibrary.getFactory().createDispatched(limit);
+        }
+
+        @Override
+        public Node getUncachedInteropLibrary() {
+            return InteropLibrary.getUncached();
+        }
+
+        @Override
+        public long unboxPointer(Node library, Object value) {
+            InteropLibrary interop = (InteropLibrary) library;
+            if (!interop.isPointer(value)) {
+                CompilerDirectives.transferToInterpreterAndInvalidate();
+                throw new IllegalArgumentException("value is not an interop pointer");
+            }
+            try {
+                return interop.asPointer(value);
+            } catch (UnsupportedMessageException e) {
+                CompilerDirectives.transferToInterpreterAndInvalidate();
+                throw new IllegalArgumentException("value is not an interop pointer");
+            }
         }
     }
 

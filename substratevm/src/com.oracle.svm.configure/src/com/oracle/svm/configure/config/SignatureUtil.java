@@ -29,14 +29,19 @@ import java.util.List;
 
 import org.graalvm.nativeimage.hosted.Feature;
 
-import com.oracle.svm.core.annotate.AutomaticFeature;
-import com.oracle.svm.util.ModuleSupport;
+import com.oracle.svm.shared.util.ModuleSupport;
 
 import jdk.vm.ci.meta.JavaKind;
 import jdk.vm.ci.meta.MetaUtil;
 
 public class SignatureUtil {
+
+    public static final int MIN_SIGNATURE_LENGTH = "()".length();
+
     public static String[] toParameterTypes(String signature) {
+        if (signature.length() < MIN_SIGNATURE_LENGTH) {
+            throw new IllegalArgumentException("Signature too short: " + signature);
+        }
         List<String> list = new ArrayList<>();
         int position = 1;
         int arrayDimensions = 0;
@@ -75,6 +80,19 @@ public class SignatureUtil {
         return sb.append(')').toString();
     }
 
+    public static String toInternalSignature(Class<?>[] parameters) {
+        List<String> names;
+        if (parameters == null) {
+            names = List.of();
+        } else {
+            names = new ArrayList<>(parameters.length);
+            for (Class<?> parameter : parameters) {
+                names.add(parameter.getName());
+            }
+        }
+        return toInternalSignature(names);
+    }
+
     public static String toInternalClassName(String qualifiedForNameString) {
         assert qualifiedForNameString.indexOf('/') == -1 : "Requires qualified Java name, not internal representation";
         assert !qualifiedForNameString.endsWith("[]") : "Requires Class.forName syntax, for example '[Ljava.lang.String;'";
@@ -101,12 +119,11 @@ public class SignatureUtil {
     }
 }
 
-@AutomaticFeature
 class SignatureUtilFeature implements Feature {
     @Override
     public void afterRegistration(AfterRegistrationAccess access) {
         if (!access.getApplicationClassPath().isEmpty()) {
-            ModuleSupport.exportAndOpenPackageToClass("jdk.internal.vm.ci", "jdk.vm.ci.meta", false, SignatureUtil.class);
+            ModuleSupport.accessPackagesToClass(ModuleSupport.Access.OPEN, SignatureUtil.class, false, "jdk.internal.vm.ci", "jdk.vm.ci.meta");
         }
     }
 }

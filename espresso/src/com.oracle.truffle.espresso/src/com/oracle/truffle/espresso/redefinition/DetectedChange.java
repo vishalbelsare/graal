@@ -30,11 +30,12 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 
-import com.oracle.truffle.espresso.descriptors.Symbol;
+import com.oracle.truffle.espresso.classfile.ParserField;
+import com.oracle.truffle.espresso.classfile.ParserMethod;
+import com.oracle.truffle.espresso.descriptors.EspressoSymbols.Names;
 import com.oracle.truffle.espresso.impl.Field;
 import com.oracle.truffle.espresso.impl.Method;
-import com.oracle.truffle.espresso.impl.ParserField;
-import com.oracle.truffle.espresso.impl.ParserMethod;
+import com.oracle.truffle.espresso.impl.ObjectKlass;
 
 public final class DetectedChange {
     private final List<ParserField> addedStaticFields = new ArrayList<>();
@@ -46,6 +47,9 @@ public final class DetectedChange {
     private final Set<Method> unchangedMethods = new HashSet<>();
     private boolean classInitializerChanged;
     private Map<ParserField, Field> mappedCompatibleFields = new HashMap<>();
+    private ObjectKlass superKlass;
+    private ObjectKlass[] superInterfaces;
+    private boolean isChangedSuperClass;
 
     public void addNewField(ParserField parserField) {
         if (parserField.isStatic()) {
@@ -87,7 +91,7 @@ public final class DetectedChange {
 
     void addMethodBodyChange(Method oldMethod, ParserMethod newMethod) {
         changedMethodBodies.put(oldMethod, newMethod);
-        if (oldMethod.getName() == Symbol.Name._clinit_) {
+        if (oldMethod.getName() == Names._clinit_) {
             classInitializerChanged = true;
         }
     }
@@ -126,5 +130,29 @@ public final class DetectedChange {
 
     public boolean clinitChanged() {
         return classInitializerChanged;
+    }
+
+    public ObjectKlass getSuperKlass() {
+        return superKlass;
+    }
+
+    public ObjectKlass[] getSuperInterfaces() {
+        return superInterfaces;
+    }
+
+    public void addSuperKlass(ObjectKlass klass) {
+        superKlass = klass;
+    }
+
+    public void addSuperInterfaces(ObjectKlass[] interfaces) {
+        superInterfaces = interfaces;
+    }
+
+    public void markChangedSuperClass() {
+        isChangedSuperClass = true;
+    }
+
+    public boolean isChangedSuperClass() {
+        return isChangedSuperClass;
     }
 }

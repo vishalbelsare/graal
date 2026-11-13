@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2021, 2021, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2021, 2022, Oracle and/or its affiliates. All rights reserved.
  * Copyright (c) 2021, 2021, Alibaba Group Holding Limited. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
@@ -26,27 +26,27 @@
 
 package com.oracle.graal.pointsto.util;
 
-import static com.oracle.svm.common.option.CommonOptionParser.BooleanOptionFormat.PLUS_MINUS;
+import static com.oracle.svm.shared.option.CommonOptionParser.BooleanOptionFormat.PLUS_MINUS;
 
 import java.io.PrintStream;
 import java.util.ArrayList;
 import java.util.Arrays;
-import java.util.HashSet;
 import java.util.List;
-import java.util.ServiceLoader;
-import java.util.Set;
 import java.util.function.Predicate;
 
 import org.graalvm.collections.EconomicMap;
-import org.graalvm.compiler.options.OptionDescriptor;
-import org.graalvm.compiler.options.OptionDescriptors;
-import org.graalvm.compiler.options.OptionKey;
-import org.graalvm.compiler.options.OptionValues;
+import org.graalvm.collections.EconomicSet;
 
-import com.oracle.svm.common.option.CommonOptionParser;
-import com.oracle.svm.common.option.CommonOptionParser.BooleanOptionFormat;
-import com.oracle.svm.common.option.CommonOptionParser.OptionParseResult;
-import com.oracle.svm.common.option.UnsupportedOptionClassException;
+import com.oracle.svm.shared.option.CommonOptionParser;
+import com.oracle.svm.shared.option.CommonOptionParser.BooleanOptionFormat;
+import com.oracle.svm.shared.option.CommonOptionParser.OptionParseResult;
+import com.oracle.svm.shared.option.UnsupportedOptionClassException;
+
+import jdk.graal.compiler.options.OptionDescriptor;
+import jdk.graal.compiler.options.OptionDescriptors;
+import jdk.graal.compiler.options.OptionKey;
+import jdk.graal.compiler.options.OptionValues;
+import jdk.graal.compiler.options.OptionsContainer;
 
 public final class PointsToOptionParser {
 
@@ -62,7 +62,8 @@ public final class PointsToOptionParser {
 
     private PointsToOptionParser() {
         ClassLoader appClassLoader = PointsToOptionParser.class.getClassLoader();
-        CommonOptionParser.collectOptions(ServiceLoader.load(OptionDescriptors.class, appClassLoader), descriptor -> {
+        Iterable<OptionDescriptors> optionDescriptors = OptionsContainer.getDiscoverableOptions(appClassLoader);
+        CommonOptionParser.collectOptions(optionDescriptors, descriptor -> {
             String name = descriptor.getName();
             if (descriptor.getOptionKey() != null) {
                 OptionDescriptor existing = allAnalysisOptions.put(name, descriptor);
@@ -73,16 +74,15 @@ public final class PointsToOptionParser {
         });
     }
 
-    public void setOptionValue(OptionKey<?> optionKey, Object value) {
-        if (optionValues == null) {
-            parse(new String[0]);
-        }
-        optionKey.update((EconomicMap<OptionKey<?>, Object>) optionValues.getMap(), value);
-    }
-
     public OptionValues parse(String[] args) {
         List<String> remainingArgs = new ArrayList<>();
-        Set<String> errors = new HashSet<>();
+        EconomicSet<String> errors = EconomicSet.create();
+        /*
+         * The standalone pointsto analysis can be programmatically invoked multiple times. Each
+         * invocation should have its own options which are parsed independently, but all
+         * invocations can share with the same allAnalysisOptions.
+         */
+        analysisValues.clear();
         for (String arg : args) {
             boolean isAnalysisOption = false;
             isAnalysisOption |= parseOption(CommonOptionParser.HOSTED_OPTION_PREFIX, allAnalysisOptions, analysisValues, PLUS_MINUS, errors, arg, System.out);
@@ -95,9 +95,10 @@ public final class PointsToOptionParser {
             AnalysisError.interruptAnalysis(String.format("Unknown options: %s", Arrays.toString(remainingArgs.toArray(new String[0]))));
         }
         if (!errors.isEmpty()) {
-            StringBuilder errMsg = new StringBuilder("Option format error:\n");
+            StringBuilder errMsg = new StringBuilder("Option format error:");
+            errMsg.append(System.lineSeparator());
             for (String err : errors) {
-                errMsg.append(err).append("\n");
+                errMsg.append(err).append(System.lineSeparator());
             }
             AnalysisError.interruptAnalysis(errMsg.toString());
         }
@@ -105,7 +106,7 @@ public final class PointsToOptionParser {
     }
 
     private static boolean parseOption(String optionPrefix, EconomicMap<String, OptionDescriptor> options, EconomicMap<OptionKey<?>, Object> valuesMap,
-                    BooleanOptionFormat booleanOptionFormat, Set<String> errors, String arg, PrintStream out) {
+                    BooleanOptionFormat booleanOptionFormat, EconomicSet<String> errors, String arg, PrintStream out) {
         if (!arg.startsWith(optionPrefix)) {
             return false;
         }

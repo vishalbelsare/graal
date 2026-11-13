@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2015, 2021, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2015, 2024, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * The Universal Permissive License (UPL), Version 1.0
@@ -51,6 +51,7 @@ import com.oracle.truffle.api.TruffleOptions;
 import com.oracle.truffle.api.interop.ArityException;
 import com.oracle.truffle.api.interop.TruffleObject;
 import com.oracle.truffle.api.interop.UnsupportedTypeException;
+import com.oracle.truffle.api.nodes.Node;
 import com.oracle.truffle.host.HostAdapterFactory.AdapterResult;
 
 final class HostInteropReflect {
@@ -65,13 +66,11 @@ final class HostInteropReflect {
 
     @CompilerDirectives.TruffleBoundary
     static Class<?> findInnerClass(Class<?> clazz, String name) {
-        if (!TruffleOptions.AOT) { // GR-13208: SVM does not support Class.getClasses() yet
-            if (Modifier.isPublic(clazz.getModifiers())) {
-                for (Class<?> t : clazz.getClasses()) {
-                    // no support for non-static type members now
-                    if (isStaticTypeOrInterface(t) && t.getSimpleName().equals(name)) {
-                        return t;
-                    }
+        if (Modifier.isPublic(clazz.getModifiers())) {
+            for (Class<?> t : clazz.getClasses()) {
+                // no support for non-static type members now
+                if (isStaticTypeOrInterface(t) && t.getSimpleName().equals(name)) {
+                    return t;
                 }
             }
         }
@@ -188,20 +187,14 @@ final class HostInteropReflect {
     static boolean isInvokable(HostObject object, Class<?> clazz, String name, boolean onlyStatic) {
         HostClassDesc classDesc = HostClassDesc.forClass(object.context, clazz);
         HostMethodDesc foundMethod = classDesc.lookupMethod(name, onlyStatic);
-        if (foundMethod != null) {
-            return true;
-        } else if (isSignature(name)) {
-            foundMethod = classDesc.lookupMethodBySignature(name, onlyStatic);
-            if (foundMethod != null) {
-                return true;
-            }
-        } else if (isJNIName(name)) {
-            foundMethod = classDesc.lookupMethodByJNIName(name, onlyStatic);
-            if (foundMethod != null) {
-                return true;
+        if (foundMethod == null) {
+            if (isSignature(name)) {
+                foundMethod = classDesc.lookupMethodBySignature(name, onlyStatic);
+            } else if (isJNIName(name)) {
+                foundMethod = classDesc.lookupMethodByJNIName(name, onlyStatic);
             }
         }
-        return false;
+        return foundMethod != null && foundMethod.isInvocable();
     }
 
     @TruffleBoundary
@@ -225,10 +218,7 @@ final class HostInteropReflect {
     }
 
     @TruffleBoundary
-    static Object newAdapterInstance(HostContext hostContext, Class<?> clazz, Object obj) throws IllegalArgumentException {
-        if (TruffleOptions.AOT) {
-            throw HostEngineException.unsupported(hostContext.access, "Unsupported target type.");
-        }
+    static Object newAdapterInstance(Node node, HostContext hostContext, Class<?> clazz, Object obj) throws IllegalArgumentException {
         HostClassDesc classDesc = HostClassDesc.forClass(hostContext, clazz);
         AdapterResult adapter = classDesc.getAdapter(hostContext);
         if (!adapter.isAutoConvertible()) {
@@ -237,7 +227,7 @@ final class HostInteropReflect {
         HostMethodDesc.SingleMethod adapterConstructor = adapter.getValueConstructor();
         Object[] arguments = new Object[]{obj};
         try {
-            return ((HostObject) HostExecuteNodeGen.getUncached().execute(adapterConstructor, null, arguments, hostContext)).obj;
+            return ((HostObject) HostExecuteNodeGen.getUncached().execute(node, adapterConstructor, null, arguments, hostContext)).obj;
         } catch (UnsupportedTypeException e) {
             throw HostInteropErrors.invalidExecuteArgumentType(hostContext, null, e.getSuppliedValues());
         } catch (ArityException e) {
@@ -268,15 +258,13 @@ final class HostInteropReflect {
         names.addAll(classDesc.getMethodNames(isStatic, includeInternal));
         if (isStatic) {
             names.add(STATIC_TO_CLASS);
-            if (!TruffleOptions.AOT) { // GR-13208: SVM does not support Class.getClasses() yet
-                if (Modifier.isPublic(clazz.getModifiers())) {
-                    // no support for non-static member types now
-                    for (Class<?> t : clazz.getClasses()) {
-                        if (!isStaticTypeOrInterface(t)) {
-                            continue;
-                        }
-                        names.add(t.getSimpleName());
+            if (Modifier.isPublic(clazz.getModifiers())) {
+                // no support for non-static member types now
+                for (Class<?> t : clazz.getClasses()) {
+                    if (!isStaticTypeOrInterface(t)) {
+                        continue;
                     }
+                    names.add(t.getSimpleName());
                 }
             }
         } else if (isClass) {

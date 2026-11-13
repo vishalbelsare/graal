@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2021, 2021, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2021, 2026, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -24,69 +24,104 @@
  */
 package com.oracle.svm.core.os;
 
-import java.io.File;
+import static com.oracle.svm.shared.Uninterruptible.CALLED_FROM_UNINTERRUPTIBLE_CODE;
 
-import org.graalvm.compiler.api.replacements.Fold;
+import org.graalvm.nativeimage.ImageSingletons;
 import org.graalvm.word.Pointer;
-import org.graalvm.word.SignedWord;
+import org.graalvm.word.PointerBase;
 import org.graalvm.word.UnsignedWord;
 import org.graalvm.word.WordBase;
 
-import com.oracle.svm.core.annotate.Uninterruptible;
+import com.oracle.svm.shared.Uninterruptible;
 import com.oracle.svm.core.os.AbstractRawFileOperationSupport.RawFileOperationSupportHolder;
 
 /**
- * Provides an OS-independent abstraction for operations on files. Most of the code is implemented
- * in a way that it can be used from uninterruptible code.
+ * Provides unbuffered, OS-independent operations on files. Most of the code is implemented in a way
+ * that it can be used from uninterruptible code.
  */
 public interface RawFileOperationSupport {
+    static boolean isPresent() {
+        return ImageSingletons.contains(RawFileOperationSupportHolder.class);
+    }
+
     /**
-     * Returns a {@link RawFileOperationSupport} singleton that uses little endian byte ordering.
+     * Returns a {@link RawFileOperationSupport} singleton that uses little endian byte order.
      */
-    @Fold
     static RawFileOperationSupport littleEndian() {
         return RawFileOperationSupportHolder.getLittleEndian();
     }
 
     /**
-     * Returns a {@link RawFileOperationSupport} singleton that uses big endian byte ordering.
+     * Returns a {@link RawFileOperationSupport} singleton that uses big endian byte order.
      */
-    @Fold
+    @Uninterruptible(reason = CALLED_FROM_UNINTERRUPTIBLE_CODE, mayBeInlined = true)
     static RawFileOperationSupport bigEndian() {
         return RawFileOperationSupportHolder.getBigEndian();
     }
 
     /**
-     * Returns a {@link RawFileOperationSupport} singleton that uses the native byte ordering of the
+     * Returns a {@link RawFileOperationSupport} singleton that uses the native byte order of the
      * underlying architecture.
      */
-    @Fold
+    @Uninterruptible(reason = CALLED_FROM_UNINTERRUPTIBLE_CODE, mayBeInlined = true)
     static RawFileOperationSupport nativeByteOrder() {
         return RawFileOperationSupportHolder.getNativeByteOrder();
     }
 
     /**
-     * Opens or creates a file with the specified {@link FileAccessMode access mode}.
+     * Tries to allocate a platform-dependent raw string for the given path. The returned value needs
+     * to be freed manually once it is no longer needed.
      *
-     * @return If the operation is successful, it returns the file descriptor. Otherwise, it returns
-     *         a value where {@link #isValid} will return false.
+     * @return If the allocation is successful, a non-null value is returned.
      */
-    RawFileDescriptor open(String filename, FileAccessMode mode);
+    RawFilePath allocatePath(String path);
 
     /**
-     * Opens or creates a file with the specified {@link FileAccessMode access mode}.
+     * Creates a file with the specified {@link FileCreationMode creation} and {@link FileAccessMode
+     * access modes}. The filename is passed to the operating system without Java path normalization.
      *
      * @return If the operation is successful, it returns the file descriptor. Otherwise, it returns
      *         a value where {@link #isValid} will return false.
      */
-    RawFileDescriptor open(File file, FileAccessMode mode);
+    RawFileDescriptor create(String filename, FileCreationMode creationMode, FileAccessMode accessMode);
+
+    /**
+     * Creates a file with the specified {@link FileCreationMode creation} and {@link FileAccessMode
+     * access modes}.
+     *
+     * @return If the operation is successful, it returns the file descriptor. Otherwise, it returns
+     *         a value where {@link #isValid} will return false.
+     */
+    @Uninterruptible(reason = CALLED_FROM_UNINTERRUPTIBLE_CODE, mayBeInlined = true)
+    RawFileDescriptor create(RawFilePath path, FileCreationMode creationMode, FileAccessMode accessMode);
+
+    /** Returns the path to the platform-specific temporary directory. */
+    String getTempDirectory();
+
+    /**
+     * Opens a file with the specified {@link FileAccessMode access mode}. The filename is passed to
+     * the operating system without Java path normalization.
+     *
+     * @return If the operation is successful, it returns the file descriptor. Otherwise, it returns
+     *         a value where {@link #isValid} will return false.
+     */
+    RawFileDescriptor open(String filename, FileAccessMode accessMode);
+
+    /**
+     * Opens a file with the specified {@link FileAccessMode access mode}.
+     *
+     * @return If the operation is successful, it returns the file descriptor. Otherwise, it returns
+     *         a value where {@link #isValid} will return false.
+     */
+    @Uninterruptible(reason = CALLED_FROM_UNINTERRUPTIBLE_CODE, mayBeInlined = true)
+    RawFileDescriptor open(RawFilePath path, FileAccessMode accessMode);
 
     /**
      * Checks if a file descriptor is valid or if it represents an error value.
      *
      * @return true if the file descriptor is valid, false otherwise.
      */
-    @Uninterruptible(reason = "Called from uninterruptible code.", mayBeInlined = true)
+    @Uninterruptible(reason = CALLED_FROM_UNINTERRUPTIBLE_CODE, mayBeInlined = true)
     boolean isValid(RawFileDescriptor fd);
 
     /**
@@ -94,7 +129,7 @@ public interface RawFileOperationSupport {
      *
      * @return true if the file descriptor was closed by the call, false otherwise.
      */
-    @Uninterruptible(reason = "Called from uninterruptible code.", mayBeInlined = true)
+    @Uninterruptible(reason = CALLED_FROM_UNINTERRUPTIBLE_CODE, mayBeInlined = true)
     boolean close(RawFileDescriptor fd);
 
     /**
@@ -103,8 +138,8 @@ public interface RawFileOperationSupport {
      * @return If the operation is successful, it returns the size of the file. Otherwise, it
      *         returns a value less than 0.
      */
-    @Uninterruptible(reason = "Called from uninterruptible code.", mayBeInlined = true)
-    SignedWord size(RawFileDescriptor fd);
+    @Uninterruptible(reason = CALLED_FROM_UNINTERRUPTIBLE_CODE, mayBeInlined = true)
+    long size(RawFileDescriptor fd);
 
     /**
      * Gets the current file position within a file.
@@ -112,23 +147,23 @@ public interface RawFileOperationSupport {
      * @return If the operation is successful, it returns the current file position. Otherwise, it
      *         returns a value less than 0.
      */
-    @Uninterruptible(reason = "Called from uninterruptible code.", mayBeInlined = true)
-    SignedWord position(RawFileDescriptor fd);
+    @Uninterruptible(reason = CALLED_FROM_UNINTERRUPTIBLE_CODE, mayBeInlined = true)
+    long position(RawFileDescriptor fd);
 
     /**
      * Sets the current file position within a file.
      *
      * @return true if the file position was updated to the given value, false otherwise.
      */
-    @Uninterruptible(reason = "Called from uninterruptible code.", mayBeInlined = true)
-    boolean seek(RawFileDescriptor fd, SignedWord position);
+    @Uninterruptible(reason = CALLED_FROM_UNINTERRUPTIBLE_CODE, mayBeInlined = true)
+    boolean seek(RawFileDescriptor fd, long position);
 
     /**
      * Writes data to the current file position and advances the file position.
      *
      * @return true if the data was written, false otherwise.
      */
-    @Uninterruptible(reason = "Called from uninterruptible code.", mayBeInlined = true)
+    @Uninterruptible(reason = CALLED_FROM_UNINTERRUPTIBLE_CODE, mayBeInlined = true)
     boolean write(RawFileDescriptor fd, Pointer data, UnsignedWord size);
 
     /**
@@ -144,7 +179,7 @@ public interface RawFileOperationSupport {
      *
      * @return true if the data was written, false otherwise.
      */
-    @Uninterruptible(reason = "Called from uninterruptible code.", mayBeInlined = true)
+    @Uninterruptible(reason = CALLED_FROM_UNINTERRUPTIBLE_CODE, mayBeInlined = true)
     boolean writeBoolean(RawFileDescriptor fd, boolean data);
 
     /**
@@ -152,44 +187,62 @@ public interface RawFileOperationSupport {
      *
      * @return true if the data was written, false otherwise.
      */
-    @Uninterruptible(reason = "Called from uninterruptible code.", mayBeInlined = true)
+    @Uninterruptible(reason = CALLED_FROM_UNINTERRUPTIBLE_CODE, mayBeInlined = true)
     boolean writeByte(RawFileDescriptor fd, byte data);
 
     /**
-     * Writes a short value in the specified byte ordering to the current file position and advances
+     * Writes a short value in the specified byte order to the current file position and advances
      * the file position.
      *
      * @return true if the data was written, false otherwise.
      */
-    @Uninterruptible(reason = "Called from uninterruptible code.", mayBeInlined = true)
+    @Uninterruptible(reason = CALLED_FROM_UNINTERRUPTIBLE_CODE, mayBeInlined = true)
     boolean writeShort(RawFileDescriptor fd, short data);
 
     /**
-     * Writes a char value in the specified byte ordering to the current file position and advances
-     * the file position.
+     * Writes a char value in the specified byte order to the current file position and advances the
+     * file position.
      *
      * @return true if the data was written, false otherwise.
      */
-    @Uninterruptible(reason = "Called from uninterruptible code.", mayBeInlined = true)
+    @Uninterruptible(reason = CALLED_FROM_UNINTERRUPTIBLE_CODE, mayBeInlined = true)
     boolean writeChar(RawFileDescriptor fd, char data);
 
     /**
-     * Writes an integer value in the specified byte ordering to the current file position and
-     * advances the file position.
-     *
-     * @return true if the data was written, false otherwise.
-     */
-    @Uninterruptible(reason = "Called from uninterruptible code.", mayBeInlined = true)
-    boolean writeInt(RawFileDescriptor fd, int data);
-
-    /**
-     * Writes a long value in the specified byte ordering to the current file position and advances
+     * Writes an integer value in the specified byte order to the current file position and advances
      * the file position.
      *
      * @return true if the data was written, false otherwise.
      */
-    @Uninterruptible(reason = "Called from uninterruptible code.", mayBeInlined = true)
+    @Uninterruptible(reason = CALLED_FROM_UNINTERRUPTIBLE_CODE, mayBeInlined = true)
+    boolean writeInt(RawFileDescriptor fd, int data);
+
+    /**
+     * Writes a long value in the specified byte order to the current file position and advances the
+     * file position.
+     *
+     * @return true if the data was written, false otherwise.
+     */
+    @Uninterruptible(reason = CALLED_FROM_UNINTERRUPTIBLE_CODE, mayBeInlined = true)
     boolean writeLong(RawFileDescriptor fd, long data);
+
+    /**
+     * Writes a float value in the specified byte order to the current file position and advances
+     * the file position.
+     *
+     * @return true if the data was written, false otherwise.
+     */
+    @Uninterruptible(reason = CALLED_FROM_UNINTERRUPTIBLE_CODE, mayBeInlined = true)
+    boolean writeFloat(RawFileDescriptor fd, float data);
+
+    /**
+     * Writes a double value in the specified byte order to the current file position and advances
+     * the file position.
+     *
+     * @return true if the data was written, false otherwise.
+     */
+    @Uninterruptible(reason = CALLED_FROM_UNINTERRUPTIBLE_CODE, mayBeInlined = true)
+    boolean writeDouble(RawFileDescriptor fd, double data);
 
     /**
      * Reads up to bufferSize bytes of data from to the current file position and advances the file
@@ -198,23 +251,34 @@ public interface RawFileOperationSupport {
      * @return If the operation is successful, it returns the number of read bytes. Otherwise, it
      *         returns a negative value.
      */
-    @Uninterruptible(reason = "Called from uninterruptible code.", mayBeInlined = true)
-    SignedWord read(RawFileDescriptor fd, Pointer buffer, UnsignedWord bufferSize);
+    @Uninterruptible(reason = CALLED_FROM_UNINTERRUPTIBLE_CODE, mayBeInlined = true)
+    long read(RawFileDescriptor fd, Pointer buffer, UnsignedWord bufferSize);
 
     /**
-     * OS-specific signed value that represents a file descriptor. It is OS-specific which values
-     * represent valid file descriptors and which values represent error values, see
+     * OS-specific word-sized value that represents a file descriptor or handle. It is OS-specific
+     * which values represent valid descriptors and which values represent error values, see
      * {@link RawFileOperationSupport#isValid}.
      */
     interface RawFileDescriptor extends WordBase {
     }
 
     /**
-     * The file access modes that can be used when opening/creating a file.
+     * OS-specific pointer value that represents a raw path string. The concrete string encoding is
+     * platform-specific.
      */
+    interface RawFilePath extends PointerBase {
+    }
+
+    enum FileCreationMode {
+        /** Create the file if it doesn't exist. Fail if it already exists. */
+        CREATE,
+        /** Create the file if it doesn't exist. If it already exists, then truncate the file. */
+        CREATE_OR_REPLACE,
+    }
+
     enum FileAccessMode {
         READ,
         READ_WRITE,
-        WRITE
+        WRITE,
     }
 }

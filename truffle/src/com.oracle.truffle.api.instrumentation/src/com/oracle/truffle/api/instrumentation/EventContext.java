@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2016, 2020, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2016, 2026, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * The Universal Permissive License (UPL), Version 1.0
@@ -51,7 +51,6 @@ import com.oracle.truffle.api.CompilerDirectives.CompilationFinal;
 import com.oracle.truffle.api.TruffleLanguage;
 import com.oracle.truffle.api.TruffleLanguage.Env;
 import com.oracle.truffle.api.frame.VirtualFrame;
-import com.oracle.truffle.api.instrumentation.InstrumentableNode.WrapperNode;
 import com.oracle.truffle.api.interop.InteropLibrary;
 import com.oracle.truffle.api.interop.InvalidArrayIndexException;
 import com.oracle.truffle.api.interop.UnknownIdentifierException;
@@ -142,7 +141,7 @@ public final class EventContext {
      */
     public boolean hasTag(Class<? extends Tag> tag) {
         if (tag == null) {
-            CompilerDirectives.transferToInterpreter();
+            CompilerDirectives.transferToInterpreterAndInvalidate();
             throw new NullPointerException();
         }
         Node node = getInstrumentedNode();
@@ -210,10 +209,8 @@ public final class EventContext {
      *
      * @since 0.12
      */
-    @SuppressWarnings("deprecation")
     public Node getInstrumentedNode() {
-        WrapperNode wrapper = probeNode.findWrapper();
-        return wrapper != null ? wrapper.getDelegateNode() : null;
+        return (Node) probeNode.findInstrumentableNode();
     }
 
     /**
@@ -300,9 +297,15 @@ public final class EventContext {
      * cannot be used on multiple threads concurrently. It can be thrown on a different thread only
      * after the unwind finishes on the last thread.
      * <p>
-     * Usage example of forced return: {@link UnwindInstrumentationReturnSnippets#onCreate}
+     * Usage example of forced return:
+     *
+     * {@snippet file="com/oracle/truffle/api/instrumentation/EventContext.java"
+     * region="UnwindInstrumentationReturnSnippets#onCreate"}
      * <p>
-     * Usage example of reenter: {@link UnwindInstrumentationReenterSnippets#onCreate}
+     * Usage example of reenter:
+     * 
+     * {@snippet file="com/oracle/truffle/api/instrumentation/EventContext.java"
+     * region="UnwindInstrumentationReenterSnippets#onCreate"}
      *
      * @param info an info that is passed into
      *            {@link ExecutionEventListener#onUnwind(EventContext, VirtualFrame, Object)} or
@@ -315,45 +318,6 @@ public final class EventContext {
     @SuppressWarnings("static-method")
     public ThreadDeath createUnwind(Object info, EventBinding<?> unwindBinding) {
         return new UnwindException(info, unwindBinding);
-    }
-
-    /**
-     * Creates a runtime exception that when thrown is observable to the guest language application.
-     * Be aware that errors propagated to the guest application may significantly alter the behavior
-     * of the guest application influencing other instruments which may limit them ability of them
-     * to be composed. If not wrapped using this method any exception caused by an execution event
-     * instrumentation is printed to the {@link TruffleInstrument.Env#out() error stream}.
-     * <p>
-     * Propagating runtime errors is supported in the following events:
-     * <ul>
-     * <li>{@link ExecutionEventNode#onEnter(VirtualFrame) onEnter}
-     * <li>{@link ExecutionEventNode#onInputValue(VirtualFrame, EventContext, int, Object)
-     * onInputValue}
-     * <li>{@link ExecutionEventNode#onReturnExceptional(VirtualFrame, Throwable)
-     * onReturnExceptional}
-     * <li>{@link ExecutionEventNode#onReturnValue(VirtualFrame, Object) onReturnValue}
-     * <li>{@link ExecutionEventNode#onUnwind(VirtualFrame, Object) onUnwind}
-     * <li>{@link ExecutionEventNode#onDispose(VirtualFrame) onDispose}
-     * </ul>
-     * Errors may not be propagated in {@link ExecutionEventNodeFactory#create(EventContext)} as
-     * this may lead to unstable ASTs.
-     * <p>
-     * If an error is propagated all other installed execution event listeners will continue to be
-     * notified. If multiple listeners propagate errors then the first error will be propagated and
-     * later errors will be attached to the first as {@link Exception#addSuppressed(Throwable)
-     * suppressed} exception. The notification order relates to the order the bindings were
-     * installed.
-     * <p>
-     *
-     * @param e the exception to propagate.
-     * @deprecated No substitute. Runtime exceptions can now be thrown directly and will be
-     *             observable by the guest language application.
-     * @since 20.0
-     */
-    @Deprecated
-    @SuppressWarnings("static-method")
-    public RuntimeException createError(RuntimeException e) {
-        return e;
     }
 
     /** @since 0.12 */
@@ -489,9 +453,9 @@ public final class EventContext {
 
 class UnwindInstrumentationReturnSnippets extends TruffleInstrument {
 
-    // @formatter:off
+    // @formatter:off // @replace regex='.*' replacement=''
     @Override
-    // BEGIN: UnwindInstrumentationReturnSnippets#onCreate
+    // @start region="UnwindInstrumentationReturnSnippets#onCreate"
     protected void onCreate(TruffleInstrument.Env env) {
         // Register a listener that checks the return value to all call nodes
         // If the return value is not 42, it forces to return 42.
@@ -516,15 +480,15 @@ class UnwindInstrumentationReturnSnippets extends TruffleInstrument {
                                                 VirtualFrame f, Throwable ex) { }
             });
     }
-    // END: UnwindInstrumentationReturnSnippets#onCreate
-    // @formatter:on
+    // @end region="UnwindInstrumentationReturnSnippets#onCreate"
+    // @formatter:on // @replace regex='.*' replacement=''
 }
 
 class UnwindInstrumentationReenterSnippets extends TruffleInstrument {
 
-    // @formatter:off
+    // @formatter:off // @replace regex='.*' replacement=''
     @Override
-    // BEGIN: UnwindInstrumentationReenterSnippets#onCreate
+    // @start region="UnwindInstrumentationReenterSnippets#onCreate"
     protected void onCreate(TruffleInstrument.Env env) {
         // Two event bindings are created: one for reenter, one for unwind
 
@@ -565,7 +529,7 @@ class UnwindInstrumentationReenterSnippets extends TruffleInstrument {
                                                 VirtualFrame f, Throwable ex) { }
             });
     }
-    // END: UnwindInstrumentationReenterSnippets#onCreate
-    // @formatter:on
+    // @end region="UnwindInstrumentationReenterSnippets#onCreate"
+    // @formatter:on // @replace regex='.*' replacement=''
     // Checkstyle: resume
 }

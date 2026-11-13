@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2016, 2019, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2016, 2024, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * The Universal Permissive License (UPL), Version 1.0
@@ -564,6 +564,21 @@ public class SourceSectionFilterTest extends AbstractPolyglotTest {
         SourceSectionFilter.newBuilder().columnIn(3, -1);
     }
 
+    @Test(expected = IllegalArgumentException.class)
+    public void testTagsFail1() {
+        SourceSectionFilter.newBuilder().tagIs((Class<?>[]) null);
+    }
+
+    @Test(expected = IllegalArgumentException.class)
+    public void testTagsFail2() {
+        SourceSectionFilter.newBuilder().tagIs((Class<?>) null);
+    }
+
+    @Test(expected = IllegalArgumentException.class)
+    public void testTagsFail3() {
+        SourceSectionFilter.newBuilder().tagIs(StandardTags.StatementTag.class, null);
+    }
+
     @Test
     public void testMimeType() {
         String src = "line1\nline2\nline3\nline4";
@@ -940,6 +955,24 @@ public class SourceSectionFilterTest extends AbstractPolyglotTest {
     }
 
     @Test
+    public void testAvailableSections() throws Exception {
+        SourceSectionFilter availableFilter = SourceSectionFilter.newBuilder().sourceSectionAvailableOnly(true).build();
+        // Available-only filter instruments available source sections
+        Assert.assertTrue(isInstrumented(availableFilter, null, source()));
+
+        SourceSection unavailableSourceSection = Source.newBuilder(InstrumentationTestLanguage.ID, "foo", "sampleSource1").build().createUnavailableSection();
+        Node unavailableNode = createNode(unavailableSourceSection);
+
+        // Available-only filter does not instrument unavailable or null source sections
+        Assert.assertFalse(isInstrumented(availableFilter, null, unavailableNode));
+        Assert.assertFalse(isInstrumented(availableFilter, null, null));
+
+        // Any root source section does not affect available filter
+        Assert.assertTrue(isInstrumented(availableFilter, new SourceSectionRootNode(null, null), source()));
+        Assert.assertTrue(isInstrumented(availableFilter, new SourceSectionRootNode(unavailableSourceSection, null), source()));
+    }
+
+    @Test
     public void testComplexFilter() {
         Source sampleSource1 = Source.newBuilder(InstrumentationTestLanguage.ID, "line1\nline2\nline3\nline4", "sampleSource1").mimeType("text/mime2").build();
         Node root = createNode(sampleSource1.createSection(0, 23));
@@ -1032,6 +1065,10 @@ public class SourceSectionFilterTest extends AbstractPolyglotTest {
     @ProvidedTags({StandardTags.RootTag.class})
     public static class ProvidesTagLanguage extends ProxyLanguage {
         static final String ID = "SourceSectionFilterTest_ProvidesTagLanguage";
+
+        public ProvidesTagLanguage() {
+            wrapper = false;
+        }
 
         @Override
         protected CallTarget parse(ParsingRequest request) throws Exception {

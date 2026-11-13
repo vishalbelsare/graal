@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2012, 2021, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2012, 2026, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * The Universal Permissive License (UPL), Version 1.0
@@ -65,7 +65,7 @@ public class NodeData extends Template implements Comparable<NodeData> {
     private final List<NodeData> enclosingNodes = new ArrayList<>();
     private NodeData declaringNode;
 
-    private final TypeSystemData typeSystem;
+    private TypeSystemData typeSystem;
     private final List<NodeChildData> children;
     private final List<NodeExecutionData> childExecutions;
     private final List<NodeFieldData> fields;
@@ -83,6 +83,15 @@ public class NodeData extends Template implements Comparable<NodeData> {
     private boolean generateIntrospection;
     private boolean generateStatistics;
     private boolean generateAOT;
+    private boolean generateInline;
+    private boolean generateUncached;
+    private boolean generateCached = true;
+    private boolean defaultInlineCached;
+
+    /* Execution metadata configured by OperationProxy.Proxyable. */
+    private boolean bindFrame = true;
+    private boolean bindBytecodeNode;
+    private boolean bindBytecodeIndex;
 
     private boolean generateTraceOnEnter;
     private boolean generateTraceOnReturn;
@@ -91,13 +100,21 @@ public class NodeData extends Template implements Comparable<NodeData> {
     private boolean reportPolymorphism;
     private boolean isUncachable;
     private boolean isNodeBound;
-    private boolean generateUncached;
+    private boolean generatePackagePrivate;
+
+    private double activationProbability = 1.0d;
+
     private Set<String> allowedCheckedExceptions;
     private Map<CacheExpression, String> sharedCaches = Collections.emptyMap();
     private ExecutableTypeData polymorphicExecutable;
 
-    public NodeData(ProcessorContext context, TypeElement type, TypeSystemData typeSystem, boolean generateFactory, boolean generateUncached) {
+    private final NodeData parsingParent;
+    private List<SpecializationData> reachableSpecializations;
+
+    @SuppressWarnings("this-escape")
+    public NodeData(ProcessorContext context, NodeData inliningParent, TypeElement type, TypeSystemData typeSystem, boolean generateFactory, boolean generateUncached, boolean generatePackagePrivate) {
         super(context, type, null);
+        this.parsingParent = inliningParent;
         this.nodeId = ElementUtils.getSimpleName(type);
         this.typeSystem = typeSystem;
         this.fields = new ArrayList<>();
@@ -107,6 +124,82 @@ public class NodeData extends Template implements Comparable<NodeData> {
         this.thisExecution.getChild().setNode(this);
         this.generateFactory = generateFactory;
         this.generateUncached = generateUncached;
+        this.generatePackagePrivate = generatePackagePrivate;
+    }
+
+    public double getActivationProbability() {
+        return activationProbability;
+    }
+
+    public void setActivationProbability(double activationProbability) {
+        this.activationProbability = activationProbability;
+    }
+
+    public List<SpecializationData> getReachableSpecializations() {
+        if (reachableSpecializations == null) {
+            List<SpecializationData> reachable = new ArrayList<>();
+            for (SpecializationData specialization : getSpecializations()) {
+                if (specialization.isReachable() &&   //
+                                (specialization.isSpecialized()   //
+                                                || (specialization.isFallback() && specialization.getMethod() != null))) {
+                    reachable.add(specialization);
+                }
+            }
+            return reachable;
+        }
+        return reachableSpecializations;
+    }
+
+    public void setReachableSpecializations(List<SpecializationData> reachableSpecializations) {
+        this.reachableSpecializations = reachableSpecializations;
+    }
+
+    public NodeData getParsingParent() {
+        return parsingParent;
+    }
+
+    public boolean shouldInlineByDefault() {
+        return isGenerateInline() || isDefaultInlineCached();
+    }
+
+    public boolean isDefaultInlineCached() {
+        return defaultInlineCached;
+    }
+
+    public void setDefaultInlineCached(boolean defaultInlineCached) {
+        this.defaultInlineCached = defaultInlineCached;
+    }
+
+    public void setGenerateCached(boolean generateCached) {
+        this.generateCached = generateCached;
+    }
+
+    public boolean isBindFrame() {
+        return bindFrame;
+    }
+
+    public void setBindFrame(boolean bindFrame) {
+        this.bindFrame = bindFrame;
+    }
+
+    public boolean isBindBytecodeNode() {
+        return bindBytecodeNode;
+    }
+
+    public void setBindBytecodeNode(boolean bindBytecodeNode) {
+        this.bindBytecodeNode = bindBytecodeNode;
+    }
+
+    public boolean isBindBytecodeIndex() {
+        return bindBytecodeIndex;
+    }
+
+    public void setBindBytecodeIndex(boolean bindBytecodeIndex) {
+        this.bindBytecodeIndex = bindBytecodeIndex;
+    }
+
+    public boolean isGenerateCached() {
+        return generateCached;
     }
 
     public void setGenerateStatistics(boolean generateStatistics) {
@@ -125,8 +218,8 @@ public class NodeData extends Template implements Comparable<NodeData> {
         this.sharedCaches = sharedCaches;
     }
 
-    public NodeData(ProcessorContext context, TypeElement type) {
-        this(context, type, null, false, false);
+    public NodeData(ProcessorContext context, NodeData inliningParent, TypeElement type) {
+        this(context, inliningParent, type, null, false, false, false);
     }
 
     public void setNodeBound(boolean isNodeBound) {
@@ -153,6 +246,17 @@ public class NodeData extends Template implements Comparable<NodeData> {
      */
     public boolean isGenerateUncached() {
         return generateUncached;
+    }
+
+    public void setGeneratePackagePrivate(boolean generatePackagePrivate) {
+        this.generatePackagePrivate = generatePackagePrivate;
+    }
+
+    /**
+     * Returns true if the generated code should be package-private.
+     */
+    public boolean isGeneratePackagePrivate() {
+        return generatePackagePrivate;
     }
 
     /**
@@ -205,6 +309,14 @@ public class NodeData extends Template implements Comparable<NodeData> {
         this.generateTraceOnException = generateTraceOnException;
     }
 
+    public boolean isGenerateInline() {
+        return generateInline;
+    }
+
+    public void setGenerateInline(boolean generateInline) {
+        this.generateInline = generateInline;
+    }
+
     public boolean isFallbackReachable() {
         SpecializationData generic = getFallbackSpecialization();
         if (generic != null) {
@@ -230,54 +342,12 @@ public class NodeData extends Template implements Comparable<NodeData> {
         return childExecutions;
     }
 
-    public Set<TypeMirror> findSpecializedTypes(NodeExecutionData execution) {
-        Set<TypeMirror> foundTypes = new HashSet<>();
-        for (SpecializationData specialization : getSpecializations()) {
-            if (!specialization.isSpecialized()) {
-                continue;
-            }
-            List<Parameter> parameters = specialization.findByExecutionData(execution);
-            for (Parameter parameter : parameters) {
-                TypeMirror type = parameter.getType();
-                if (type == null) {
-                    throw new AssertionError();
-                }
-                foundTypes.add(type);
-            }
-        }
-        return foundTypes;
-    }
-
-    public Collection<TypeMirror> findSpecializedReturnTypes() {
-        Set<TypeMirror> foundTypes = new HashSet<>();
-        for (SpecializationData specialization : getSpecializations()) {
-            if (!specialization.isSpecialized()) {
-                continue;
-            }
-            foundTypes.add(specialization.getReturnType().getType());
-        }
-        return foundTypes;
-    }
-
     public int getExecutionCount() {
         return getChildExecutions().size();
     }
 
     public int getSignatureSize() {
         return getChildExecutions().size();
-    }
-
-    public boolean isFrameUsedByAnyGuard() {
-        for (SpecializationData specialization : specializations) {
-            if (!specialization.isReachable()) {
-                continue;
-            }
-
-            if (specialization.isFrameUsedByGuard()) {
-                return true;
-            }
-        }
-        return false;
     }
 
     public List<CreateCastData> getCasts() {
@@ -335,6 +405,10 @@ public class NodeData extends Template implements Comparable<NodeData> {
         return getTemplateType().asType();
     }
 
+    public Modifier getVisibility() {
+        return generatePackagePrivate ? null : ElementUtils.getVisibility(getTemplateType().getModifiers());
+    }
+
     public boolean needsFactory() {
         if (specializations == null) {
             return false;
@@ -359,30 +433,6 @@ public class NodeData extends Template implements Comparable<NodeData> {
             }
         }
         return true;
-    }
-
-    public NodeExecutionData findExecutionByExpression(String childNameExpression) {
-        String childName = childNameExpression;
-        int index = -1;
-
-        int start = childName.indexOf('[');
-        int end = childName.lastIndexOf(']');
-        if (start != -1 && end != -1 && start < end) {
-            try {
-                index = Integer.parseInt(childName.substring(start + 1, end));
-                childName = childName.substring(0, start);
-                childName = NodeExecutionData.createName(childName, index);
-            } catch (NumberFormatException e) {
-                // ignore
-            }
-        }
-
-        for (NodeExecutionData execution : childExecutions) {
-            if (execution.getName().equals(childName) && (execution.getChildArrayIndex() == -1 || execution.getChildArrayIndex() == index)) {
-                return execution;
-            }
-        }
-        return null;
     }
 
     public List<NodeData> getNodesWithFactories() {
@@ -479,21 +529,61 @@ public class NodeData extends Template implements Comparable<NodeData> {
         return null;
     }
 
-    public boolean needsRewrites(ProcessorContext context) {
-        int count = 0;
-        for (SpecializationData specialization : getSpecializations()) {
-            if (specialization.getMethod() == null) {
-                continue;
-            }
-            if (count == 1) {
+    private boolean forceSpecialize;
+
+    /**
+     * Enables force specialization even if node has a single specialization that would
+     * theoretically not require specialization. This is currently used if we generate boxing
+     * elimination quickenings that often have a single specialization but multiple boxing variants
+     * and we need to generate an executeAndSpecialize() method to integrate quickening.
+     */
+    public void setForceSpecialize(boolean enabled) {
+        this.forceSpecialize = enabled;
+    }
+
+    public boolean isForceSpecialize() {
+        return forceSpecialize;
+    }
+
+    /**
+     * Returns <code>true</code> if this node needs its own specialization routine. In other words
+     * whether we need to generate an executeAndSpecialize() method. Returns <code>false</code>
+     * otherwise.
+     */
+    public boolean needsSpecialize() {
+        List<SpecializationData> s = getReachableSpecializations();
+        if (s.isEmpty()) {
+            return false;
+        } else if (s.size() == 1) {
+            if (isForceSpecialize()) {
                 return true;
             }
-            if (specialization.needsRewrite(context)) {
-                return true;
-            }
-            count++;
+            return s.get(0).needsSpecialize();
+        } else {
+            // if a node has more than one specialization
+            // we always require a specialize
+            return true;
         }
-        return false;
+    }
+
+    /**
+     * Returns <code>true</code> if this node requires any profiling state, else <code>false</code>.
+     */
+    public boolean needsState() {
+        List<SpecializationData> s = getReachableSpecializations();
+        if (s.isEmpty()) {
+            // just for robustness, does not happen in practice
+            return false;
+        } else if (s.size() == 1) {
+            // even single specialization nodes may need state
+            // if they e.g. have use a @Cached annotation.
+            return s.get(0).needsState() || s.get(0).needsSpecialize();
+        } else {
+            // if a node has more than one specialization
+            // we always require state as we need to track
+            // the specialization active bits
+            return true;
+        }
     }
 
     public SpecializationData getFallbackSpecialization() {
@@ -507,6 +597,10 @@ public class NodeData extends Template implements Comparable<NodeData> {
 
     public TypeSystemData getTypeSystem() {
         return typeSystem;
+    }
+
+    public void setTypeSystem(TypeSystemData typeSystem) {
+        this.typeSystem = typeSystem;
     }
 
     @Override
@@ -591,11 +685,12 @@ public class NodeData extends Template implements Comparable<NodeData> {
         return children;
     }
 
-    public Collection<SpecializationData> computeUncachedSpecializations(List<SpecializationData> s) {
-        Set<SpecializationData> uncached = new LinkedHashSet<>(s);
-        // remove all replacable specializations
-        for (SpecializationData specialization : s) {
-            uncached.removeAll(specialization.getReplaces());
+    public Collection<SpecializationData> computeUncachedSpecializations(List<SpecializationData> allSpecializations) {
+        Set<SpecializationData> uncached = new LinkedHashSet<>(allSpecializations);
+        for (SpecializationData current : allSpecializations) {
+            if (current.isExcludeForUncached()) {
+                uncached.remove(current);
+            }
         }
         return uncached;
     }
@@ -684,6 +779,35 @@ public class NodeData extends Template implements Comparable<NodeData> {
         }
 
         return Arrays.asList(ElementUtils.getCommonSuperType(ProcessorContext.getInstance(), foundTypes));
+    }
+
+    public List<SpecializationData> findSpecializationsByName(Collection<String> methodNames) {
+        Set<String> specializationsLeft = new HashSet<>(methodNames);
+        List<SpecializationData> includedSpecializations = new ArrayList<>();
+        for (SpecializationData specialization : getReachableSpecializations()) {
+            if (specialization.getMethod() == null) {
+                continue;
+            }
+            String methodName = specialization.getMethodName();
+            if (specializationsLeft.contains(methodName)) {
+                includedSpecializations.add(specialization);
+                specializationsLeft.remove(methodName);
+            }
+            if (specializationsLeft.isEmpty()) {
+                break;
+            }
+        }
+        if (!specializationsLeft.isEmpty()) {
+            Set<String> availableNames = new HashSet<>();
+            for (SpecializationData specialization : getReachableSpecializations()) {
+                availableNames.add(specialization.getMethodName());
+            }
+            throw new IllegalArgumentException(
+                            String.format("Referenced specialization(s) with method names %s  not found for in type '%s'. Available names %s.", ElementUtils.getSimpleName(getTemplateType()),
+                                            specializationsLeft, availableNames));
+        }
+
+        return includedSpecializations;
     }
 
     public void setReportPolymorphism(boolean report) {

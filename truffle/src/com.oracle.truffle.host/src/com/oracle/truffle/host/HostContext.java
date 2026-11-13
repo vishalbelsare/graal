@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2017, 2021, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2017, 2023, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * The Universal Permissive License (UPL), Version 1.0
@@ -43,7 +43,6 @@ package com.oracle.truffle.host;
 import java.io.IOException;
 import java.lang.reflect.Array;
 import java.util.ArrayList;
-import java.util.Arrays;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
@@ -51,9 +50,12 @@ import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.function.Predicate;
 
-import org.graalvm.polyglot.PolyglotException;
+import org.graalvm.collections.EconomicSet;
+import org.graalvm.polyglot.Context;
+import org.graalvm.polyglot.HostAccess.MutableTargetMapping;
 import org.graalvm.polyglot.Value;
 import org.graalvm.polyglot.impl.AbstractPolyglotImpl.AbstractHostAccess;
+import org.graalvm.polyglot.impl.AbstractPolyglotImpl.AbstractValueDispatch;
 
 import com.oracle.truffle.api.CompilerDirectives;
 import com.oracle.truffle.api.CompilerDirectives.CompilationFinal;
@@ -63,22 +65,24 @@ import com.oracle.truffle.api.TruffleLanguage;
 import com.oracle.truffle.api.TruffleLanguage.ContextReference;
 import com.oracle.truffle.api.TruffleOptions;
 import com.oracle.truffle.api.dsl.Cached;
+import com.oracle.truffle.api.dsl.GenerateInline;
 import com.oracle.truffle.api.dsl.GenerateUncached;
+import com.oracle.truffle.api.dsl.NeverDefault;
 import com.oracle.truffle.api.dsl.Specialization;
 import com.oracle.truffle.api.interop.InteropLibrary;
 import com.oracle.truffle.api.interop.InvalidArrayIndexException;
 import com.oracle.truffle.api.interop.TruffleObject;
 import com.oracle.truffle.api.library.ExportLibrary;
 import com.oracle.truffle.api.library.ExportMessage;
-import com.oracle.truffle.api.nodes.ExplodeLoop;
 import com.oracle.truffle.api.nodes.Node;
+import com.oracle.truffle.api.strings.TruffleString;
 import com.oracle.truffle.host.HostAdapterFactory.AdapterResult;
-import com.oracle.truffle.host.HostContextFactory.ToGuestValueNodeGen;
 import com.oracle.truffle.host.HostLanguage.HostLanguageException;
 
 final class HostContext {
 
     @CompilationFinal Object internalContext;
+    @CompilationFinal Object internalLanguageContext;
     final Map<String, Class<?>> classCache = new HashMap<>();
     final Object topScope = new TopScopeObject(this);
     volatile HostClassLoader classloader;
@@ -87,10 +91,11 @@ final class HostContext {
     private Predicate<String> classFilter;
     private boolean hostClassLoadingAllowed;
     private boolean hostLookupAllowed;
+    private EconomicSet<MutableTargetMapping> mutableTargetMappings;
     final TruffleLanguage.Env env;
     final AbstractHostAccess access;
 
-    @SuppressWarnings("serial") final HostException stackoverflowError = new HostException(new StackOverflowError() {
+    @SuppressWarnings("serial") final HostException stackoverflowError = HostException.wrap(new StackOverflowError() {
         @SuppressWarnings("sync-override")
         @Override
         public Throwable fillInStackTrace() {
@@ -98,7 +103,7 @@ final class HostContext {
         }
     }, this);
 
-    final ClassValue<Map<List<Class<?>>, AdapterResult>> adapterCache = new ClassValue<Map<List<Class<?>>, AdapterResult>>() {
+    final ClassValue<Map<List<Class<?>>, AdapterResult>> adapterCache = new ClassValue<>() {
         @Override
         protected Map<List<Class<?>>, AdapterResult> computeValue(Class<?> type) {
             return new ConcurrentHashMap<>();
@@ -116,23 +121,38 @@ final class HostContext {
      * preinitialization.
      */
     @SuppressWarnings("hiding")
-    void initialize(Object internalContext, ClassLoader cl, Predicate<String> clFilter, boolean hostCLAllowed, boolean hostLookupAllowed) {
+    void initialize(Object internalContext, ClassLoader cl, Predicate<String> clFilter, boolean hostCLAllowed, boolean hostLookupAllowed, MutableTargetMapping... mutableTargetMappings) {
         if (classloader != null && this.classFilter != null || this.hostClassLoadingAllowed || this.hostLookupAllowed) {
             throw new AssertionError("must not be used during context preinitialization");
         }
         this.internalContext = internalContext;
+        this.internalLanguageContext = HostAccessor.ENGINE.getHostLanguageContext(internalContext);
         this.contextClassLoader = cl;
         this.classFilter = clFilter;
         this.hostClassLoadingAllowed = hostCLAllowed;
         this.hostLookupAllowed = hostLookupAllowed;
+        if (mutableTargetMappings != null) {
+            this.mutableTargetMappings = EconomicSet.create(mutableTargetMappings.length);
+            for (MutableTargetMapping m : mutableTargetMappings) {
+                this.mutableTargetMappings.add(m);
+            }
+        } else {
+            this.mutableTargetMappings = EconomicSet.create(0);
+        }
     }
 
     public HostClassCache getHostClassCache() {
         return language.hostClassCache;
     }
 
+    @NeverDefault
     GuestToHostCodeCache getGuestToHostCache() {
-        return language.getGuestToHostCache();
+        GuestToHostCodeCache cache = (GuestToHostCodeCache) HostAccessor.ENGINE.getGuestToHostCodeCache(internalContext);
+        if (cache == null) {
+            CompilerDirectives.transferToInterpreterAndInvalidate();
+            cache = (GuestToHostCodeCache) HostAccessor.ENGINE.installGuestToHostCodeCache(internalContext, new GuestToHostCodeCache(language));
+        }
+        return cache;
     }
 
     @TruffleBoundary
@@ -173,23 +193,47 @@ final class HostContext {
             return primitiveType;
         }
         try {
-            ClassLoader classLoader = getClassloader();
-            Class<?> foundClass = classLoader.loadClass(className);
-            Object currentModule = HostAccessor.JDKSERVICES.getUnnamedModule(classLoader);
-            if (HostAccessor.JDKSERVICES.verifyModuleVisibility(currentModule, foundClass)) {
-                return foundClass;
-            } else {
-                throw new HostLanguageException(String.format("Access to host class %s is not allowed or does not exist.", className));
+            if (getHostClassCache().hasCustomNamedLookup()) {
+                try {
+                    return accessClass(getHostClassCache().getMethodLookup(null).findClass(className));
+                } catch (ClassNotFoundException | IllegalAccessException | LinkageError e) {
+                    // fallthrough to class loader lookup
+                }
             }
-        } catch (ClassNotFoundException e) {
-            throw new HostLanguageException(String.format("Access to host class %s is not allowed or does not exist.", className));
+            return accessClass(loadClassViaClassLoader(className));
+        } catch (ClassNotFoundException | LinkageError e) {
+            throw throwClassLoadException(className);
         }
+    }
+
+    private Class<?> accessClass(Class<?> clazz) {
+        if (HostClassDesc.getLookup(clazz, getHostClassCache()) != null) {
+            return clazz;
+        } else {
+            throw throwClassLoadException(clazz.getName());
+        }
+    }
+
+    private Class<?> loadClassViaClassLoader(String className) throws ClassNotFoundException {
+        ClassLoader classLoader = getClassloader();
+        return classLoader.loadClass(className);
+    }
+
+    private static HostLanguageException throwClassLoadException(String className) {
+        throw new HostLanguageException(String.format("Access to host class %s is not allowed or does not exist.", className));
     }
 
     void validateClass(String className) {
         if (classFilter != null && !classFilter.test(className)) {
             throw new HostLanguageException(String.format("Access to host class %s is not allowed.", className));
         }
+    }
+
+    static Object getUnnamedModule(ClassLoader classLoader) {
+        if (classLoader == null) {
+            return null;
+        }
+        return classLoader.getUnnamedModule();
     }
 
     private static Class<?> getPrimitiveTypeByName(String className) {
@@ -215,6 +259,10 @@ final class HostContext {
         }
     }
 
+    EconomicSet<MutableTargetMapping> getMutableTargetMappings() {
+        return mutableTargetMappings;
+    }
+
     void addToHostClasspath(TruffleFile classpathEntry) {
         checkHostAccessAllowed();
         if (TruffleOptions.AOT) {
@@ -232,19 +280,19 @@ final class HostContext {
      * is why this coercion should only be used in the catch block at the outermost API call.
      */
     @TruffleBoundary
-    <T extends Throwable> RuntimeException hostToGuestException(T e) {
+    <T extends Throwable> RuntimeException hostToGuestException(T e, Node location) {
         assert !(e instanceof HostException) : "host exceptions not expected here";
 
         if (e instanceof ThreadDeath) {
             throw (ThreadDeath) e;
-        } else if (e instanceof PolyglotException) {
+        } else if (e instanceof RuntimeException r && access.isPolyglotException(r)) {
             // this will rethrow if the guest exception in the polyglot exception can be rethrown.
-            language.access.rethrowPolyglotException(internalContext, (PolyglotException) e);
+            language.access.rethrowPolyglotException(internalContext, r);
 
             // fall-through and treat it as any other host exception
         }
         try {
-            return new HostException(e, this);
+            return HostException.wrap(e, this, location);
         } catch (StackOverflowError stack) {
             /*
              * Cannot create a new host exception. Use a readily prepared instance.
@@ -253,22 +301,21 @@ final class HostContext {
         }
     }
 
+    @TruffleBoundary
+    <T extends Throwable> RuntimeException hostToGuestException(T e) {
+        return hostToGuestException(e, null);
+    }
+
     Value asValue(Node node, Object value) {
         // make language lookup fold if possible
         HostLanguage l = HostLanguage.get(node);
         return l.access.toValue(internalContext, value);
     }
 
-    Object toGuestValue(Class<?> receiver) {
-        return HostObject.forClass(receiver, this);
-    }
-
-    Object toGuestValue(Node node, Object hostValue) {
+    static Object toGuestValue(Node node, Object hostValue) {
         HostLanguage l = HostLanguage.get(node);
-        HostContext context = HostContext.get(node);
-        assert context == this;
-        Object result = l.access.toGuestValue(context.internalContext, hostValue);
-        return l.service.toGuestValue(context, result, false);
+        Object result = l.access.toGuestValue(node, l.api, hostValue);
+        return l.service.toGuestValue(node, result, false);
     }
 
     static boolean isGuestPrimitive(Object receiver) {
@@ -276,7 +323,7 @@ final class HostContext {
                         || receiver instanceof Long || receiver instanceof Float //
                         || receiver instanceof Boolean || receiver instanceof Character //
                         || receiver instanceof Byte || receiver instanceof Short //
-                        || receiver instanceof String;
+                        || receiver instanceof String || receiver instanceof TruffleString;
     }
 
     private static final ContextReference<HostContext> REFERENCE = ContextReference.create(HostLanguage.class);
@@ -286,120 +333,26 @@ final class HostContext {
     }
 
     @GenerateUncached
+    @GenerateInline
     abstract static class ToGuestValueNode extends Node {
 
-        abstract Object execute(HostContext context, Object receiver);
+        abstract Object execute(Node node, Object receiver);
 
         @Specialization(guards = "receiver == null")
-        Object doNull(HostContext context, @SuppressWarnings("unused") Object receiver) {
-            return context.toGuestValue(this, receiver);
+        Object doNull(Node node, Object receiver) {
+            return HostContext.toGuestValue(node, receiver);
         }
 
         @Specialization(guards = {"receiver != null", "receiver.getClass() == cachedReceiver"}, limit = "3")
-        Object doCached(HostContext context, Object receiver, @Cached("receiver.getClass()") Class<?> cachedReceiver) {
-            return context.toGuestValue(this, cachedReceiver.cast(receiver));
+        Object doCached(Node node, Object receiver, @Cached("receiver.getClass()") Class<?> cachedReceiver) {
+            return HostContext.toGuestValue(node, cachedReceiver.cast(receiver));
         }
 
         @Specialization(replaces = "doCached")
         @TruffleBoundary
-        Object doUncached(HostContext context, Object receiver) {
-            return context.toGuestValue(this, receiver);
+        Object doUncached(Node node, Object receiver) {
+            return HostContext.toGuestValue(node, receiver);
         }
-    }
-
-    static final class ToGuestValuesNode extends Node {
-
-        @Children private volatile ToGuestValueNode[] toGuestValue;
-        @CompilationFinal private volatile boolean needsCopy = false;
-        @CompilationFinal private volatile boolean generic = false;
-
-        private ToGuestValuesNode() {
-        }
-
-        public Object[] apply(HostContext context, Object[] args) {
-            ToGuestValueNode[] nodes = this.toGuestValue;
-            if (nodes == null) {
-                CompilerDirectives.transferToInterpreterAndInvalidate();
-                nodes = new ToGuestValueNode[args.length];
-                for (int i = 0; i < nodes.length; i++) {
-                    nodes[i] = ToGuestValueNodeGen.create();
-                }
-                toGuestValue = insert(nodes);
-            }
-            if (args.length == nodes.length) {
-                // fast path
-                if (nodes.length == 0) {
-                    return args;
-                } else {
-                    Object[] newArgs = fastToGuestValuesUnroll(nodes, context, args);
-                    return newArgs;
-                }
-            } else {
-                if (!generic || nodes.length != 1) {
-                    CompilerDirectives.transferToInterpreterAndInvalidate();
-                    nodes = Arrays.copyOf(nodes, 1);
-                    if (nodes[0] == null) {
-                        nodes[0] = ToGuestValueNodeGen.create();
-                    }
-                    this.toGuestValue = insert(nodes);
-                    this.generic = true;
-                }
-                if (args.length == 0) {
-                    return args;
-                }
-                return fastToGuestValues(nodes[0], context, args);
-            }
-        }
-
-        /*
-         * Specialization for constant number of arguments. Uses a profile for each argument.
-         */
-        @ExplodeLoop
-        private Object[] fastToGuestValuesUnroll(ToGuestValueNode[] nodes, HostContext context, Object[] args) {
-            Object[] newArgs = needsCopy ? new Object[nodes.length] : args;
-            for (int i = 0; i < nodes.length; i++) {
-                Object arg = args[i];
-                Object newArg = nodes[i].execute(context, arg);
-                if (needsCopy) {
-                    newArgs[i] = newArg;
-                } else if (arg != newArg) {
-                    CompilerDirectives.transferToInterpreterAndInvalidate();
-                    newArgs = new Object[nodes.length];
-                    System.arraycopy(args, 0, newArgs, 0, args.length);
-                    newArgs[i] = newArg;
-                    needsCopy = true;
-                }
-            }
-            return newArgs;
-        }
-
-        /*
-         * Specialization that supports multiple argument lengths but uses a single profile for all
-         * arguments.
-         */
-        private Object[] fastToGuestValues(ToGuestValueNode node, HostContext context, Object[] args) {
-            assert toGuestValue[0] != null;
-            Object[] newArgs = needsCopy ? new Object[args.length] : args;
-            for (int i = 0; i < args.length; i++) {
-                Object arg = args[i];
-                Object newArg = node.execute(context, arg);
-                if (needsCopy) {
-                    newArgs[i] = newArg;
-                } else if (arg != newArg) {
-                    CompilerDirectives.transferToInterpreterAndInvalidate();
-                    newArgs = new Object[args.length];
-                    System.arraycopy(args, 0, newArgs, 0, args.length);
-                    newArgs[i] = newArg;
-                    needsCopy = true;
-                }
-            }
-            return newArgs;
-        }
-
-        public static ToGuestValuesNode create() {
-            return new ToGuestValuesNode();
-        }
-
     }
 
     @ExportLibrary(InteropLibrary.class)
@@ -453,14 +406,14 @@ final class HostContext {
 
         @SuppressWarnings("static-method")
         @ExportMessage
-        boolean hasLanguage() {
+        boolean hasLanguageId() {
             return true;
         }
 
         @SuppressWarnings("static-method")
         @ExportMessage
-        Class<? extends TruffleLanguage<?>> getLanguage() {
-            return HostLanguage.class;
+        String getLanguageId() {
+            return HostLanguage.ID;
         }
 
         @SuppressWarnings("static-method")
@@ -510,6 +463,14 @@ final class HostContext {
             }
             classloader = null;
         }
+    }
+
+    AbstractValueDispatch lookupValueCache(Object value) {
+        return HostAccessor.ENGINE.lookupValueCache(internalContext, value);
+    }
+
+    Context getContextAPI() {
+        return HostAccessor.ENGINE.getContextAPI(internalContext);
     }
 
 }

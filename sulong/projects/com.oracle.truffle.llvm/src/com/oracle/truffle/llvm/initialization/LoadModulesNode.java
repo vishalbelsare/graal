@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2020, 2021, Oracle and/or its affiliates.
+ * Copyright (c) 2020, 2023, Oracle and/or its affiliates.
  *
  * All rights reserved.
  *
@@ -51,6 +51,7 @@ import com.oracle.truffle.llvm.runtime.LLVMScope;
 import com.oracle.truffle.llvm.runtime.LLVMScopeChain;
 import com.oracle.truffle.llvm.runtime.LLVMSymbol;
 import com.oracle.truffle.llvm.runtime.LLVMUnsupportedException;
+import com.oracle.truffle.llvm.runtime.LibraryLocator;
 import com.oracle.truffle.llvm.runtime.SulongLibrary;
 import com.oracle.truffle.llvm.runtime.SulongLibrary.CachedMainFunction;
 import com.oracle.truffle.llvm.runtime.except.LLVMParserException;
@@ -125,6 +126,7 @@ public final class LoadModulesNode extends LLVMRootNode {
         boolean isActive(LLVMLoadingPhase phase) {
             return phase == this || phase == ALL;
         }
+
     }
 
     private LoadModulesNode(String name, LLVMParserResult parserResult, boolean isInternalSulongLibrary,
@@ -139,9 +141,10 @@ public final class LoadModulesNode extends LLVMRootNode {
         this.language = language;
         this.hasInitialised = false;
         this.initContext = null;
-        this.initSymbols = new InitializeSymbolsNode(parserResult, lazyParsing, isInternalSulongLibrary, libraryName);
+        DataSectionFactory dataSectionFactory = new DataSectionFactory(parserResult);
+        this.initSymbols = new InitializeSymbolsNode(parserResult, lazyParsing, isInternalSulongLibrary, libraryName, dataSectionFactory, language);
         this.initExternals = new InitializeExternalNode(parserResult);
-        this.initGlobals = new InitializeGlobalNode(parserResult, libraryName);
+        this.initGlobals = new InitializeGlobalNode(parserResult, libraryName, dataSectionFactory);
         this.initOverwrite = new InitializeOverwriteNode(parserResult);
         this.initModules = new InitializeModuleNode(language, parserResult, libraryName);
         this.indirectCall = IndirectCallNode.create();
@@ -150,7 +153,7 @@ public final class LoadModulesNode extends LLVMRootNode {
 
     @Override
     public String getName() {
-        return '<' + getClass().getSimpleName() + '>';
+        return '<' + getClass().getSimpleName() + '/' + libraryName + '/' + bitcodeID.getId() + '>';
     }
 
     @Override
@@ -164,6 +167,10 @@ public final class LoadModulesNode extends LLVMRootNode {
             FrameDescriptor.Builder builder = FrameDescriptor.newBuilder();
             int stackId = builder.addSlot(FrameSlotKind.Object, null, null);
             assert stackId == LLVMStack.STACK_ID;
+            int uniquesRegionId = builder.addSlot(FrameSlotKind.Object, null, null);
+            assert uniquesRegionId == LLVMStack.UNIQUES_REGION_ID;
+            int basePointerId = builder.addSlot(FrameSlotKind.Long, null, null);
+            assert basePointerId == LLVMStack.BASE_POINTER_ID;
             return new LoadModulesNode(soName, parserResult, isInternalSulongLibrary, builder.build(), lazyParsing, libraryDependencies, source, language);
         } catch (Type.TypeOverflowException e) {
             throw new LLVMUnsupportedException(null, LLVMUnsupportedException.UnsupportedReason.UNSUPPORTED_VALUE_RANGE, e);
@@ -185,10 +192,8 @@ public final class LoadModulesNode extends LLVMRootNode {
                 initContext = this.insert(language.createInitializeContextNode());
                 hasInitialised = true;
             }
-
             LLVMScopeChain firstScopeChain = loadModule(frame, context);
-            context.addSourceForCache(bitcodeID, source);
-            context.addCalltargetForCache(libraryName, this.getCallTarget());
+            context.addCalltargetForLoadedLibrary(libraryName, this.getCallTarget());
 
             // Only the root library (not a dependency) will have a non-null scope.
             if (firstScopeChain != null) {
@@ -205,7 +210,7 @@ public final class LoadModulesNode extends LLVMRootNode {
     @SuppressWarnings("unchecked")
     private LLVMScopeChain loadModule(VirtualFrame frame, LLVMContext context) {
 
-        stackAccess.executeEnter(frame, getContext().getThreadingStack().getStack());
+        stackAccess.executeEnter(frame, getContext().getThreadingStack().getStack(this));
         try {
             LLVMLoadingPhase phase;
             // instead of creating a llvm local scope, just create a llvm scope here, and then put
@@ -298,6 +303,9 @@ public final class LoadModulesNode extends LLVMRootNode {
                     }
 
                     for (int i = 0; i < libraryDependencies.length; i++) {
+                        if (LibraryLocator.loggingEnabled()) {
+                            LibraryLocator.traceStaticInits(context, "building scope", libraryDependencies[i].getLibraryName());
+                        }
                         CallTarget callTarget = libraryDependencies[i].execute();
                         if (callTarget != null) {
                             queAdd(que, callTarget);
@@ -336,7 +344,13 @@ public final class LoadModulesNode extends LLVMRootNode {
                 if (!visited.get(id)) {
                     visited.set(id);
                     for (LoadDependencyNode libraryDependency : libraryDependencies) {
-                        callDependencies.call(libraryDependency.execute(), LLVMLoadingPhase.BUILD_DEPENDENCY, visited, dependencies);
+                        if (LibraryLocator.loggingEnabled()) {
+                            LibraryLocator.traceStaticInits(context, "building library dependency", libraryDependency.getLibraryName());
+                        }
+                        CallTarget lib = libraryDependency.execute();
+                        if (lib != null) {
+                            callDependencies.call(lib, LLVMLoadingPhase.BUILD_DEPENDENCY, visited, dependencies);
+                        }
                     }
                     dependencies.add(this.getCallTarget());
                 }
@@ -398,45 +412,31 @@ public final class LoadModulesNode extends LLVMRootNode {
     private void executeInitialiseAllPhase(ArrayList<CallTarget> dependencies, RTLDFlags rtldFlags, LLVMScopeChain scopeChain) {
         assert dependencies != null;
         for (CallTarget callTarget : dependencies) {
-            if (callTarget != null) {
-                callDependencies.call(callTarget, LLVMLoadingPhase.INIT_SYMBOLS);
-            }
+            callDependencies.call(callTarget, LLVMLoadingPhase.INIT_SYMBOLS);
         }
 
         for (CallTarget callTarget : dependencies) {
-            if (callTarget != null) {
-                callDependencies.call(callTarget, LLVMLoadingPhase.INIT_EXTERNALS, rtldFlags, scopeChain);
-            }
+            callDependencies.call(callTarget, LLVMLoadingPhase.INIT_EXTERNALS, rtldFlags, scopeChain);
         }
 
         for (CallTarget callTarget : dependencies) {
-            if (callTarget != null) {
-                callDependencies.call(callTarget, LLVMLoadingPhase.INIT_GLOBALS);
-            }
+            callDependencies.call(callTarget, LLVMLoadingPhase.INIT_GLOBALS);
         }
 
         for (CallTarget callTarget : dependencies) {
-            if (callTarget != null) {
-                callDependencies.call(callTarget, LLVMLoadingPhase.INIT_OVERWRITE, rtldFlags, scopeChain);
-            }
+            callDependencies.call(callTarget, LLVMLoadingPhase.INIT_OVERWRITE, rtldFlags, scopeChain);
         }
 
         for (CallTarget callTarget : dependencies) {
-            if (callTarget != null) {
-                callDependencies.call(callTarget, LLVMLoadingPhase.INIT_CONTEXT);
-            }
+            callDependencies.call(callTarget, LLVMLoadingPhase.INIT_CONTEXT);
         }
 
         for (CallTarget callTarget : dependencies) {
-            if (callTarget != null) {
-                callDependencies.call(callTarget, LLVMLoadingPhase.INIT_MODULE);
-            }
+            callDependencies.call(callTarget, LLVMLoadingPhase.INIT_MODULE);
         }
 
         for (CallTarget callTarget : dependencies) {
-            if (callTarget != null) {
-                callDependencies.call(callTarget, LLVMLoadingPhase.INIT_DONE);
-            }
+            callDependencies.call(callTarget, LLVMLoadingPhase.INIT_DONE);
         }
     }
 

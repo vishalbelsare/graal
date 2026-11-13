@@ -26,37 +26,36 @@ package com.oracle.svm.core.posix.amd64;
 
 import static com.oracle.svm.core.RegisterDumper.dumpReg;
 
-import org.graalvm.nativeimage.ImageSingletons;
 import org.graalvm.nativeimage.Platform;
 import org.graalvm.nativeimage.Platforms;
-import org.graalvm.nativeimage.hosted.Feature;
 import org.graalvm.word.Pointer;
 import org.graalvm.word.PointerBase;
 
 import com.oracle.svm.core.RegisterDumper;
-import com.oracle.svm.core.annotate.AutomaticFeature;
-import com.oracle.svm.core.annotate.Uninterruptible;
+import com.oracle.svm.shared.Uninterruptible;
+import com.oracle.svm.shared.singletons.AutomaticallyRegisteredImageSingleton;
 import com.oracle.svm.core.graal.amd64.AMD64ReservedRegisters;
-import com.oracle.svm.core.log.Log;
+import com.oracle.svm.guest.staging.log.Log;
 import com.oracle.svm.core.posix.UContextRegisterDumper;
 import com.oracle.svm.core.posix.headers.Signal;
 import com.oracle.svm.core.posix.headers.Signal.ucontext_t;
-import com.oracle.svm.core.util.VMError;
+import com.oracle.svm.shared.singletons.traits.BuiltinTraits.RuntimeAccessOnly;
+import com.oracle.svm.shared.singletons.traits.BuiltinTraits.SingleLayer;
+import com.oracle.svm.shared.singletons.traits.SingletonLayeredInstallationKind.InitialLayerOnly;
+import com.oracle.svm.shared.singletons.traits.SingletonTraits;
+import com.oracle.svm.shared.util.VMError;
 
 import jdk.vm.ci.amd64.AMD64;
 
-@Platforms({Platform.DARWIN_AMD64.class})
-@AutomaticFeature
-class AMD64DarwinUContextRegisterDumperFeature implements Feature {
-    @Override
-    public void afterRegistration(AfterRegistrationAccess access) {
-        VMError.guarantee(AMD64.r14.equals(AMD64ReservedRegisters.HEAP_BASE_REGISTER_CANDIDATE));
-        VMError.guarantee(AMD64.r15.equals(AMD64ReservedRegisters.THREAD_REGISTER_CANDIDATE));
-        ImageSingletons.add(RegisterDumper.class, new AMD64DarwinUContextRegisterDumper());
-    }
-}
-
+@AutomaticallyRegisteredImageSingleton(RegisterDumper.class)
+@Platforms(Platform.DARWIN_AMD64.class)
+@SingletonTraits(access = RuntimeAccessOnly.class, layeredCallbacks = SingleLayer.class, layeredInstallationKind = InitialLayerOnly.class)
 class AMD64DarwinUContextRegisterDumper implements UContextRegisterDumper {
+    AMD64DarwinUContextRegisterDumper() {
+        VMError.guarantee(AMD64.r14.equals(AMD64ReservedRegisters.HEAP_BASE_REGISTER));
+        VMError.guarantee(AMD64.r15.equals(AMD64ReservedRegisters.THREAD_REGISTER));
+    }
+
     @Override
     public void dumpRegisters(Log log, ucontext_t uContext, boolean printLocationInfo, boolean allowJavaHeapAccess, boolean allowUnsafeOperations) {
         Signal.AMD64DarwinMContext64 sigcontext = uContext.uc_mcontext_darwin_amd64();
@@ -81,26 +80,28 @@ class AMD64DarwinUContextRegisterDumper implements UContextRegisterDumper {
     }
 
     @Override
-    @Uninterruptible(reason = "Called from uninterruptible code", mayBeInlined = true)
+    @Uninterruptible(reason = "Called from uninterruptible code.", mayBeInlined = true)
     public PointerBase getHeapBase(ucontext_t uContext) {
         Signal.AMD64DarwinMContext64 sigcontext = uContext.uc_mcontext_darwin_amd64();
         return ((Pointer) sigcontext).readWord(sigcontext.r14_offset());
     }
 
     @Override
-    @Uninterruptible(reason = "Called from uninterruptible code", mayBeInlined = true)
+    @Uninterruptible(reason = "Called from uninterruptible code.", mayBeInlined = true)
     public PointerBase getThreadPointer(ucontext_t uContext) {
         Signal.AMD64DarwinMContext64 sigcontext = uContext.uc_mcontext_darwin_amd64();
         return ((Pointer) sigcontext).readWord(sigcontext.r15_offset());
     }
 
     @Override
+    @Uninterruptible(reason = "Called from uninterruptible code.", mayBeInlined = true)
     public PointerBase getSP(ucontext_t uContext) {
         Signal.AMD64DarwinMContext64 sigcontext = uContext.uc_mcontext_darwin_amd64();
         return ((Pointer) sigcontext).readWord(sigcontext.rsp_offset());
     }
 
     @Override
+    @Uninterruptible(reason = "Called from uninterruptible code.", mayBeInlined = true)
     public PointerBase getIP(ucontext_t uContext) {
         Signal.AMD64DarwinMContext64 sigcontext = uContext.uc_mcontext_darwin_amd64();
         return ((Pointer) sigcontext).readWord(sigcontext.rip_offset());

@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2021, 2021, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2021, 2025, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -31,27 +31,61 @@ import java.util.TreeMap;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.Consumer;
 
-import org.graalvm.compiler.nodes.extended.BytecodeExceptionNode;
-import org.graalvm.compiler.options.Option;
-import org.graalvm.compiler.options.OptionKey;
 import org.graalvm.nativeimage.ImageSingletons;
 
+import com.oracle.svm.shared.singletons.traits.BuiltinTraits.BuildtimeAccessOnly;
+import com.oracle.svm.shared.singletons.traits.BuiltinTraits.NoLayeredCallbacks;
+import com.oracle.svm.shared.singletons.traits.SingletonTraits;
+
+import jdk.graal.compiler.debug.GraalError;
+import jdk.graal.compiler.nodes.extended.BytecodeExceptionNode;
+import jdk.graal.compiler.options.Option;
+import jdk.graal.compiler.options.OptionKey;
+
+/**
+ * This class collects detailed counters that are then saved into the image build statistics file.
+ */
+@SingletonTraits(access = BuildtimeAccessOnly.class, layeredCallbacks = NoLayeredCallbacks.class)
 public class ImageBuildStatistics {
 
     public static class Options {
         @Option(help = "Collect information during image build about devirtualized invokes and bytecode exceptions.")//
         public static final OptionKey<Boolean> CollectImageBuildStatistics = new OptionKey<>(false);
-        @Option(help = "File for printing image build statistics")//
-        public static final OptionKey<String> ImageBuildStatisticsFile = new OptionKey<>(null);
     }
 
+    /**
+     * Phases in the compilation pipeline where the counters may be collected.
+     */
     public enum CheckCountLocation {
+        BEFORE_STRENGTHEN_GRAPHS,
+        AFTER_STRENGTHEN_GRAPHS,
         AFTER_PARSE_CANONICALIZATION,
         BEFORE_HIGH_TIER,
         AFTER_HIGH_TIER
     }
 
     final TreeMap<String, AtomicLong> counters;
+
+    /**
+     * Create a new counter based on the given unique {@code key}. Each counter is represented as an
+     * {@link AtomicLong} so that it can be updated from multiple compilations happening in
+     * parallel.
+     */
+    public AtomicLong createCounter(String key) {
+        AtomicLong result = new AtomicLong();
+        var existing = counters.put(key, result);
+        if (existing != null) {
+            throw GraalError.shouldNotReachHere("Key already used: " + key);
+        }
+        return result;
+    }
+
+    /**
+     * @see #createCounter(String)
+     */
+    public AtomicLong createCounter(String key, CheckCountLocation location) {
+        return createCounter(getName(key, location));
+    }
 
     public void incDevirtualizedInvokeCounter() {
         counters.get(devirtualizedInvokes()).incrementAndGet();
@@ -98,14 +132,20 @@ public class ImageBuildStatistics {
             for (Map.Entry<String, AtomicLong> entry : counters.entrySet()) {
                 json.append(INDENT + "\"").append(entry.getKey()).append("\":").append(entry.getValue().get()).append(",").append(System.lineSeparator());
             }
-            json.append("}").append(System.lineSeparator());
-            out.print(fixLast(json));
+            out.print(json);
+            printTimerStats(out);
+            out.format("}%n");
+        }
+
+        private void printTimerStats(PrintWriter out) {
+            TimerCollectionPrinter dumper = ImageSingletons.lookup(TimerCollectionPrinter.class);
+            dumper.printTimerStats(out);
         }
 
         static final String INDENT = "   ";
+    }
 
-        protected String fixLast(StringBuilder json) {
-            return json.toString().replace("," + System.lineSeparator() + "}", System.lineSeparator() + "}");
-        }
+    public interface TimerCollectionPrinter {
+        void printTimerStats(PrintWriter out);
     }
 }

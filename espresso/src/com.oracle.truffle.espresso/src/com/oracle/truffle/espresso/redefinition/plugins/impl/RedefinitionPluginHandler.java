@@ -30,16 +30,18 @@ import java.util.List;
 import java.util.Map;
 import java.util.ServiceLoader;
 import java.util.Set;
+import java.util.logging.Level;
 
 import com.oracle.truffle.api.CompilerDirectives.TruffleBoundary;
-import com.oracle.truffle.espresso.descriptors.Symbol;
+import com.oracle.truffle.espresso.classfile.descriptors.Symbol;
+import com.oracle.truffle.espresso.classfile.descriptors.Type;
 import com.oracle.truffle.espresso.impl.ObjectKlass;
 import com.oracle.truffle.espresso.jdwp.api.RedefineInfo;
 import com.oracle.truffle.espresso.redefinition.DefineKlassListener;
 import com.oracle.truffle.espresso.redefinition.plugins.api.ClassLoadAction;
 import com.oracle.truffle.espresso.redefinition.plugins.api.InternalRedefinitionPlugin;
 import com.oracle.truffle.espresso.runtime.EspressoContext;
-import com.oracle.truffle.espresso.runtime.StaticObject;
+import com.oracle.truffle.espresso.runtime.staticobject.StaticObject;
 
 public final class RedefinitionPluginHandler implements RedefineListener, DefineKlassListener {
 
@@ -48,7 +50,7 @@ public final class RedefinitionPluginHandler implements RedefineListener, Define
     // internal plugins are immediately activated during context
     // initialization, so no need for synchronization on this set
     private final Set<InternalRedefinitionPlugin> internalPlugins = new HashSet<>(1);
-    private final Map<Symbol<Symbol.Type>, List<ClassLoadAction>> classLoadActions = new HashMap<>();
+    private final Map<Symbol<Type>, List<ClassLoadAction>> classLoadActions = new HashMap<>();
 
     // The guest language HotSwap plugin handler passed
     // onto us if guest plugins are present at runtime.
@@ -61,7 +63,7 @@ public final class RedefinitionPluginHandler implements RedefineListener, Define
     @TruffleBoundary
     public void registerClassLoadAction(String className, ClassLoadAction action) {
         synchronized (classLoadActions) {
-            Symbol<Symbol.Type> type = context.getTypes().fromClassGetName(className);
+            Symbol<Type> type = context.getTypes().fromClassGetName(className);
             List<ClassLoadAction> list = classLoadActions.get(type);
             if (list == null) {
                 list = new ArrayList<>();
@@ -101,7 +103,7 @@ public final class RedefinitionPluginHandler implements RedefineListener, Define
     @Override
     public void onKlassDefined(ObjectKlass klass) {
         synchronized (classLoadActions) {
-            Symbol<Symbol.Type> type = klass.getType();
+            Symbol<Type> type = klass.getType();
             List<ClassLoadAction> loadActions = classLoadActions.get(type);
             if (loadActions != null) {
                 // fire all registered load actions
@@ -142,6 +144,7 @@ public final class RedefinitionPluginHandler implements RedefineListener, Define
             } catch (Throwable t) {
                 // don't let individual plugin errors cause failure
                 // to run other post redefinition plugins
+                context.getLogger().log(Level.WARNING, "Suppressing exception during postClassRedefinition.", t);
             }
         }
         // external plugins

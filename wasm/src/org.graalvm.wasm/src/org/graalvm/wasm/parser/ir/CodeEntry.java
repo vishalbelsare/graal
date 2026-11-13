@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2021, 2021, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2021, 2026, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * The Universal Permissive License (UPL), Version 1.0
@@ -41,58 +41,80 @@
 
 package org.graalvm.wasm.parser.ir;
 
-import org.graalvm.wasm.collection.IntArrayList;
-import org.graalvm.wasm.nodes.WasmRootNode;
-
-import java.util.ArrayList;
-
 /**
  * Represents information about the code section of a wasm function.
  */
-public class CodeEntry {
+public final class CodeEntry {
     private final int functionIndex;
-    private final BlockNode functionBlock;
-
-    private final int profileCount;
     private final int maxStackSize;
-    private final IntArrayList intConstants;
-    private final ArrayList<int[]> branchTables;
-    private final byte[] localTypes;
+    private final int maxLegacyCatchDepth;
+    private final int[] localTypes;
+    private final int[] resultTypes;
+    // Ordinary CALL targets, including imports, in instruction order.
+    private final int[] callFunctionIndices;
+    // CALL_INDIRECT and CALL_REF sites; imported CALLs are classified during instantiation.
+    private final int indirectCallCount;
+    private final int bytecodeStartOffset;
+    private final int bytecodeEndOffset;
+    private final boolean usesMemoryZero;
+    private final int exceptionTableOffset;
 
-    public CodeEntry(int functionIndex, BlockNode codeEntryBlock, int currentProfileCount, int currentMaxStackSize, IntArrayList currentIntConstants, ArrayList<int[]> currentBranchTables,
-                    byte[] localTypes) {
+    public CodeEntry(int functionIndex, int maxStackSize, int maxLegacyCatchDepth, int[] localTypes, int[] resultTypes, int[] callFunctionIndices, int indirectCallCount,
+                    int startOffset, int endOffset, boolean usesMemoryZero, int exceptionTableOffset) {
         this.functionIndex = functionIndex;
-        this.functionBlock = codeEntryBlock;
-        this.profileCount = currentProfileCount;
-        this.maxStackSize = currentMaxStackSize;
-        this.intConstants = currentIntConstants;
-        this.branchTables = currentBranchTables;
+        this.maxStackSize = maxStackSize;
+        this.maxLegacyCatchDepth = maxLegacyCatchDepth;
         this.localTypes = localTypes;
+        this.resultTypes = resultTypes;
+        this.callFunctionIndices = callFunctionIndices;
+        this.indirectCallCount = indirectCallCount;
+        this.bytecodeStartOffset = startOffset;
+        this.bytecodeEndOffset = endOffset;
+        this.usesMemoryZero = usesMemoryZero;
+        this.exceptionTableOffset = exceptionTableOffset;
     }
 
-    public void initializeTruffleComponents(WasmRootNode rootNode) {
-        int[] constants = intConstants.toArray();
-        int[][] tables = branchTables.toArray(new int[0][]);
-        rootNode.codeEntry().setIntConstants(constants);
-        if (tables.length > 0) {
-            rootNode.codeEntry().setBranchTables(tables);
-        }
-        rootNode.codeEntry().setProfileCount(profileCount);
-    }
-
-    public int getMaxStackSize() {
+    public int maxStackSize() {
         return maxStackSize;
     }
 
-    public int getFunctionIndex() {
+    public int maxLegacyCatchDepth() {
+        return maxLegacyCatchDepth;
+    }
+
+    public int functionIndex() {
         return functionIndex;
     }
 
-    public BlockNode getFunctionBlock() {
-        return functionBlock;
+    public int[] localTypes() {
+        return localTypes;
     }
 
-    public byte[] getLocalTypes() {
-        return localTypes;
+    public int[] resultTypes() {
+        return resultTypes;
+    }
+
+    public int[] callFunctionIndices() {
+        return callFunctionIndices;
+    }
+
+    public int indirectCallCount() {
+        return indirectCallCount;
+    }
+
+    public int bytecodeStartOffset() {
+        return bytecodeStartOffset;
+    }
+
+    public int bytecodeEndOffset() {
+        return bytecodeEndOffset;
+    }
+
+    public boolean usesMemoryZero() {
+        return usesMemoryZero;
+    }
+
+    public int exceptionTableOffset() {
+        return exceptionTableOffset;
     }
 }

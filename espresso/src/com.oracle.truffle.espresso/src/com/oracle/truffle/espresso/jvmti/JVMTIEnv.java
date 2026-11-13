@@ -20,19 +20,22 @@
  * or visit www.oracle.com if you need additional information or have any
  * questions.
  */
-
 package com.oracle.truffle.espresso.jvmti;
 
+import static com.oracle.truffle.espresso.ffi.memory.NativeMemory.IllegalMemoryAccessException;
+import static com.oracle.truffle.espresso.ffi.memory.NativeMemory.MemoryAllocationException;
 import static com.oracle.truffle.espresso.jvmti.JvmtiErrorCodes.JVMTI_ERROR_ILLEGAL_ARGUMENT;
 import static com.oracle.truffle.espresso.jvmti.JvmtiErrorCodes.JVMTI_OK;
 
 import java.util.List;
 
 import com.oracle.truffle.api.CompilerDirectives.CompilationFinal;
+import com.oracle.truffle.api.TruffleLogger;
 import com.oracle.truffle.api.interop.ArityException;
 import com.oracle.truffle.api.interop.TruffleObject;
 import com.oracle.truffle.api.interop.UnsupportedMessageException;
 import com.oracle.truffle.api.interop.UnsupportedTypeException;
+import com.oracle.truffle.espresso.EspressoLanguage;
 import com.oracle.truffle.espresso.ffi.Pointer;
 import com.oracle.truffle.espresso.ffi.RawPointer;
 import com.oracle.truffle.espresso.ffi.nfi.NativeUtils;
@@ -44,9 +47,7 @@ import com.oracle.truffle.espresso.substitutions.GenerateNativeEnv;
 
 @GenerateNativeEnv(target = JvmtiImpl.class, prependEnv = true)
 public final class JVMTIEnv extends NativeEnv {
-
-    private final EspressoContext context;
-
+    private static final TruffleLogger LOGGER = TruffleLogger.getLogger(EspressoLanguage.ID, JVMTIEnv.class);
     @CompilationFinal //
     private @Pointer TruffleObject jvmtiEnvPtr;
     @CompilationFinal //
@@ -55,7 +56,7 @@ public final class JVMTIEnv extends NativeEnv {
     private TruffleObject envLocalStorage = RawPointer.nullInstance();
 
     JVMTIEnv(EspressoContext context, TruffleObject initializeJvmtiContext, int version) {
-        this.context = context;
+        super(context);
         jvmtiEnvPtr = initializeAndGetEnv(initializeJvmtiContext, version);
         jvmtiVersion = version;
         assert getUncached().isPointer(jvmtiEnvPtr);
@@ -74,6 +75,11 @@ public final class JVMTIEnv extends NativeEnv {
         }
     }
 
+    @Override
+    protected TruffleLogger getLogger() {
+        return LOGGER;
+    }
+
     public TruffleObject getEnv() {
         return jvmtiEnvPtr;
     }
@@ -86,8 +92,8 @@ public final class JVMTIEnv extends NativeEnv {
     }
 
     @Override
-    public EspressoContext getContext() {
-        return context;
+    protected String getName() {
+        return "JVMTIEnv";
     }
 
     // Checkstyle: stop method name check
@@ -102,23 +108,33 @@ public final class JVMTIEnv extends NativeEnv {
             return JVMTI_ERROR_ILLEGAL_ARGUMENT;
         }
         TruffleObject alloc;
-        if (byteCount == 0) {
-            alloc = RawPointer.nullInstance();
-        } else {
-            alloc = getNativeAccess().allocateMemory(byteCount);
-            if (getUncached().isNull(alloc)) {
-                return JvmtiErrorCodes.JVMTI_ERROR_OUT_OF_MEMORY;
+        try {
+            if (byteCount == 0) {
+                alloc = RawPointer.nullInstance();
+            } else {
+                alloc = RawPointer.create(getNativeAccess().nativeMemory().allocateMemory(byteCount));
             }
+            NativeUtils.writeToPointerPointer(getUncached(), memPtr, alloc, getNativeAccess().nativeMemory());
+        } catch (MemoryAllocationException e) {
+            return JvmtiErrorCodes.JVMTI_ERROR_OUT_OF_MEMORY;
+        } catch (IllegalMemoryAccessException e) {
+            getLogger().warning("memPtr does not point to a valid memory region");
+            return JVMTI_ERROR_ILLEGAL_ARGUMENT;
         }
-        NativeUtils.writeToPointerPointer(getUncached(), memPtr, alloc);
         return JVMTI_OK;
     }
 
     @JvmtiImpl
+    @SuppressWarnings("unchecked")
     public int Deallocate(@Pointer TruffleObject memPtr) {
         // Null is valid. Do nothing if that is the case
         if (!getUncached().isNull(memPtr)) {
-            getNativeAccess().freeMemory(memPtr);
+            try {
+                getNativeAccess().nativeMemory().freeMemory(NativeUtils.interopAsPointer(memPtr));
+            } catch (IllegalMemoryAccessException e) {
+                getLogger().warning("memPtr does not point to a valid memory region");
+                return JVMTI_ERROR_ILLEGAL_ARGUMENT;
+            }
         }
         return JVMTI_OK;
     }
@@ -141,7 +157,12 @@ public final class JVMTIEnv extends NativeEnv {
             // Pointer should have been pre-null-checked
             return JVMTI_ERROR_ILLEGAL_ARGUMENT;
         }
-        NativeUtils.writeToPointerPointer(getUncached(), dataPtr, envLocalStorage);
+        try {
+            NativeUtils.writeToPointerPointer(getUncached(), dataPtr, envLocalStorage, getNativeAccess().nativeMemory());
+        } catch (IllegalMemoryAccessException e) {
+            getLogger().warning("dataPtr does not point to a valid memory region");
+            return JVMTI_ERROR_ILLEGAL_ARGUMENT;
+        }
         return JVMTI_OK;
     }
 
@@ -151,7 +172,12 @@ public final class JVMTIEnv extends NativeEnv {
             // Pointer should have been pre-null-checked
             return JVMTI_ERROR_ILLEGAL_ARGUMENT;
         }
-        NativeUtils.writeToIntPointer(getUncached(), phasePtr, getVM().getJvmti().getPhase());
+        try {
+            NativeUtils.writeToIntPointer(getUncached(), phasePtr, getVM().getJvmti().getPhase(), getNativeAccess().nativeMemory());
+        } catch (IllegalMemoryAccessException e) {
+            getLogger().warning("phasePtr does not point to a valid memory region");
+            return JVMTI_ERROR_ILLEGAL_ARGUMENT;
+        }
         return JVMTI_OK;
     }
 
@@ -168,7 +194,12 @@ public final class JVMTIEnv extends NativeEnv {
             // Pointer should have been pre-null-checked
             return JVMTI_ERROR_ILLEGAL_ARGUMENT;
         }
-        NativeUtils.writeToIntPointer(getUncached(), versionPtr, jvmtiVersion);
+        try {
+            NativeUtils.writeToIntPointer(getUncached(), versionPtr, jvmtiVersion, getNativeAccess().nativeMemory());
+        } catch (IllegalMemoryAccessException e) {
+            getLogger().warning("versionPtr does not point to a valid memory region");
+            return JVMTI_ERROR_ILLEGAL_ARGUMENT;
+        }
         return JVMTI_OK;
     }
 

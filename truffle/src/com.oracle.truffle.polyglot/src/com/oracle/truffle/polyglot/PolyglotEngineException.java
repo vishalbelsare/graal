@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2020, 2021, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2020, 2024, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * The Universal Permissive License (UPL), Version 1.0
@@ -42,8 +42,6 @@ package com.oracle.truffle.polyglot;
 
 import java.util.ConcurrentModificationException;
 import java.util.NoSuchElementException;
-
-import org.graalvm.polyglot.Context;
 
 import com.oracle.truffle.api.TruffleLanguage;
 import com.oracle.truffle.api.TruffleLanguage.Env;
@@ -99,10 +97,16 @@ import com.oracle.truffle.api.TruffleLanguage.Env;
 final class PolyglotEngineException extends RuntimeException {
 
     final RuntimeException e;
+    final boolean closedException;
 
     PolyglotEngineException(RuntimeException e) {
+        this(e, false);
+    }
+
+    PolyglotEngineException(RuntimeException e, boolean closedException) {
         super(null, e);
         this.e = e;
+        this.closedException = closedException;
     }
 
     @SuppressWarnings("sync-override")
@@ -125,8 +129,16 @@ final class PolyglotEngineException extends RuntimeException {
         return new PolyglotEngineException(new IllegalArgumentException(message));
     }
 
+    static PolyglotEngineException illegalArgument(String message, RuntimeException e) {
+        return new PolyglotEngineException(new IllegalArgumentException(message, e));
+    }
+
     static PolyglotEngineException illegalState(String message) {
         return new PolyglotEngineException(new IllegalStateException(message));
+    }
+
+    static PolyglotEngineException closedException(String message) {
+        return new PolyglotEngineException(new IllegalStateException(message), true);
     }
 
     static PolyglotEngineException nullPointer(String message) {

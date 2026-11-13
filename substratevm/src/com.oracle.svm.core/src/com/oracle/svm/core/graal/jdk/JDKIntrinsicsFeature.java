@@ -26,24 +26,23 @@ package com.oracle.svm.core.graal.jdk;
 
 import java.util.Map;
 
-import org.graalvm.compiler.api.replacements.SnippetReflectionProvider;
-import org.graalvm.compiler.graph.Node;
-import org.graalvm.compiler.nodes.graphbuilderconf.GraphBuilderConfiguration.Plugins;
-import org.graalvm.compiler.nodes.graphbuilderconf.InvocationPlugins;
-import org.graalvm.compiler.nodes.graphbuilderconf.InvocationPlugins.Registration;
-import org.graalvm.compiler.options.OptionValues;
-import org.graalvm.compiler.phases.util.Providers;
-import org.graalvm.compiler.replacements.arraycopy.ArrayCopySnippets;
-
 import com.oracle.svm.core.ParsingReason;
-import com.oracle.svm.core.annotate.AutomaticFeature;
-import com.oracle.svm.core.graal.GraalFeature;
+import com.oracle.svm.shared.feature.AutomaticallyRegisteredFeature;
+import com.oracle.svm.core.feature.InternalFeature;
 import com.oracle.svm.core.graal.meta.RuntimeConfiguration;
 import com.oracle.svm.core.graal.meta.SubstrateForeignCallsProvider;
 import com.oracle.svm.core.graal.snippets.NodeLoweringProvider;
 
-@AutomaticFeature
-final class JDKIntrinsicsFeature implements GraalFeature {
+import jdk.graal.compiler.graph.Node;
+import jdk.graal.compiler.nodes.graphbuilderconf.GraphBuilderConfiguration.Plugins;
+import jdk.graal.compiler.nodes.graphbuilderconf.InvocationPlugins;
+import jdk.graal.compiler.nodes.graphbuilderconf.InvocationPlugins.Registration;
+import jdk.graal.compiler.options.OptionValues;
+import jdk.graal.compiler.phases.util.Providers;
+import jdk.graal.compiler.replacements.arraycopy.ArrayCopySnippets;
+
+@AutomaticallyRegisteredFeature
+final class JDKIntrinsicsFeature implements InternalFeature {
 
     @Override
     public void registerForeignCalls(SubstrateForeignCallsProvider foreignCalls) {
@@ -60,7 +59,7 @@ final class JDKIntrinsicsFeature implements GraalFeature {
     }
 
     @Override
-    public void registerInvocationPlugins(Providers providers, SnippetReflectionProvider snippetReflection, Plugins plugins, ParsingReason reason) {
+    public void registerInvocationPlugins(Providers providers, Plugins plugins, ParsingReason reason) {
         registerSystemPlugins(plugins.getInvocationPlugins());
     }
 
@@ -68,5 +67,4 @@ final class JDKIntrinsicsFeature implements GraalFeature {
         Registration r = new Registration(plugins, System.class);
         ArrayCopySnippets.registerSystemArraycopyPlugin(r);
     }
-
 }

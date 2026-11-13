@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2019, 2021, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2019, 2026, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -28,6 +28,7 @@ import java.io.IOException;
 import java.util.Comparator;
 import java.util.HashMap;
 import java.util.Map;
+import java.util.Objects;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.function.BiFunction;
@@ -35,13 +36,15 @@ import java.util.function.BiPredicate;
 import java.util.function.Consumer;
 import java.util.stream.Collectors;
 
-import org.graalvm.nativeimage.impl.ConfigurationCondition;
-
+import com.oracle.svm.configure.ConfigurationTypeDescriptor;
+import com.oracle.svm.configure.UnresolvedAccessCondition;
 import com.oracle.svm.configure.config.ConfigurationMemberInfo.ConfigurationMemberAccessibility;
 import com.oracle.svm.configure.config.ConfigurationMemberInfo.ConfigurationMemberDeclaration;
-import com.oracle.svm.configure.json.JsonPrintable;
-import com.oracle.svm.configure.json.JsonPrinter;
-import com.oracle.svm.configure.json.JsonWriter;
+
+import jdk.graal.compiler.util.SignatureUtil;
+import jdk.graal.compiler.util.json.JsonPrintable;
+import jdk.graal.compiler.util.json.JsonPrinter;
+import jdk.graal.compiler.util.json.JsonWriter;
 
 /**
  * Type usage information, part of a {@link TypeConfiguration}. Unlike other configuration classes
@@ -52,7 +55,7 @@ import com.oracle.svm.configure.json.JsonWriter;
  */
 public class ConfigurationType implements JsonPrintable {
     static ConfigurationType copyAndSubtract(ConfigurationType type, ConfigurationType subtractType) {
-        if (type.equals(subtractType)) {
+        if (type == subtractType) {
             return null;
         }
         ConfigurationType copy = new ConfigurationType(type);
@@ -60,51 +63,81 @@ public class ConfigurationType implements JsonPrintable {
             return copy;
         }
 
-        assert type.getCondition().equals(subtractType.getCondition());
-        assert type.getQualifiedJavaName().equals(subtractType.getQualifiedJavaName());
+        assert type.sameTypeAndCondition(subtractType);
 
         copy.removeAll(subtractType);
         return copy.isEmpty() ? null : copy;
     }
 
-    private final ConfigurationCondition condition;
-    private final String qualifiedJavaName;
+    static ConfigurationType copyAndIntersect(ConfigurationType type, ConfigurationType toIntersect) {
+        ConfigurationType copy = new ConfigurationType(type);
+        assert type.sameTypeAndCondition(toIntersect);
+        copy.intersectWith(toIntersect);
+        return copy;
+    }
+
+    static ConfigurationType copyAndMerge(ConfigurationType type, ConfigurationType toMerge) {
+        ConfigurationType copy = new ConfigurationType(type);
+        copy.mergeFrom(toMerge);
+        return copy;
+    }
+
+    private final UnresolvedAccessCondition condition;
+    private final ConfigurationTypeDescriptor typeDescriptor;
 
     private Map<String, FieldInfo> fields;
     private Map<ConfigurationMethod, ConfigurationMemberInfo> methods;
 
     private boolean allDeclaredClasses;
+    private boolean allRecordComponents;
     private boolean allPermittedSubclasses;
+    private boolean allNestMembers;
+    private boolean allSigners;
     private boolean allPublicClasses;
-    private boolean allDeclaredFields;
-    private boolean allPublicFields;
+    private ConfigurationMemberAccessibility allDeclaredFieldsAccess = ConfigurationMemberAccessibility.NONE;
+    private ConfigurationMemberAccessibility allPublicFieldsAccess = ConfigurationMemberAccessibility.NONE;
+    private boolean unsafeAllocated;
     private ConfigurationMemberAccessibility allDeclaredMethodsAccess = ConfigurationMemberAccessibility.NONE;
     private ConfigurationMemberAccessibility allPublicMethodsAccess = ConfigurationMemberAccessibility.NONE;
     private ConfigurationMemberAccessibility allDeclaredConstructorsAccess = ConfigurationMemberAccessibility.NONE;
     private ConfigurationMemberAccessibility allPublicConstructorsAccess = ConfigurationMemberAccessibility.NONE;
+    private boolean serializable = false;
+    private boolean typeJniAccessible = false;
 
-    public ConfigurationType(ConfigurationCondition condition, String qualifiedJavaName) {
-        assert qualifiedJavaName.indexOf('/') == -1 : "Requires qualified Java name, not internal representation";
-        assert !qualifiedJavaName.startsWith("[") : "Requires Java source array syntax, for example java.lang.String[]";
-        this.condition = condition;
-        this.qualifiedJavaName = qualifiedJavaName;
+    public ConfigurationType(UnresolvedAccessCondition condition, ConfigurationTypeDescriptor typeDescriptor, boolean includeAllElements) {
+        this.condition = Objects.requireNonNull(condition);
+        this.typeDescriptor = Objects.requireNonNull(typeDescriptor);
+        allDeclaredClasses = allPublicClasses = allRecordComponents = allPermittedSubclasses = allNestMembers = allSigners = includeAllElements;
+        allDeclaredFieldsAccess = allPublicFieldsAccess = allDeclaredMethodsAccess = allPublicMethodsAccess = allDeclaredConstructorsAccess = allPublicConstructorsAccess = includeAllElements
+                        ? ConfigurationMemberAccessibility.QUERIED
+                        : ConfigurationMemberAccessibility.NONE;
     }
 
-    private ConfigurationType(ConfigurationType other) {
+    ConfigurationType(ConfigurationType other, UnresolvedAccessCondition condition) {
         // Our object is not yet published, so it is sufficient to take only the other object's lock
         synchronized (other) {
-            qualifiedJavaName = other.qualifiedJavaName;
-            condition = other.condition;
-            mergeFrom(other);
+            typeDescriptor = other.typeDescriptor;
+            this.condition = condition;
+            // Copy members under the inferred condition.
+            mergeFlagsFrom(other);
+            mergeFieldsFrom(other);
+            mergeMethodsFrom(other);
         }
     }
 
-    private void mergeFrom(ConfigurationType other) {
-        assert condition.equals(other.condition);
-        assert qualifiedJavaName.equals(other.qualifiedJavaName);
+    ConfigurationType(ConfigurationType other) {
+        this(other, other.condition);
+    }
+
+    void mergeFrom(ConfigurationType other) {
+        assert sameTypeAndCondition(other);
         mergeFlagsFrom(other);
         mergeFieldsFrom(other);
         mergeMethodsFrom(other);
+    }
+
+    private boolean sameTypeAndCondition(ConfigurationType otherType) {
+        return condition.equals(otherType.condition) && typeDescriptor.equals(otherType.typeDescriptor);
     }
 
     private void mergeFlagsFrom(ConfigurationType other) {
@@ -117,7 +150,7 @@ public class ConfigurationType implements JsonPrintable {
                 fields = new HashMap<>();
             }
             for (Map.Entry<String, FieldInfo> fieldInfoEntry : other.fields.entrySet()) {
-                fields.compute(fieldInfoEntry.getKey(), (key, value) -> {
+                fields.compute(fieldInfoEntry.getKey(), (_, value) -> {
                     if (value == null) {
                         return fieldInfoEntry.getValue();
                     } else {
@@ -126,15 +159,15 @@ public class ConfigurationType implements JsonPrintable {
                 });
             }
         }
-        maybeRemoveFields(allDeclaredFields, allPublicFields);
+        maybeRemoveFields(allDeclaredFieldsAccess, allPublicFieldsAccess);
     }
 
-    private void maybeRemoveFields(boolean hasAllDeclaredFields, boolean hasAllPublicFields) {
-        if (hasAllDeclaredFields) {
-            removeFields(ConfigurationMemberDeclaration.DECLARED);
+    private void maybeRemoveFields(ConfigurationMemberAccessibility hasAllDeclaredFields, ConfigurationMemberAccessibility hasAllPublicFields) {
+        if (hasAllDeclaredFields != ConfigurationMemberAccessibility.NONE) {
+            removeFields(ConfigurationMemberDeclaration.DECLARED, hasAllDeclaredFields);
         }
-        if (hasAllPublicFields) {
-            removeFields(ConfigurationMemberDeclaration.PUBLIC);
+        if (hasAllPublicFields != ConfigurationMemberAccessibility.NONE) {
+            removeFields(ConfigurationMemberDeclaration.PUBLIC, hasAllPublicFields);
         }
     }
 
@@ -144,7 +177,7 @@ public class ConfigurationType implements JsonPrintable {
                 methods = new HashMap<>();
             }
             for (Map.Entry<ConfigurationMethod, ConfigurationMemberInfo> methodEntry : other.methods.entrySet()) {
-                methods.compute(methodEntry.getKey(), (key, value) -> {
+                methods.compute(methodEntry.getKey(), (_, value) -> {
                     if (value != null) {
                         return value.intersect(methodEntry.getValue());
                     } else {
@@ -174,9 +207,39 @@ public class ConfigurationType implements JsonPrintable {
         }
     }
 
+    private void intersectWith(ConfigurationType other) {
+        intersectFlags(other);
+        intersectFields(other);
+        intersectMethods(other);
+    }
+
+    private void intersectFlags(ConfigurationType other) {
+        setFlagsFromOther(other, (our, their) -> our && their, ConfigurationMemberAccessibility::intersect);
+    }
+
+    private void intersectFields(ConfigurationType other) {
+        if (fields != null) {
+            if (other.fields != null) {
+                fields.keySet().retainAll(other.fields.keySet());
+                fields.replaceAll((key, value) -> value.newIntersectedWith(other.fields.get(key)));
+            } else {
+                fields = null;
+            }
+        }
+    }
+
+    private void intersectMethods(ConfigurationType other) {
+        if (methods != null) {
+            if (other.methods != null) {
+                methods.keySet().retainAll(other.methods.keySet());
+            } else {
+                methods = null;
+            }
+        }
+    }
+
     private void removeAll(ConfigurationType other) {
-        assert condition.equals(other.condition);
-        assert qualifiedJavaName.equals(other.qualifiedJavaName);
+        assert sameTypeAndCondition(other);
         removeFlags(other);
         removeFields(other);
         removeMethods(other);
@@ -187,10 +250,10 @@ public class ConfigurationType implements JsonPrintable {
     }
 
     private void removeFields(ConfigurationType other) {
-        maybeRemoveFields(allDeclaredFields || other.allDeclaredFields, allPublicFields || other.allPublicFields);
+        maybeRemoveFields(allDeclaredFieldsAccess.combine(other.allDeclaredFieldsAccess), allPublicFieldsAccess.combine(other.allPublicFieldsAccess));
         if (fields != null && other.fields != null) {
             for (Map.Entry<String, FieldInfo> fieldInfoEntry : other.fields.entrySet()) {
-                fields.computeIfPresent(fieldInfoEntry.getKey(), (key, value) -> value.newWithDifferencesFrom(fieldInfoEntry.getValue()));
+                fields.computeIfPresent(fieldInfoEntry.getKey(), (_, value) -> value.newWithDifferencesFrom(fieldInfoEntry.getValue()));
             }
             if (fields.isEmpty()) {
                 fields = null;
@@ -202,7 +265,15 @@ public class ConfigurationType implements JsonPrintable {
         maybeRemoveMethods(allDeclaredMethodsAccess.combine(other.allDeclaredMethodsAccess), allPublicMethodsAccess.combine(other.allPublicMethodsAccess),
                         allDeclaredConstructorsAccess.combine(other.allDeclaredConstructorsAccess), allPublicConstructorsAccess.combine(other.allPublicConstructorsAccess));
         if (methods != null && other.methods != null) {
-            methods.entrySet().removeAll(other.methods.entrySet());
+            for (Map.Entry<ConfigurationMethod, ConfigurationMemberInfo> entry : other.methods.entrySet()) {
+                ConfigurationMemberInfo otherMethodInfo = entry.getValue();
+                methods.computeIfPresent(entry.getKey(), (_, methodInfo) -> {
+                    if (otherMethodInfo.includes(methodInfo)) {
+                        return null; // remove
+                    }
+                    return methodInfo;
+                });
+            }
             if (methods.isEmpty()) {
                 methods = null;
             }
@@ -212,14 +283,20 @@ public class ConfigurationType implements JsonPrintable {
     private void setFlagsFromOther(ConfigurationType other, BiPredicate<Boolean, Boolean> flagPredicate,
                     BiFunction<ConfigurationMemberAccessibility, ConfigurationMemberAccessibility, ConfigurationMemberAccessibility> accessCombiner) {
         allDeclaredClasses = flagPredicate.test(allDeclaredClasses, other.allDeclaredClasses);
+        allRecordComponents = flagPredicate.test(allRecordComponents, other.allRecordComponents);
         allPermittedSubclasses = flagPredicate.test(allPermittedSubclasses, other.allPermittedSubclasses);
+        allNestMembers = flagPredicate.test(allNestMembers, other.allNestMembers);
+        allSigners = flagPredicate.test(allSigners, other.allSigners);
         allPublicClasses = flagPredicate.test(allPublicClasses, other.allPublicClasses);
-        allDeclaredFields = flagPredicate.test(allDeclaredFields, other.allDeclaredFields);
-        allPublicFields = flagPredicate.test(allPublicFields, other.allPublicFields);
+        allDeclaredFieldsAccess = accessCombiner.apply(allDeclaredFieldsAccess, other.allDeclaredFieldsAccess);
+        allPublicFieldsAccess = accessCombiner.apply(allPublicFieldsAccess, other.allPublicFieldsAccess);
+        unsafeAllocated = flagPredicate.test(unsafeAllocated, other.unsafeAllocated);
         allDeclaredMethodsAccess = accessCombiner.apply(allDeclaredMethodsAccess, other.allDeclaredMethodsAccess);
         allPublicMethodsAccess = accessCombiner.apply(allPublicMethodsAccess, other.allPublicMethodsAccess);
         allDeclaredConstructorsAccess = accessCombiner.apply(allDeclaredConstructorsAccess, other.allDeclaredConstructorsAccess);
         allPublicConstructorsAccess = accessCombiner.apply(allPublicConstructorsAccess, other.allPublicConstructorsAccess);
+        serializable = flagPredicate.test(serializable, other.serializable);
+        typeJniAccessible = flagPredicate.test(typeJniAccessible, other.typeJniAccessible);
     }
 
     private boolean isEmpty() {
@@ -227,19 +304,21 @@ public class ConfigurationType implements JsonPrintable {
     }
 
     private boolean allFlagsFalse() {
-        return !(allDeclaredClasses || allPermittedSubclasses || allPublicClasses || allDeclaredFields || allPublicFields ||
+        return !(allDeclaredClasses || allRecordComponents || allPermittedSubclasses || allNestMembers || allSigners || allPublicClasses || serializable || typeJniAccessible ||
+                        allDeclaredFieldsAccess != ConfigurationMemberAccessibility.NONE || allPublicFieldsAccess != ConfigurationMemberAccessibility.NONE ||
                         allDeclaredMethodsAccess != ConfigurationMemberAccessibility.NONE || allPublicMethodsAccess != ConfigurationMemberAccessibility.NONE ||
                         allDeclaredConstructorsAccess != ConfigurationMemberAccessibility.NONE || allPublicConstructorsAccess != ConfigurationMemberAccessibility.NONE);
     }
 
-    public String getQualifiedJavaName() {
-        return qualifiedJavaName;
+    public ConfigurationTypeDescriptor getTypeDescriptor() {
+        return typeDescriptor;
     }
 
     public synchronized void addField(String name, ConfigurationMemberDeclaration declaration, boolean finalButWritable) {
+        ConfigurationMemberAccessibility accessibility = ConfigurationMemberAccessibility.ACCESSED;
         if (!finalButWritable) {
-            if ((declaration.includes(ConfigurationMemberDeclaration.DECLARED) && allDeclaredFields) ||
-                            (declaration.includes(ConfigurationMemberDeclaration.PUBLIC) && allPublicFields)) {
+            if ((declaration.includes(ConfigurationMemberDeclaration.DECLARED) && allDeclaredFieldsAccess.includes(accessibility)) ||
+                            (declaration.includes(ConfigurationMemberDeclaration.PUBLIC) && allPublicFieldsAccess.includes(accessibility))) {
                 fields = maybeRemove(fields, map -> {
                     FieldInfo fieldInfo = map.get(name);
                     if (fieldInfo != null && !fieldInfo.isFinalButWritable()) {
@@ -252,9 +331,9 @@ public class ConfigurationType implements JsonPrintable {
         if (fields == null) {
             fields = new HashMap<>();
         }
-        fields.compute(name, (k, v) -> (v != null)
-                        ? FieldInfo.get(v.getKind().intersect(declaration), v.isFinalButWritable() || finalButWritable)
-                        : FieldInfo.get(declaration, finalButWritable));
+        fields.compute(name, (_, v) -> (v != null)
+                        ? FieldInfo.get(v.getKind().intersect(ConfigurationMemberInfo.get(declaration, accessibility)), v.isFinalButWritable() || finalButWritable)
+                        : FieldInfo.get(declaration, accessibility, finalButWritable));
     }
 
     public void addMethodsWithName(String name, ConfigurationMemberDeclaration declaration, ConfigurationMemberAccessibility accessibility) {
@@ -268,6 +347,17 @@ public class ConfigurationType implements JsonPrintable {
     public synchronized void addMethod(String name, String internalSignature, ConfigurationMemberDeclaration declaration, ConfigurationMemberAccessibility accessibility) {
         ConfigurationMemberInfo kind = ConfigurationMemberInfo.get(declaration, accessibility);
         boolean matchesAllSignatures = (internalSignature == null);
+        if (!matchesAllSignatures) {
+            /*
+             * A method with an invalid signature will not match any existing method. The signature
+             * is also checked during run-time queries (in this case, JNI's `Get(Static)MethodID`)
+             * and the missing registration error check does not happen if the signature is invalid,
+             * so there is no need to register a negative query for the method either.
+             */
+            if (!SignatureUtil.isSignatureValid(internalSignature, true)) {
+                return;
+            }
+        }
         if (ConfigurationMethod.isConstructorName(name) ? hasAllConstructors(declaration, accessibility) : hasAllMethods(declaration, accessibility)) {
             if (!matchesAllSignatures) {
                 if (accessibility == ConfigurationMemberAccessibility.ACCESSED) {
@@ -289,11 +379,11 @@ public class ConfigurationType implements JsonPrintable {
         }
         ConfigurationMethod method = new ConfigurationMethod(name, internalSignature);
         if (matchesAllSignatures) { // remove any methods that the new entry matches
-            methods.compute(method, (k, v) -> v != null ? kind.union(v) : kind);
+            methods.compute(method, (_, v) -> v != null ? kind.union(v) : kind);
             methods = maybeRemove(methods, map -> map.entrySet().removeIf(entry -> name.equals(entry.getKey().getName()) &&
                             kind.includes(entry.getValue()) && !method.equals(entry.getKey())));
         } else {
-            methods.compute(method, (k, v) -> v != null ? kind.intersect(v) : kind);
+            methods.compute(method, (_, v) -> v != null ? kind.intersect(v) : kind);
         }
         assert methods.containsKey(method);
     }
@@ -312,22 +402,42 @@ public class ConfigurationType implements JsonPrintable {
         allDeclaredClasses = true;
     }
 
+    public synchronized void setAllRecordComponents() {
+        allRecordComponents = true;
+    }
+
     public synchronized void setAllPermittedSubclasses() {
         allPermittedSubclasses = true;
+    }
+
+    public synchronized void setAllNestMembers() {
+        allNestMembers = true;
+    }
+
+    public synchronized void setAllSigners() {
+        allSigners = true;
     }
 
     public synchronized void setAllPublicClasses() {
         allPublicClasses = true;
     }
 
-    public synchronized void setAllDeclaredFields() {
-        allDeclaredFields = true;
-        removeFields(ConfigurationMemberDeclaration.DECLARED);
+    public void setUnsafeAllocated() {
+        this.unsafeAllocated = true;
     }
 
-    public synchronized void setAllPublicFields() {
-        allPublicFields = true;
-        removeFields(ConfigurationMemberDeclaration.PUBLIC);
+    public synchronized void setAllDeclaredFields(ConfigurationMemberAccessibility accessibility) {
+        if (!allDeclaredFieldsAccess.includes(accessibility)) {
+            allDeclaredFieldsAccess = accessibility;
+            removeFields(ConfigurationMemberDeclaration.DECLARED, allDeclaredFieldsAccess);
+        }
+    }
+
+    public synchronized void setAllPublicFields(ConfigurationMemberAccessibility accessibility) {
+        if (!allPublicFieldsAccess.includes(accessibility)) {
+            allPublicFieldsAccess = accessibility;
+            removeFields(ConfigurationMemberDeclaration.PUBLIC, allDeclaredFieldsAccess);
+        }
     }
 
     public synchronized void setAllDeclaredMethods(ConfigurationMemberAccessibility accessibility) {
@@ -358,49 +468,54 @@ public class ConfigurationType implements JsonPrintable {
         }
     }
 
+    public synchronized boolean isSerializable() {
+        return serializable;
+    }
+
+    public synchronized void setSerializable() {
+        serializable = true;
+    }
+
+    public synchronized boolean isJniAccessible() {
+        return typeJniAccessible;
+    }
+
+    public synchronized void setJniAccessible() {
+        typeJniAccessible = true;
+    }
+
     @Override
     public synchronized void printJson(JsonWriter writer) throws IOException {
-        writer.append('{').indent().newline();
-        ConfigurationConditionPrintable.printConditionAttribute(condition, writer);
-        writer.quote("name").append(':').quote(qualifiedJavaName);
+        writer.appendObjectStart();
+        AccessConditionPrintable.printConditionAttribute(condition, writer, true);
+        writer.quote("type").appendFieldSeparator();
+        typeDescriptor.printJson(writer);
 
-        optionallyPrintJsonBoolean(writer, allDeclaredFields, "allDeclaredFields");
-        optionallyPrintJsonBoolean(writer, allPublicFields, "allPublicFields");
-        optionallyPrintJsonBoolean(writer, allDeclaredMethodsAccess == ConfigurationMemberAccessibility.ACCESSED, "allDeclaredMethods");
-        optionallyPrintJsonBoolean(writer, allPublicMethodsAccess == ConfigurationMemberAccessibility.ACCESSED, "allPublicMethods");
-        optionallyPrintJsonBoolean(writer, allDeclaredConstructorsAccess == ConfigurationMemberAccessibility.ACCESSED, "allDeclaredConstructors");
-        optionallyPrintJsonBoolean(writer, allPublicConstructorsAccess == ConfigurationMemberAccessibility.ACCESSED, "allPublicConstructors");
-        optionallyPrintJsonBoolean(writer, allDeclaredClasses, "allDeclaredClasses");
-        optionallyPrintJsonBoolean(writer, allPermittedSubclasses, "allPermittedSubclasses");
-        optionallyPrintJsonBoolean(writer, allPublicClasses, "allPublicClasses");
-        optionallyPrintJsonBoolean(writer, allDeclaredMethodsAccess == ConfigurationMemberAccessibility.QUERIED, "queryAllDeclaredMethods");
-        optionallyPrintJsonBoolean(writer, allPublicMethodsAccess == ConfigurationMemberAccessibility.QUERIED, "queryAllPublicMethods");
-        optionallyPrintJsonBoolean(writer, allDeclaredConstructorsAccess == ConfigurationMemberAccessibility.QUERIED, "queryAllDeclaredConstructors");
-        optionallyPrintJsonBoolean(writer, allPublicConstructorsAccess == ConfigurationMemberAccessibility.QUERIED, "queryAllPublicConstructors");
+        printJsonBooleanIfSet(writer, allDeclaredFieldsAccess == ConfigurationMemberAccessibility.ACCESSED, "allDeclaredFields");
+        printJsonBooleanIfSet(writer, allPublicFieldsAccess == ConfigurationMemberAccessibility.ACCESSED, "allPublicFields");
+        printJsonBooleanIfSet(writer, allDeclaredMethodsAccess == ConfigurationMemberAccessibility.ACCESSED, "allDeclaredMethods");
+        printJsonBooleanIfSet(writer, allPublicMethodsAccess == ConfigurationMemberAccessibility.ACCESSED, "allPublicMethods");
+        printJsonBooleanIfSet(writer, allDeclaredConstructorsAccess == ConfigurationMemberAccessibility.ACCESSED, "allDeclaredConstructors");
+        printJsonBooleanIfSet(writer, allPublicConstructorsAccess == ConfigurationMemberAccessibility.ACCESSED, "allPublicConstructors");
+        printJsonBooleanIfSet(writer, unsafeAllocated, "unsafeAllocated");
+        printJsonBooleanIfSet(writer, serializable, "serializable");
+        printJsonBooleanIfSet(writer, typeJniAccessible, "jniAccessible");
+
         if (fields != null) {
-            writer.append(',').newline().quote("fields").append(':');
+            writer.appendSeparator().quote("fields").appendFieldSeparator();
             JsonPrinter.printCollection(writer, fields.entrySet(), Map.Entry.comparingByKey(), ConfigurationType::printField);
         }
         if (methods != null) {
             Set<ConfigurationMethod> accessedMethods = getMethodsByAccessibility(ConfigurationMemberAccessibility.ACCESSED);
             if (!accessedMethods.isEmpty()) {
-                writer.append(',').newline().quote("methods").append(':');
-                JsonPrinter.printCollection(writer,
-                                accessedMethods,
-                                Comparator.comparing(ConfigurationMethod::getName).thenComparing(Comparator.nullsFirst(Comparator.comparing(ConfigurationMethod::getInternalSignature))),
-                                JsonPrintable::printJson);
-            }
-            Set<ConfigurationMethod> queriedMethods = getMethodsByAccessibility(ConfigurationMemberAccessibility.QUERIED);
-            if (!queriedMethods.isEmpty()) {
-                writer.append(',').newline().quote("queriedMethods").append(':');
-                JsonPrinter.printCollection(writer,
-                                queriedMethods,
-                                Comparator.comparing(ConfigurationMethod::getName).thenComparing(Comparator.nullsFirst(Comparator.comparing(ConfigurationMethod::getInternalSignature))),
-                                JsonPrintable::printJson);
+                writer.appendSeparator().quote("methods").appendFieldSeparator();
+                Comparator<ConfigurationMethod> methodComparator = Comparator.comparing(ConfigurationMethod::getName)
+                                .thenComparing(Comparator.nullsFirst(Comparator.comparing(ConfigurationMethod::getInternalSignature)));
+                JsonPrinter.printCollection(writer, accessedMethods, methodComparator, JsonPrintable::printJson);
             }
         }
 
-        writer.unindent().newline().append('}');
+        writer.appendObjectEnd();
     }
 
     private Set<ConfigurationMethod> getMethodsByAccessibility(ConfigurationMemberAccessibility accessibility) {
@@ -408,21 +523,26 @@ public class ConfigurationType implements JsonPrintable {
     }
 
     private static void printField(Map.Entry<String, FieldInfo> entry, JsonWriter w) throws IOException {
-        w.append('{').quote("name").append(':').quote(entry.getKey());
+        w.appendObjectStart().quote("name").appendFieldSeparator().quote(entry.getKey());
         if (entry.getValue().isFinalButWritable()) {
-            w.append(", ").quote("allowWrite").append(':').append("true");
+            w.appendSeparator().quote("allowWrite").appendFieldSeparator().append("true");
         }
-        w.append('}');
+        w.appendObjectEnd();
     }
 
-    private static void optionallyPrintJsonBoolean(JsonWriter writer, boolean predicate, String attribute) throws IOException {
+    private static void printJsonBooleanIfSet(JsonWriter writer, boolean predicate, String attribute) throws IOException {
         if (predicate) {
-            writer.append(',').newline().quote(attribute).append(":true");
+            printJsonBoolean(writer, predicate, attribute);
         }
     }
 
-    private void removeFields(ConfigurationMemberDeclaration declaration) {
-        fields = maybeRemove(fields, map -> map.values().removeIf(v -> declaration.includes(v.getKind())));
+    private static void printJsonBoolean(JsonWriter writer, boolean value, String attribute) throws IOException {
+        writer.appendSeparator().quote(attribute).appendFieldSeparator().append(Boolean.toString(value));
+    }
+
+    private void removeFields(ConfigurationMemberDeclaration declaration, ConfigurationMemberAccessibility accessibility) {
+        ConfigurationMemberInfo kind = ConfigurationMemberInfo.get(declaration, accessibility);
+        fields = maybeRemove(fields, map -> map.entrySet().removeIf(entry -> kind.includes(entry.getValue().getKind())));
     }
 
     private void removeMethods(ConfigurationMemberDeclaration declaration, ConfigurationMemberAccessibility accessibility, boolean constructors) {
@@ -441,7 +561,7 @@ public class ConfigurationType implements JsonPrintable {
         return map;
     }
 
-    ConfigurationCondition getCondition() {
+    UnresolvedAccessCondition getCondition() {
         return condition;
     }
 
@@ -458,20 +578,32 @@ public class ConfigurationType implements JsonPrintable {
             return (type.fields == null) ? null : type.fields.get(fieldName);
         }
 
-        public static boolean haveAllDeclaredFields(ConfigurationType self) {
-            return self.allDeclaredFields;
+        public static ConfigurationMemberAccessibility getAllDeclaredFields(ConfigurationType self) {
+            return self.allDeclaredFieldsAccess;
         }
 
-        public static boolean haveAllPublicFields(ConfigurationType type) {
-            return type.allPublicFields;
+        public static ConfigurationMemberAccessibility getAllPublicFields(ConfigurationType type) {
+            return type.allPublicFieldsAccess;
         }
 
         public static boolean haveAllDeclaredClasses(ConfigurationType type) {
             return type.allDeclaredClasses;
         }
 
+        public static boolean haveAllRecordComponents(ConfigurationType type) {
+            return type.allRecordComponents;
+        }
+
         public static boolean haveAllPermittedSubclasses(ConfigurationType type) {
             return type.allPermittedSubclasses;
+        }
+
+        public static boolean haveAllNestMembers(ConfigurationType type) {
+            return type.allNestMembers;
+        }
+
+        public static boolean haveAllSigners(ConfigurationType type) {
+            return type.allSigners;
         }
 
         public static boolean haveAllPublicClasses(ConfigurationType type) {

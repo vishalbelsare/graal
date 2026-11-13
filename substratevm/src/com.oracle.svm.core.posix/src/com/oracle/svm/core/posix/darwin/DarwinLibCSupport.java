@@ -24,10 +24,18 @@
  */
 package com.oracle.svm.core.posix.darwin;
 
-import com.oracle.svm.core.annotate.Uninterruptible;
+import com.oracle.svm.shared.Uninterruptible;
+import com.oracle.svm.shared.singletons.AutomaticallyRegisteredImageSingleton;
+import com.oracle.svm.core.headers.LibCSupport;
 import com.oracle.svm.core.posix.PosixLibCSupport;
 import com.oracle.svm.core.posix.headers.darwin.DarwinErrno;
+import com.oracle.svm.shared.singletons.traits.BuiltinTraits.AllAccess;
+import com.oracle.svm.shared.singletons.traits.BuiltinTraits.SingleLayer;
+import com.oracle.svm.shared.singletons.traits.SingletonLayeredInstallationKind.InitialLayerOnly;
+import com.oracle.svm.shared.singletons.traits.SingletonTraits;
 
+@SingletonTraits(access = AllAccess.class, layeredCallbacks = SingleLayer.class, layeredInstallationKind = InitialLayerOnly.class)
+@AutomaticallyRegisteredImageSingleton(LibCSupport.class)
 class DarwinLibCSupport extends PosixLibCSupport {
 
     @Override

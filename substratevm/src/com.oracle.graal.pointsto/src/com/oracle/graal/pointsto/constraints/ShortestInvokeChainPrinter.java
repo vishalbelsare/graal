@@ -32,8 +32,9 @@ import java.util.Map;
 
 import com.oracle.graal.pointsto.BigBang;
 import com.oracle.graal.pointsto.meta.AnalysisMethod;
-
+import com.oracle.graal.pointsto.meta.AnalysisUniverse;
 import com.oracle.graal.pointsto.meta.InvokeInfo;
+
 import jdk.vm.ci.code.BytecodePosition;
 
 public final class ShortestInvokeChainPrinter {
@@ -59,11 +60,9 @@ public final class ShortestInvokeChainPrinter {
         Deque<AnalysisMethod> workList = new LinkedList<>();
         Map<AnalysisMethod, Element> visited = new HashMap<>();
 
-        for (AnalysisMethod m : bb.getUniverse().getMethods()) {
-            if (m.isEntryPoint()) {
-                workList.addLast(m);
-                visited.put(m, new Element(m, null, null));
-            }
+        for (AnalysisMethod m : AnalysisUniverse.getCallTreeRoots(bb.getUniverse())) {
+            workList.addLast(m);
+            visited.put(m, new Element(m, null, null));
         }
 
         while (workList.size() > 0) {
@@ -72,7 +71,7 @@ public final class ShortestInvokeChainPrinter {
             assert methodElement != null;
 
             for (InvokeInfo invoke : method.getInvokes()) {
-                for (AnalysisMethod callee : invoke.getCallees()) {
+                for (AnalysisMethod callee : invoke.getAllCallees()) {
 
                     if (visited.containsKey(callee)) {
                         // We already had a shorter path to this method.

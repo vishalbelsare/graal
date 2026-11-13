@@ -24,26 +24,122 @@
  */
 package com.oracle.svm.core.locks;
 
+import java.util.Comparator;
+import java.util.List;
+
 import org.graalvm.nativeimage.ImageSingletons;
 import org.graalvm.nativeimage.IsolateThread;
+import org.graalvm.nativeimage.Platform;
+import org.graalvm.nativeimage.Platforms;
 
 import com.oracle.svm.core.SubstrateDiagnostics.DiagnosticThunk;
 import com.oracle.svm.core.SubstrateDiagnostics.ErrorContext;
-import com.oracle.svm.core.annotate.RestrictHeapAccess;
-import com.oracle.svm.core.log.Log;
+import com.oracle.svm.core.feature.InternalFeature;
+import com.oracle.svm.core.imagelayer.LayeredFoldResolver;
+import com.oracle.svm.guest.staging.core.heap.RestrictHeapAccess;
+import com.oracle.svm.guest.staging.log.Log;
+import com.oracle.svm.guest.staging.util.ImageHeapList;
+import com.oracle.svm.shared.Uninterruptible;
+import com.oracle.svm.shared.singletons.traits.BuiltinTraits.AllAccess;
+import com.oracle.svm.shared.singletons.traits.BuiltinTraits.SingleLayer;
+import com.oracle.svm.shared.singletons.traits.SingletonLayeredInstallationKind.InitialLayerOnly;
+import com.oracle.svm.shared.singletons.traits.SingletonTraits;
+import com.oracle.svm.shared.util.VMError;
 
-public abstract class VMLockSupport {
-    /**
-     * Returns an array that contains all {@link VMMutex} objects that are present in the image or
-     * null if that information is not available.
-     */
-    public abstract VMMutex[] getMutexes();
+import jdk.graal.compiler.api.replacements.Fold;
+
+/**
+ * Registry and lifecycle owner for VM-level locking primitives that are reachable in an image.
+ * <p>
+ * During image build, {@link VMMutex}, {@link VMCondition}, and {@link VMSemaphore} objects are
+ * created as hosted placeholders. Those placeholders are then replaced with runtime implementations
+ * that are backed by platform-specific state.
+ */
+@SingletonTraits(access = AllAccess.class, layeredCallbacks = SingleLayer.class, layeredInstallationKind = InitialLayerOnly.class)
+public class VMLockSupport {
+    /** All mutexes, so that we can initialize them at run time when the VM starts. */
+    private final List<VMMutex> mutexes = ImageHeapList.create(VMMutex.class, Comparator.comparing(VMMutex::getName));
+    /** All conditions, so that we can initialize them at run time when the VM starts. */
+    private final List<VMCondition> conditions = ImageHeapList.create(VMCondition.class, Comparator.comparing(VMCondition::getName));
+    /** All semaphores, so that we can initialize them at run time when the VM starts. */
+    private final List<VMSemaphore> semaphores = ImageHeapList.create(VMSemaphore.class, Comparator.comparing(VMSemaphore::getName));
+
+    @Platforms(Platform.HOSTED_ONLY.class) //
+    private ClassInstanceReplacer<VMMutex, VMMutex> mutexReplacer;
+
+    @Fold(resolver = LayeredFoldResolver.InitialLayer.class)
+    public static VMLockSupport singleton() {
+        return ImageSingletons.lookup(VMLockSupport.class);
+    }
+
+    @Platforms(Platform.HOSTED_ONLY.class)
+    public void registerObjectReplacers(InternalFeature.DuringSetupAccess access) {
+        mutexReplacer = new ClassInstanceReplacer<>(VMMutex.class, mutexes, this::replaceVMMutex);
+
+        access.registerObjectReplacer(mutexReplacer);
+        access.registerObjectReplacer(new ClassInstanceReplacer<>(VMCondition.class, conditions, this::replaceVMCondition));
+        access.registerObjectReplacer(new ClassInstanceReplacer<>(VMSemaphore.class, semaphores, this::replaceSemaphore));
+    }
+
+    @Platforms(Platform.HOSTED_ONLY.class)
+    private VMMutex replaceVMMutex(VMMutex source) {
+        return new RuntimeVMMutex(source.getName());
+    }
+
+    @Platforms(Platform.HOSTED_ONLY.class)
+    private VMCondition replaceVMCondition(VMCondition source) {
+        return new RuntimeVMCondition((RuntimeVMMutex) mutexReplacer.apply(source.getMutex()), source.getName());
+    }
+
+    @Platforms(Platform.HOSTED_ONLY.class)
+    private VMSemaphore replaceSemaphore(VMSemaphore source) {
+        return new RuntimeVMSemaphore(source.getName());
+    }
 
     /**
-     * Returns an array that contains all {@link VMCondition} objects that are present in the image
-     * or null if that information is not available.
+     * Initializes all {@link VMMutex}, {@link VMCondition}, and {@link VMSemaphore} objects.
+     *
+     * @return {@code true} if the initialization was successful, {@code false} if an error
+     *         occurred.
      */
-    public abstract VMCondition[] getConditions();
+    @Uninterruptible(reason = "Too early for safepoints.")
+    public final boolean initialize() {
+        for (int i = 0; i < mutexes.size(); i++) {
+            if (mutexes.get(i).initialize() != 0) {
+                return false;
+            }
+        }
+        for (int i = 0; i < conditions.size(); i++) {
+            if (conditions.get(i).initialize() != 0) {
+                return false;
+            }
+        }
+        for (int i = 0; i < semaphores.size(); i++) {
+            if (semaphores.get(i).initialize() != 0) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    /**
+     * Destroys all {@link VMMutex}, {@link VMCondition}, and {@link VMSemaphore} objects.
+     */
+    @Uninterruptible(reason = "The isolate teardown is in progress.")
+    public final void destroy() {
+        for (int i = 0; i < semaphores.size(); i++) {
+            int code = semaphores.get(i).destroy();
+            VMError.guarantee(code == 0, "VMSemaphore.destroy() failed.");
+        }
+        for (int i = 0; i < conditions.size(); i++) {
+            int code = conditions.get(i).destroy();
+            VMError.guarantee(code == 0, "VMCondition.destroy() failed.");
+        }
+        for (int i = 0; i < mutexes.size(); i++) {
+            int code = mutexes.get(i).destroy();
+            VMError.guarantee(code == 0, "VMMutex.destroy() failed.");
+        }
+    }
 
     public static class DumpVMMutexes extends DiagnosticThunk {
         @Override
@@ -56,31 +152,22 @@ public abstract class VMLockSupport {
         public void printDiagnostics(Log log, ErrorContext context, int maxDiagnosticLevel, int invocationCount) {
             log.string("VM mutexes:").indent(true);
 
-            VMLockSupport support = null;
-            if (ImageSingletons.contains(VMLockSupport.class)) {
-                support = ImageSingletons.lookup(VMLockSupport.class);
-            }
-
-            if (support == null || support.getMutexes() == null) {
-                log.string("No mutex information is available.");
-            } else {
-                VMMutex[] mutexes = support.getMutexes();
-                for (int i = 0; i < mutexes.length; i++) {
-                    VMMutex mutex = mutexes[i];
-                    IsolateThread owner = mutex.owner;
-                    log.string("mutex \"").string(mutex.getName()).string("\" ");
-                    if (owner.isNull()) {
-                        log.string("is unlocked.");
+            VMLockSupport support = VMLockSupport.singleton();
+            for (int i = 0; i < support.mutexes.size(); i++) {
+                VMMutex mutex = support.mutexes.get(i);
+                IsolateThread owner = mutex.owner;
+                log.string("mutex \"").string(mutex.getName()).string("\" ");
+                if (owner.isNull()) {
+                    log.string("is unlocked.");
+                } else {
+                    log.string("is locked by ");
+                    if (owner.equal(VMMutex.UNSPECIFIED_OWNER)) {
+                        log.string("an unspecified thread.");
                     } else {
-                        log.string("is locked by ");
-                        if (owner.equal(VMMutex.UNSPECIFIED_OWNER)) {
-                            log.string("an unspecified thread.");
-                        } else {
-                            log.string("thread ").zhex(owner);
-                        }
+                        log.string("thread ").zhex(owner);
                     }
-                    log.newline();
                 }
+                log.newline();
             }
 
             log.indent(false);

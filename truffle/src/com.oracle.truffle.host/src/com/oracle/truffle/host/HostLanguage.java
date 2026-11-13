@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2017, 2020, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2017, 2024, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * The Universal Permissive License (UPL), Version 1.0
@@ -42,16 +42,15 @@ package com.oracle.truffle.host;
 
 import static com.oracle.truffle.api.CompilerDirectives.shouldNotReachHere;
 
-import org.graalvm.polyglot.HostAccess;
 import org.graalvm.polyglot.impl.AbstractPolyglotImpl;
 import org.graalvm.polyglot.impl.AbstractPolyglotImpl.APIAccess;
 import org.graalvm.polyglot.impl.AbstractPolyglotImpl.AbstractHostAccess;
 
 import com.oracle.truffle.api.CallTarget;
-import com.oracle.truffle.api.CompilerDirectives;
 import com.oracle.truffle.api.CompilerDirectives.CompilationFinal;
 import com.oracle.truffle.api.CompilerDirectives.TruffleBoundary;
 import com.oracle.truffle.api.TruffleLanguage;
+import com.oracle.truffle.api.dsl.Bind;
 import com.oracle.truffle.api.exception.AbstractTruffleException;
 import com.oracle.truffle.api.frame.VirtualFrame;
 import com.oracle.truffle.api.interop.InteropLibrary;
@@ -64,14 +63,19 @@ import com.oracle.truffle.host.HostMethodScope.ScopedObject;
 /*
  * Java host language implementation.
  */
+@Bind.DefaultExpression("get($node)")
 final class HostLanguage extends TruffleLanguage<HostContext> {
 
-    @CompilationFinal private GuestToHostCodeCache guestToHostCache;
+    static final String ID = "host";
+
     @CompilationFinal HostClassCache hostClassCache; // effectively final
     final AbstractHostAccess access;
     final AbstractPolyglotImpl polyglot;
     final APIAccess api;
     final HostLanguageService service;
+    final Class<?> valueClass;
+    final Class<?> polyglotExceptionClass;
+    final Class<?> byteSequenceClass;
     @CompilationFinal private boolean methodScopingEnabled;
 
     HostLanguage(AbstractPolyglotImpl polyglot, AbstractHostAccess hostAccess) {
@@ -79,6 +83,9 @@ final class HostLanguage extends TruffleLanguage<HostContext> {
         this.access = hostAccess;
         this.api = polyglot.getAPIAccess();
         this.service = new HostLanguageService(polyglot, this);
+        this.valueClass = polyglot.getAPIAccess().getValueClass();
+        this.polyglotExceptionClass = polyglot.getAPIAccess().getPolyglotExceptionClass();
+        this.byteSequenceClass = polyglot.getAPIAccess().getByteSequenceClass();
     }
 
     @Override
@@ -109,15 +116,6 @@ final class HostLanguage extends TruffleLanguage<HostContext> {
         return true;
     }
 
-    GuestToHostCodeCache getGuestToHostCache() {
-        GuestToHostCodeCache cache = this.guestToHostCache;
-        if (cache == null) {
-            CompilerDirectives.transferToInterpreterAndInvalidate();
-            guestToHostCache = cache = new GuestToHostCodeCache(this);
-        }
-        return cache;
-    }
-
     private Object unwrapIfScoped(Object obj) {
         if (!methodScopingEnabled) {
             return obj;
@@ -129,13 +127,13 @@ final class HostLanguage extends TruffleLanguage<HostContext> {
         return o;
     }
 
-    void initializeHostAccess(HostAccess policy, ClassLoader cl) {
-        if (policy == null) {
+    void initializeHostAccess(Object hostAccess) {
+        if (hostAccess == null) {
             // should only happen during context preinitialization
             return;
         }
 
-        HostClassCache cache = HostClassCache.findOrInitialize(access, api, policy, cl);
+        HostClassCache cache = HostClassCache.findOrInitialize(access, api, hostAccess);
         if (this.hostClassCache != null) {
             if (this.hostClassCache.hostAccess.equals(cache.hostAccess)) {
                 /*
@@ -143,15 +141,15 @@ final class HostLanguage extends TruffleLanguage<HostContext> {
                  * applies.
                  */
             } else {
-                throw new IllegalStateException("Found different host access configuration for a context with a shared engine. " +
+                throw HostAccessor.ENGINE.createPolyglotEngineException(new IllegalStateException("Found different host access configuration for a context with a shared engine. " +
                                 "The host access configuration must be the same for all contexts of an engine. " +
-                                "Provide the same host access configuration using the Context.Builder.allowHostAccess method when constructing the context.");
+                                "Provide the same host access configuration using the Context.Builder.allowHostAccess method when constructing the context."));
             }
         } else {
             this.hostClassCache = cache;
         }
 
-        this.methodScopingEnabled = api.isMethodScopingEnabled(policy);
+        this.methodScopingEnabled = api.isMethodScopingEnabled(hostAccess);
     }
 
     @Override
@@ -161,15 +159,18 @@ final class HostLanguage extends TruffleLanguage<HostContext> {
         if (value instanceof TruffleObject) {
             InteropLibrary lib = InteropLibrary.getFactory().getUncached(value);
             try {
-                assert !lib.hasLanguage(value) || lib.getLanguage(value) != HostLanguage.class;
+                assert !lib.hasLanguageId(value) || !HostLanguage.ID.equals(lib.getLanguageId(value));
             } catch (UnsupportedMessageException e) {
                 throw shouldNotReachHere(e);
             }
-            wrapped = HostToTypeNode.convertToObject(hostContext, value, lib);
+            wrapped = HostToTypeNode.convertToObject(lib, hostContext, value, lib);
         } else {
             wrapped = value;
         }
-        return HostObject.forObject(wrapped, hostContext);
+        if (wrapped != null) {
+            return HostObject.forObject(wrapped, hostContext);
+        }
+        return null;
     }
 
     @Override

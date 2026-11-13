@@ -25,75 +25,35 @@
 package com.oracle.truffle.tools.profiler.impl;
 
 import java.io.File;
-import java.io.FileNotFoundException;
-import java.io.FileOutputStream;
-import java.io.PrintStream;
+import java.net.URL;
 import java.nio.file.Path;
-import java.nio.file.Paths;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Objects;
-import java.util.function.Consumer;
-import java.util.function.Function;
 import java.util.function.Predicate;
 import java.util.regex.Pattern;
-import java.util.regex.PatternSyntaxException;
 
-import org.graalvm.options.OptionKey;
-import org.graalvm.options.OptionType;
+import org.graalvm.shadowed.org.json.JSONObject;
 
 import com.oracle.truffle.api.exception.AbstractTruffleException;
 import com.oracle.truffle.api.instrumentation.SourceSectionFilter;
 import com.oracle.truffle.api.instrumentation.StandardTags;
-import com.oracle.truffle.api.instrumentation.TruffleInstrument;
 import com.oracle.truffle.api.source.Source;
 import com.oracle.truffle.api.source.SourceSection;
-import com.oracle.truffle.tools.utils.json.JSONObject;
 
 abstract class ProfilerCLI {
 
-    static final OptionType<Object[]> WILDCARD_FILTER_TYPE = new OptionType<>("Expression",
-                    new Function<String, Object[]>() {
-                        @Override
-                        public Object[] apply(String filterWildcardExpression) {
-                            if (filterWildcardExpression == null) {
-                                return null;
-                            }
-                            String[] expressions = filterWildcardExpression.split(",");
-                            Object[] builtExpressions = new Object[expressions.length];
-                            for (int i = 0; i < expressions.length; i++) {
-                                String expression = expressions[i];
-                                expression = expression.trim();
-                                Object result = expression;
-                                if (expression.contains("?") || expression.contains("*")) {
-                                    try {
-                                        result = Pattern.compile(wildcardToRegex(expression));
-                                    } catch (PatternSyntaxException e) {
-                                        throw new IllegalArgumentException(
-                                                        String.format("Invalid wildcard pattern %s.", expression), e);
-                                    }
-                                }
-                                builtExpressions[i] = result;
-                            }
-                            return builtExpressions;
-                        }
-                    }, new Consumer<Object[]>() {
-                        @Override
-                        public void accept(Object[] objects) {
-
-                        }
-                    });
     public static final String UNKNOWN = "<Unknown>";
 
     static SourceSectionFilter buildFilter(boolean roots, boolean statements, boolean calls, boolean internals,
-                    Object[] filterRootName, Object[] filterFile, String filterMimeType, String filterLanguage) {
+                    WildcardFilter filterRootName, WildcardFilter filterFile, String filterMimeType, String filterLanguage) {
         SourceSectionFilter.Builder builder = SourceSectionFilter.newBuilder();
         if (!internals || filterFile != null || filterMimeType != null || filterLanguage != null) {
             builder.sourceIs(new SourceSectionFilter.SourcePredicate() {
                 @Override
                 public boolean test(Source source) {
                     boolean internal = (internals || !source.isInternal());
-                    boolean file = testWildcardExpressions(source.getPath(), filterFile);
+                    boolean file = filterFile.testWildcardExpressions(source.getPath());
                     boolean mimeType = filterMimeType.equals("") || filterMimeType.equals(source.getMimeType());
                     final boolean languageId = filterLanguage.equals("") || filterMimeType.equals(source.getLanguage());
                     return internal && file && mimeType && languageId;
@@ -120,7 +80,7 @@ abstract class ProfilerCLI {
         builder.rootNameIs(new Predicate<String>() {
             @Override
             public boolean test(String s) {
-                return testWildcardExpressions(s, filterRootName);
+                return filterRootName.testWildcardExpressions(s);
             }
         });
 
@@ -146,17 +106,27 @@ abstract class ProfilerCLI {
             return UNKNOWN;
         }
         StringBuilder b = new StringBuilder();
-        if (sourceSection.getSource().getPath() == null) {
-            b.append(sourceSection.getSource().getName());
-        } else {
-            Path pathAbsolute = Paths.get(sourceSection.getSource().getPath());
-            Path pathBase = new File("").getAbsoluteFile().toPath();
+        Source source = sourceSection.getSource();
+        URL url = source.getURL();
+        if (url != null && !"file".equals(url.getProtocol())) {
+            b.append(url.toExternalForm());
+        } else if (source.getPath() != null) {
             try {
+                /*
+                 * On Windows, getPath for a local file URL returns a path in the format
+                 * `/C:/Documents/`, which is not a valid file system path on Windows. Attempting to
+                 * parse this path using Path#of results in a failure. However, java.io.File
+                 * correctly handles this format by removing the invalid leading `/` character.
+                 */
+                Path pathAbsolute = new File(source.getPath()).toPath();
+                Path pathBase = new File("").getAbsoluteFile().toPath();
                 Path pathRelative = pathBase.relativize(pathAbsolute);
                 b.append(pathRelative.toFile());
             } catch (IllegalArgumentException e) {
-                b.append(sourceSection.getSource().getName());
+                b.append(source.getName());
             }
+        } else {
+            b.append(source.getName());
         }
 
         b.append("~").append(formatIndices(sourceSection, true));
@@ -206,42 +176,6 @@ abstract class ProfilerCLI {
             }
         }
         return false;
-    }
-
-    private static String wildcardToRegex(String wildcard) {
-        StringBuilder s = new StringBuilder(wildcard.length());
-        s.append('^');
-        for (int i = 0, is = wildcard.length(); i < is; i++) {
-            char c = wildcard.charAt(i);
-            switch (c) {
-                case '*':
-                    s.append("\\S*");
-                    break;
-                case '?':
-                    s.append("\\S");
-                    break;
-                // escape special regexp-characters
-                case '(':
-                case ')':
-                case '[':
-                case ']':
-                case '$':
-                case '^':
-                case '.':
-                case '{':
-                case '}':
-                case '|':
-                case '\\':
-                    s.append("\\");
-                    s.append(c);
-                    break;
-                default:
-                    s.append(c);
-                    break;
-            }
-        }
-        s.append('$');
-        return s.toString();
     }
 
     static JSONObject sourceSectionToJSON(SourceSection sourceSection) {
@@ -305,20 +239,6 @@ abstract class ProfilerCLI {
             int result = sourceSection != null ? sourceSection.hashCode() : 0;
             result = 31 * result + (rootName != null ? rootName.hashCode() : 0);
             return result;
-        }
-    }
-
-    protected static PrintStream chooseOutputStream(TruffleInstrument.Env env, OptionKey<String> option) {
-        try {
-            if (option.hasBeenSet(env.getOptions())) {
-                final String outputPath = option.getValue(env.getOptions());
-                final File file = new File(outputPath);
-                return new PrintStream(new FileOutputStream(file));
-            } else {
-                return new PrintStream(env.out());
-            }
-        } catch (FileNotFoundException e) {
-            throw handleFileNotFound();
         }
     }
 

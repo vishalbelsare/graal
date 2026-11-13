@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2009, 2021, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2009, 2023, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * The Universal Permissive License (UPL), Version 1.0
@@ -60,12 +60,10 @@ import org.graalvm.word.WordFactory;
  * Annotates a method that is a VM entry point. Such a method must be declared <i>static</i>, and is
  * made accessible so that it can be called as a C function using the native ABI.
  * <p>
- * An execution context must be passed as a parameter and can be either an {@link IsolateThread}
- * that is specific to the current thread, or an {@link Isolate} for an isolate in which the current
- * thread is attached. These pointers can be obtained via the methods of {@link CurrentIsolate}.
- * When there is more than one parameter of these types, exactly one of the parameters must be
- * annotated with {@link IsolateThreadContext} for {@link IsolateThread}, or {@link IsolateContext}
- * for {@link Isolate}.
+ * An execution context must be passed as an {@link IsolateThread} that is specific to the current
+ * thread. This pointer can be obtained via {@link CurrentIsolate#getCurrentThread()}. When there is
+ * more than one parameter of {@link IsolateThread}, exactly one of the parameters must be annotated
+ * with {@link IsolateThreadContext}.
  * <p>
  * Exceptions cannot be thrown to the caller and must be explicitly caught in the entry point
  * method. Any uncaught exception causes the termination of the process after it is printed.
@@ -189,6 +187,32 @@ public @interface CEntryPoint {
             return false;
         }
     }
+
+    /**
+     * @since 22.0
+     */
+    enum Publish {
+        /**
+         * Do not publish the entry point method.
+         */
+        NotPublished,
+        /**
+         * Create a symbol for the entry point method in the native image.
+         */
+        SymbolOnly,
+        /**
+         * Create a symbol for the entry point method in the native image, and if building a shared
+         * library image, also include a C declaration in the generated C header file.
+         */
+        SymbolAndHeader,
+    }
+
+    /**
+     * Whether the entry point is part of the symbols and header files produced by Native Image.
+     *
+     * @since 22.0
+     */
+    Publish publishAs() default Publish.SymbolAndHeader;
 
     /**
      * The built-in methods which can be {@linkplain #builtin() aliased}.

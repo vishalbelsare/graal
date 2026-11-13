@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2015, 2019, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2015, 2026, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * The Universal Permissive License (UPL), Version 1.0
@@ -55,10 +55,12 @@ import org.junit.Before;
 import org.junit.BeforeClass;
 import org.junit.Test;
 
-import com.oracle.truffle.api.CallTarget;
+import com.oracle.truffle.api.CompilerDirectives.TruffleBoundary;
+import com.oracle.truffle.api.RootCallTarget;
 import com.oracle.truffle.api.dsl.Cached;
 import com.oracle.truffle.api.frame.VirtualFrame;
 import com.oracle.truffle.api.interop.ArityException;
+import com.oracle.truffle.api.interop.InteropException;
 import com.oracle.truffle.api.interop.InteropLibrary;
 import com.oracle.truffle.api.interop.TruffleObject;
 import com.oracle.truffle.api.interop.UnsupportedMessageException;
@@ -74,10 +76,12 @@ import com.oracle.truffle.tck.tests.TruffleTestAssumptions;
 
 public class HostStackTraceTest extends AbstractPolyglotTest {
 
+    private boolean rootCall;
+
     @ExportLibrary(InteropLibrary.class)
     class HostStackTraceExecutable implements TruffleObject {
 
-        final CallTarget callTarget;
+        final RootCallTarget callTarget;
 
         HostStackTraceExecutable(String name, SourceSection rootSection, SourceSection callSection) {
             this.callTarget = new ExecuteRootNode(name, rootSection, callSection).getCallTarget();
@@ -95,9 +99,12 @@ public class HostStackTraceTest extends AbstractPolyglotTest {
             return true;
         }
 
-        // unached version does callTarget.call
+        // uncached version does callTarget.call
         @ExportMessage
         final Object execute(Object[] arguments, @Cached IndirectCallNode callNode) {
+            if (rootCall) {
+                return callNode.call(callTarget.getRootNode(), -1, arguments);
+            }
             return callNode.call(callTarget, arguments);
         }
 
@@ -159,8 +166,13 @@ public class HostStackTraceTest extends AbstractPolyglotTest {
                 Object[] prunedArgs = Arrays.copyOfRange(frame.getArguments(), 1, frame.getArguments().length);
                 return interop.execute(receiver, prunedArgs);
             } catch (UnsupportedTypeException | ArityException | UnsupportedMessageException e) {
-                throw new AssertionError(e);
+                throw throwAssertionError(e);
             }
+        }
+
+        @TruffleBoundary
+        private static Error throwAssertionError(InteropException e) {
+            throw new AssertionError(e);
         }
 
     }
@@ -181,7 +193,7 @@ public class HostStackTraceTest extends AbstractPolyglotTest {
 
     @Test
     public void testExecute() {
-        Value v = context.asValue(new Supplier<Object>() {
+        Value v = context.asValue(new Supplier<>() {
             public Object get() {
                 throw new RuntimeException();
             }
@@ -204,6 +216,9 @@ public class HostStackTraceTest extends AbstractPolyglotTest {
         }
     }
 
+    /*
+     * Referenced in reflect-config.json
+     */
     public void v0() {
         throw new RuntimeException();
     }
@@ -273,6 +288,12 @@ public class HostStackTraceTest extends AbstractPolyglotTest {
     }
 
     @Test
+    public void testExecuteGuestTwoFramesWithRootCall() {
+        rootCall = true;
+        testExecuteGuestTwoFrames();
+    }
+
+    @Test
     public void testExecuteUncached() {
         Source source = Source.newBuilder(ProxyLanguage.ID, "    ", "").build();
 
@@ -280,7 +301,7 @@ public class HostStackTraceTest extends AbstractPolyglotTest {
         Value v1 = context.asValue(new HostStackTraceExecutable("v1", source.createSection(0, 1), source.createSection(1, 1)));
         Value v2 = context.asValue(new HostStackTraceExecutable("v2", source.createSection(2, 1), source.createSection(3, 1)));
 
-        // TODO support host stack trace
+        // TODO GR-38632 support host stack trace
         try {
             v2.execute(v0);
         } catch (PolyglotException e) {

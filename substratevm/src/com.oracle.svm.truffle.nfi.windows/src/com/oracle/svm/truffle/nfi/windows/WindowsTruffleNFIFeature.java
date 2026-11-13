@@ -26,28 +26,34 @@ package com.oracle.svm.truffle.nfi.windows;
 
 import org.graalvm.nativeimage.ImageSingletons;
 import org.graalvm.nativeimage.Platform;
-import org.graalvm.nativeimage.Platforms;
 import org.graalvm.nativeimage.c.type.CCharPointer;
 import org.graalvm.nativeimage.c.type.CTypeConversion;
-import org.graalvm.nativeimage.hosted.Feature;
 import org.graalvm.word.PointerBase;
-import org.graalvm.word.WordFactory;
+import org.graalvm.word.impl.Word;
 
-import com.oracle.svm.core.SubstrateUtil;
-import com.oracle.svm.core.annotate.AutomaticFeature;
+import com.oracle.svm.core.feature.InternalFeature;
 import com.oracle.svm.core.jdk.PlatformNativeLibrarySupport;
 import com.oracle.svm.core.windows.WindowsUtils;
 import com.oracle.svm.core.windows.headers.LibLoaderAPI;
 import com.oracle.svm.core.windows.headers.WinBase.HMODULE;
 import com.oracle.svm.core.windows.headers.WindowsLibC;
+import com.oracle.svm.shared.singletons.traits.BuiltinTraits.DisallowLayered;
+import com.oracle.svm.shared.singletons.traits.BuiltinTraits.NoLayeredCallbacks;
+import com.oracle.svm.shared.singletons.traits.BuiltinTraits.RuntimeAccessOnly;
+import com.oracle.svm.shared.singletons.traits.SingletonTraits;
+import com.oracle.svm.shared.util.SubstrateUtil;
 import com.oracle.svm.truffle.nfi.Target_com_oracle_truffle_nfi_backend_libffi_NFIUnsatisfiedLinkError;
+import com.oracle.svm.truffle.nfi.TruffleNFIFeature;
 import com.oracle.svm.truffle.nfi.TruffleNFISupport;
 import com.oracle.truffle.api.CompilerDirectives;
 import com.oracle.truffle.api.exception.AbstractTruffleException;
 
-@AutomaticFeature
-@Platforms(Platform.WINDOWS.class)
-public final class WindowsTruffleNFIFeature implements Feature {
+public final class WindowsTruffleNFIFeature implements InternalFeature {
+
+    @Override
+    public boolean isInConfiguration(IsInConfigurationAccess access) {
+        return ImageSingletons.contains(TruffleNFIFeature.class) && Platform.includedIn(Platform.WINDOWS.class);
+    }
 
     @Override
     public void duringSetup(DuringSetupAccess access) {
@@ -55,6 +61,7 @@ public final class WindowsTruffleNFIFeature implements Feature {
     }
 }
 
+@SingletonTraits(access = RuntimeAccessOnly.class, layeredCallbacks = NoLayeredCallbacks.class, other = DisallowLayered.class)
 final class WindowsTruffleNFISupport extends TruffleNFISupport {
     static void initialize() {
         ImageSingletons.add(TruffleNFISupport.class, new WindowsTruffleNFISupport());
@@ -72,13 +79,10 @@ final class WindowsTruffleNFISupport extends TruffleNFISupport {
     @Override
     protected long loadLibraryImpl(long nativeContext, String name, int flags) {
         String dllPath = name;
-        CTypeConversion.CCharPointerHolder dllpathPin = CTypeConversion.toCString(dllPath);
-        CCharPointer dllPathPtr = dllpathPin.get();
-        /*
-         * WinBase.SetDllDirectoryA(dllpathPtr); CCharPointerHolder pathPin =
-         * CTypeConversion.toCString(path); CCharPointer pathPtr = pathPin.get();
-         */
-        HMODULE dlhandle = LibLoaderAPI.LoadLibraryA(dllPathPtr);
+        HMODULE dlhandle;
+        try (WindowsUtils.WCharPointerHolder dllpathPin = WindowsUtils.toWideCString(dllPath)) {
+            dlhandle = LibLoaderAPI.LoadLibraryExW(dllpathPin.get(), Word.nullPointer(), flags);
+        }
         if (dlhandle.isNull()) {
             CompilerDirectives.transferToInterpreter();
             throw SubstrateUtil.cast(new Target_com_oracle_truffle_nfi_backend_libffi_NFIUnsatisfiedLinkError(WindowsUtils.lastErrorString(dllPath)), AbstractTruffleException.class);
@@ -88,7 +92,7 @@ final class WindowsTruffleNFISupport extends TruffleNFISupport {
 
     @Override
     protected void freeLibraryImpl(long library) {
-        LibLoaderAPI.FreeLibrary(WordFactory.pointer(library));
+        LibLoaderAPI.FreeLibrary(Word.pointer(library));
     }
 
     @Override
@@ -102,7 +106,7 @@ final class WindowsTruffleNFISupport extends TruffleNFISupport {
             ret = nativeLibrarySupport.findBuiltinSymbol(name);
         } else {
             try (CTypeConversion.CCharPointerHolder symbol = CTypeConversion.toCString(name)) {
-                ret = LibLoaderAPI.GetProcAddress(WordFactory.pointer(library), symbol.get());
+                ret = LibLoaderAPI.GetProcAddress(Word.pointer(library), symbol.get());
             }
         }
 

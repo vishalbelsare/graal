@@ -27,81 +27,91 @@ package com.oracle.svm.hosted.code;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 
-import org.graalvm.compiler.nodes.java.AbstractNewObjectNode;
-import org.graalvm.compiler.nodes.java.NewInstanceNode;
+import com.oracle.svm.core.BuilderUtil;
+import com.oracle.svm.core.code.FactoryMethodHolder;
+import com.oracle.svm.core.code.FactoryThrowMethodHolder;
 import org.graalvm.nativeimage.ImageSingletons;
-import org.graalvm.nativeimage.hosted.Feature;
 
-import com.oracle.graal.pointsto.infrastructure.UniverseMetaAccess;
+import com.oracle.graal.pointsto.infrastructure.ResolvedSignature;
 import com.oracle.graal.pointsto.meta.AnalysisMetaAccess;
 import com.oracle.graal.pointsto.meta.AnalysisMethod;
-import com.oracle.graal.pointsto.meta.AnalysisUniverse;
-import com.oracle.svm.core.annotate.AutomaticFeature;
-import com.oracle.svm.core.code.FactoryMethodHolder;
-import com.oracle.svm.hosted.meta.HostedMetaAccess;
-import com.oracle.svm.hosted.meta.HostedMethod;
-import com.oracle.svm.hosted.meta.HostedUniverse;
+import com.oracle.graal.pointsto.meta.AnalysisType;
+import com.oracle.svm.shared.singletons.AutomaticallyRegisteredImageSingleton;
+import com.oracle.svm.shared.util.VMError;
+import com.oracle.svm.hosted.imagelayer.HostedImageLayerBuildingSupport;
 import com.oracle.svm.hosted.phases.HostedGraphKit;
+import com.oracle.svm.shared.singletons.traits.BuiltinTraits.BuildtimeAccessOnly;
+import com.oracle.svm.shared.singletons.traits.BuiltinTraits.NoLayeredCallbacks;
+import com.oracle.svm.shared.singletons.traits.BuiltinTraits.PartiallyLayerAware;
+import com.oracle.svm.shared.singletons.traits.SingletonTraits;
+import com.oracle.svm.util.GuestAccess;
 
+import jdk.graal.compiler.nodes.java.AbstractNewObjectNode;
+import jdk.graal.compiler.nodes.java.NewInstanceNode;
 import jdk.vm.ci.meta.ConstantPool;
-import jdk.vm.ci.meta.MetaAccessProvider;
 import jdk.vm.ci.meta.ResolvedJavaMethod;
 import jdk.vm.ci.meta.ResolvedJavaType;
 import jdk.vm.ci.meta.Signature;
 
+@AutomaticallyRegisteredImageSingleton
+@SingletonTraits(access = BuildtimeAccessOnly.class, layeredCallbacks = NoLayeredCallbacks.class, other = PartiallyLayerAware.class)
 public class FactoryMethodSupport {
 
     public static FactoryMethodSupport singleton() {
         return ImageSingletons.lookup(FactoryMethodSupport.class);
     }
 
-    private final Map<AnalysisMethod, FactoryMethod> factoryMethods = new ConcurrentHashMap<>();
-
-    public ResolvedJavaMethod lookup(UniverseMetaAccess metaAccess, ResolvedJavaMethod constructor) {
-        HostedUniverse hUniverse;
-        AnalysisMetaAccess aMetaAccess;
-        if (metaAccess instanceof HostedMetaAccess) {
-            hUniverse = (HostedUniverse) metaAccess.getUniverse();
-            aMetaAccess = (AnalysisMetaAccess) metaAccess.getWrapped();
-        } else {
-            hUniverse = null;
-            aMetaAccess = (AnalysisMetaAccess) metaAccess;
-        }
-        AnalysisUniverse aUniverse = (AnalysisUniverse) aMetaAccess.getUniverse();
-        MetaAccessProvider unwrappedMetaAccess = aMetaAccess.getWrapped();
-
-        AnalysisMethod aConstructor = constructor instanceof HostedMethod ? ((HostedMethod) constructor).getWrapped() : (AnalysisMethod) constructor;
-        FactoryMethod factoryMethod = factoryMethods.computeIfAbsent(aConstructor, key -> {
-            ResolvedJavaMethod unwrappedConstructor = aConstructor.getWrapped();
-            ResolvedJavaType declaringClass = unwrappedMetaAccess.lookupJavaType(FactoryMethodHolder.class);
-            Signature signature = new SimpleSignature(unwrappedConstructor.toParameterTypes(), unwrappedConstructor.getDeclaringClass());
-            ConstantPool constantPool = unwrappedConstructor.getConstantPool();
-            return new FactoryMethod(unwrappedConstructor, declaringClass, signature, constantPool);
-        });
-
-        AnalysisMethod aFactoryMethod = aUniverse.lookup(factoryMethod);
-        if (hUniverse != null) {
-            return hUniverse.lookup(aFactoryMethod);
-        } else {
-            return aFactoryMethod;
-        }
+    private record ConstructorDescription(AnalysisMethod aConstructor, AnalysisType aInstantiatedType) {
     }
 
-    protected boolean inlineConstructor(@SuppressWarnings("unused") ResolvedJavaMethod constructor) {
-        return false;
+    private final Map<ConstructorDescription, FactoryMethod> factoryMethods = new ConcurrentHashMap<>();
+    private final Map<ConstructorDescription, FactoryMethod> factoryThrowMethods = new ConcurrentHashMap<>();
+
+    public static boolean isFactoryMethod(AnalysisMethod method) {
+        ResolvedJavaType declaringClass = method.getDeclaringClass().getWrapped();
+        return declaringClass.equals(GuestAccess.get().lookupType(FactoryMethodHolder.class)) || declaringClass.equals(GuestAccess.get().lookupType(FactoryThrowMethodHolder.class));
+    }
+
+    public AnalysisMethod lookup(AnalysisMetaAccess aMetaAccess, AnalysisMethod aConstructor, boolean throwAllocatedObject) {
+        return lookup(aMetaAccess, aConstructor, aConstructor.getDeclaringClass(), throwAllocatedObject);
+    }
+
+    public AnalysisMethod lookup(AnalysisMetaAccess aMetaAccess, AnalysisMethod aConstructor, AnalysisType aInstantiatedType, boolean throwAllocatedObject) {
+        AnalysisType aInstType = aInstantiatedType == null ? aConstructor.getDeclaringClass() : aInstantiatedType;
+        VMError.guarantee(aConstructor.getDeclaringClass().isAssignableFrom(aInstType), "Must be assignable from");
+        VMError.guarantee(aInstType.isInstanceClass() && !aInstType.isAbstract(), "Must be a non-abstract instance class");
+        Map<ConstructorDescription, FactoryMethod> methods = throwAllocatedObject ? factoryThrowMethods : factoryMethods;
+        FactoryMethod factoryMethod = methods.computeIfAbsent(new ConstructorDescription(aConstructor, aInstType), _ -> {
+            /*
+             * Computing the factory method name via the analysis universe ensures that type name
+             * modifications, like to make lambda names unique, are incorporated in the name.
+             */
+            String name = BuilderUtil.uniqueStubName(aConstructor);
+            /*
+             * Computing the signature types via the analysis universe ensures that we have all
+             * substitutions applied and all types already resolved.
+             */
+            ResolvedJavaType[] unwrappedParameterTypes = new ResolvedJavaType[aConstructor.getSignature().getParameterCount(false)];
+            for (int i = 0; i < unwrappedParameterTypes.length; i++) {
+                unwrappedParameterTypes[i] = aConstructor.getSignature().getParameterType(i).getWrapped();
+            }
+            ResolvedJavaType unwrappedReturnType = (throwAllocatedObject ? aMetaAccess.lookupJavaType(void.class) : aInstType).getWrapped();
+            Signature unwrappedSignature = ResolvedSignature.fromArray(unwrappedParameterTypes, unwrappedReturnType);
+            ResolvedJavaMethod unwrappedConstructor = aConstructor.getWrapped();
+            ResolvedJavaType unwrappedInstantiatedType = aInstType.getWrapped();
+            ResolvedJavaType unwrappedDeclaringClass = throwAllocatedObject ? GuestAccess.get().lookupType(FactoryThrowMethodHolder.class) : GuestAccess.get().lookupType(FactoryMethodHolder.class);
+            ConstantPool unwrappedConstantPool = unwrappedConstructor.getConstantPool();
+            return new FactoryMethod(name, unwrappedConstructor, unwrappedInstantiatedType, unwrappedDeclaringClass, unwrappedSignature, unwrappedConstantPool, throwAllocatedObject);
+        });
+
+        AnalysisMethod aMethod = aMetaAccess.getUniverse().lookup(factoryMethod);
+        if (HostedImageLayerBuildingSupport.buildingSharedLayer()) {
+            aMetaAccess.getUniverse().getBigbang().tryRegisterMethodForBaseImage(aMethod);
+        }
+        return aMethod;
     }
 
     protected AbstractNewObjectNode createNewInstance(HostedGraphKit kit, ResolvedJavaType type, boolean fillContents) {
         return kit.append(new NewInstanceNode(type, fillContents));
-    }
-}
-
-@AutomaticFeature
-final class FactoryMethodFeature implements Feature {
-    @Override
-    public void beforeAnalysis(BeforeAnalysisAccess arg) {
-        if (!ImageSingletons.contains(FactoryMethodSupport.class)) {
-            ImageSingletons.add(FactoryMethodSupport.class, new FactoryMethodSupport());
-        }
     }
 }

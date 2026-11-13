@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2021, 2021, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2021, 2026, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -24,19 +24,35 @@
  */
 package com.oracle.svm.core.headers;
 
-import org.graalvm.compiler.api.replacements.Fold;
+import static com.oracle.svm.shared.Uninterruptible.CALLED_FROM_UNINTERRUPTIBLE_CODE;
+
 import org.graalvm.nativeimage.ImageSingletons;
+import org.graalvm.nativeimage.UnmanagedMemory;
 import org.graalvm.nativeimage.c.type.CCharPointer;
 import org.graalvm.nativeimage.c.type.CCharPointerPointer;
 import org.graalvm.word.PointerBase;
 import org.graalvm.word.SignedWord;
 import org.graalvm.word.UnsignedWord;
 
-import com.oracle.svm.core.annotate.Uninterruptible;
+import com.oracle.svm.core.imagelayer.ImageLayerBuildingSupport;
+import com.oracle.svm.core.imagelayer.LayeredFoldResolver;
+import com.oracle.svm.core.memory.NativeMemory;
+import com.oracle.svm.core.memory.NullableNativeMemory;
+import com.oracle.svm.guest.staging.core.memory.UntrackedNullableNativeMemory;
+import com.oracle.svm.shared.Uninterruptible;
+import com.oracle.svm.shared.singletons.LayeredImageSingletonSupport;
+import com.oracle.svm.shared.singletons.traits.LayeredInstallationKindSingletonTrait;
+import com.oracle.svm.shared.singletons.traits.SingletonLayeredInstallationKind;
 
+import jdk.graal.compiler.api.replacements.Fold;
+
+/** Platform-independent LibC support. */
 public class LibC {
-    public static final int EXIT_CODE_ABORT = 99;
-
+    /// Gets the current thread's native error number.
+    ///
+    /// A native operation and the read of its `errno` must be in the same uninterruptible region.
+    /// A safepoint or a Java-to-native transition between them can run code that overwrites `errno`.
+    /// Callers that need to allocate or throw must capture the error before leaving that region.
     @Uninterruptible(reason = "Called from uninterruptible code.", mayBeInlined = true)
     public static int errno() {
         return libc().errno();
@@ -53,6 +69,11 @@ public class LibC {
     }
 
     @Uninterruptible(reason = "Called from uninterruptible code.", mayBeInlined = true)
+    public static <T extends PointerBase> int memcmp(T s1, T s2, UnsignedWord n) {
+        return libc().memcmp(s1, s2, n);
+    }
+
+    @Uninterruptible(reason = "Called from uninterruptible code.", mayBeInlined = true)
     public static <T extends PointerBase> T memmove(T dest, PointerBase src, UnsignedWord n) {
         return libc().memmove(dest, src, n);
     }
@@ -63,43 +84,44 @@ public class LibC {
     }
 
     @Uninterruptible(reason = "Called from uninterruptible code.", mayBeInlined = true)
-    public static <T extends PointerBase> T malloc(UnsignedWord size) {
-        return libc().malloc(size);
-    }
-
-    @Uninterruptible(reason = "Called from uninterruptible code.", mayBeInlined = true)
-    public static <T extends PointerBase> T calloc(UnsignedWord nmemb, UnsignedWord size) {
-        return libc().calloc(nmemb, size);
-    }
-
-    @Uninterruptible(reason = "Called from uninterruptible code.", mayBeInlined = true)
-    public static <T extends PointerBase> T realloc(PointerBase ptr, UnsignedWord size) {
-        return libc().realloc(ptr, size);
-    }
-
-    @Uninterruptible(reason = "Called from uninterruptible code.", mayBeInlined = true)
-    public static void free(PointerBase ptr) {
-        libc().free(ptr);
-    }
-
-    @Uninterruptible(reason = "Called from uninterruptible code.", mayBeInlined = true)
     public static void exit(int status) {
         libc().exit(status);
     }
 
     @Uninterruptible(reason = "Called from uninterruptible code.", mayBeInlined = true)
     public static void abort() {
-        /*
-         * Using the abort system call has unexpected performance implications on Oracle Enterprise
-         * Linux: Storing the crash dump information takes minutes even for tiny images. Therefore,
-         * we just exit with an otherwise unused exit code.
-         */
-        exit(EXIT_CODE_ABORT);
+        libc().abort();
+    }
+
+    /**
+     * May only be used to free memory that was allocated by the libc or other native code. Do
+     * <b>NOT</b> use this method when freeing memory that was allocated via internal APIs such as
+     * {@link NativeMemory}, {@link NullableNativeMemory}, {@link UntrackedNullableNativeMemory}, or
+     * {@link UnmanagedMemory}.
+     */
+    @Uninterruptible(reason = CALLED_FROM_UNINTERRUPTIBLE_CODE, mayBeInlined = true)
+    public static void free(PointerBase ptr) {
+        libc().free(ptr);
     }
 
     @Uninterruptible(reason = "Called from uninterruptible code.", mayBeInlined = true)
     public static UnsignedWord strlen(CCharPointer str) {
         return libc().strlen(str);
+    }
+
+    @Uninterruptible(reason = "Called from uninterruptible code.", mayBeInlined = true)
+    public static CCharPointer strdup(CCharPointer str) {
+        return libc().strdup(str);
+    }
+
+    @Uninterruptible(reason = "Called from uninterruptible code.", mayBeInlined = true)
+    public static int strcmp(CCharPointer s1, CCharPointer s2) {
+        return libc().strcmp(s1, s2);
+    }
+
+    @Uninterruptible(reason = CALLED_FROM_UNINTERRUPTIBLE_CODE, mayBeInlined = true)
+    public static int strncmp(CCharPointer s1, CCharPointer s2, UnsignedWord n) {
+        return libc().strncmp(s1, s2, n);
     }
 
     @Uninterruptible(reason = "Called from uninterruptible code.", mayBeInlined = true)
@@ -112,12 +134,20 @@ public class LibC {
         return libc().strtoull(string, endPtr, base);
     }
 
-    @Fold
+    @Fold(resolver = LayeredFoldResolver.InitialLayer.class)
     public static boolean isSupported() {
-        return ImageSingletons.contains(LibCSupport.class);
+        return ImageSingletons.contains(LibCSupport.class) || isInstalledInInitialLayer();
     }
 
-    @Fold
+    private static boolean isInstalledInInitialLayer() {
+        if (ImageLayerBuildingSupport.buildingExtensionLayer()) {
+            LayeredInstallationKindSingletonTrait trait = LayeredImageSingletonSupport.singleton().getTraitForUninstalledSingleton(LibCSupport.class, LayeredInstallationKindSingletonTrait.class);
+            return trait.metadata() == SingletonLayeredInstallationKind.INITIAL_LAYER_ONLY;
+        }
+        return false;
+    }
+
+    @Fold(resolver = LayeredFoldResolver.InitialLayer.class)
     static LibCSupport libc() {
         return ImageSingletons.lookup(LibCSupport.class);
     }

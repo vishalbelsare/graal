@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2018, 2021, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2018, 2024, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * The Universal Permissive License (UPL), Version 1.0
@@ -44,6 +44,7 @@ import java.util.Objects;
 
 import com.oracle.truffle.api.CompilerDirectives;
 import com.oracle.truffle.api.CompilerDirectives.CompilationFinal;
+import com.oracle.truffle.api.HostCompilerDirectives.InliningRoot;
 import com.oracle.truffle.api.frame.VirtualFrame;
 import com.oracle.truffle.api.interop.TruffleObject;
 import com.oracle.truffle.api.nodes.RootNode;
@@ -82,6 +83,7 @@ abstract class HostToGuestRootNode extends RootNode {
     protected abstract Class<?> getReceiverType();
 
     @Override
+    @InliningRoot
     public final Object execute(VirtualFrame frame) {
         Object[] args = frame.getArguments();
         PolyglotLanguageContext languageContext = layer.getSingleConstantLanguageContext(language);
@@ -91,9 +93,8 @@ abstract class HostToGuestRootNode extends RootNode {
         PolyglotContextImpl constantContext = layer.getSingleConstantContext();
         if (constantContext == null) {
             constantContext = languageContext.context;
-        } else {
-            assert languageContext.context == constantContext;
         }
+        assert languageContext.context == constantContext;
         PolyglotContextImpl context = constantContext;
 
         assert Objects.equals(layer, languageContext.context.layer) : PolyglotSharingLayer.invalidSharingError(this, layer, languageContext.context.layer);

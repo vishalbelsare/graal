@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2020, 2020, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2020, 2022, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -22,17 +22,18 @@
  */
 package com.oracle.truffle.espresso.redefinition;
 
-import com.oracle.truffle.espresso.descriptors.Symbol;
-import com.oracle.truffle.espresso.impl.ObjectKlass;
-import com.oracle.truffle.espresso.runtime.StaticObject;
-
 import java.lang.ref.WeakReference;
 import java.util.ArrayList;
+
+import com.oracle.truffle.espresso.classfile.descriptors.Name;
+import com.oracle.truffle.espresso.classfile.descriptors.Symbol;
+import com.oracle.truffle.espresso.impl.ObjectKlass;
+import com.oracle.truffle.espresso.runtime.staticobject.StaticObject;
 
 // Represents ClassInfo instances that are cached in the global
 // cache for all classes having been involved in a redefinition
 public final class ImmutableClassInfo extends ClassInfo {
-    private final Symbol<Symbol.Name> name; // key in global cache
+    private final Symbol<Name> name; // key in global cache
     private final WeakReference<ObjectKlass> klass;
     private final StaticObject classLoader;
     private final byte[] bytes;
@@ -45,8 +46,9 @@ public final class ImmutableClassInfo extends ClassInfo {
 
     private final ArrayList<ImmutableClassInfo> innerClasses;
 
-    ImmutableClassInfo(ObjectKlass klass, Symbol<Symbol.Name> originalName, StaticObject classLoader, String classFingerprint, String methodFingerprint, String fieldFingerprint,
-                    String enclosingMethodFingerprint, ArrayList<ImmutableClassInfo> inners, byte[] bytes) {
+    ImmutableClassInfo(ObjectKlass klass, Symbol<Name> originalName, StaticObject classLoader, String classFingerprint, String methodFingerprint, String fieldFingerprint,
+                    String enclosingMethodFingerprint, ArrayList<ImmutableClassInfo> inners, byte[] bytes, boolean isEnumSwitchmaphelper, boolean isInnerTestKlass) {
+        super(isEnumSwitchmaphelper, isInnerTestKlass);
         this.klass = new WeakReference<>(klass);
         this.name = originalName;
         this.classLoader = classLoader;
@@ -59,7 +61,7 @@ public final class ImmutableClassInfo extends ClassInfo {
     }
 
     @Override
-    public Symbol<Symbol.Name> getName() {
+    public Symbol<Name> getName() {
         return name;
     }
 

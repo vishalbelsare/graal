@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2021, 2021, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2021, 2025, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -24,152 +24,268 @@
  */
 package com.oracle.svm.core.hub;
 
-// Checkstyle: allow reflection
-
-import static com.oracle.svm.core.hub.DynamicHub.NO_CLASS_LOADER;
-
+import java.lang.ref.SoftReference;
 import java.lang.reflect.Constructor;
-import java.lang.reflect.Executable;
-import java.lang.reflect.Method;
 import java.lang.reflect.Modifier;
 import java.security.ProtectionDomain;
-import java.util.ArrayList;
-import java.util.Arrays;
-import java.util.List;
 
-import org.graalvm.collections.Pair;
-import org.graalvm.nativeimage.ImageSingletons;
+import org.graalvm.nativeimage.Platform;
+import org.graalvm.nativeimage.Platforms;
 
-import com.oracle.svm.core.hub.DynamicHub.ReflectionData;
-import com.oracle.svm.core.jdk.ProtectionDomainSupport;
-import com.oracle.svm.core.reflect.MethodMetadataDecoder;
-import com.oracle.svm.core.reflect.MethodMetadataDecoder.MethodDescriptor;
-import com.oracle.svm.core.util.VMError;
+import com.oracle.svm.core.classinitialization.ClassInitializationInfo;
+import com.oracle.svm.guest.staging.configure.RuntimeDynamicAccessMetadata;
+import com.oracle.svm.guest.staging.core.heap.UnknownObjectField;
+import com.oracle.svm.guest.staging.core.heap.UnknownPrimitiveField;
+import com.oracle.svm.guest.staging.hub.ClassDefinitionInfo;
+import com.oracle.svm.core.imagelayer.ImageLayerBuildingSupport;
+import com.oracle.svm.guest.staging.layered.LayeredFieldValue;
+import com.oracle.svm.guest.staging.layered.LayeredFieldValueTransformer;
+import com.oracle.svm.shared.BuildPhaseProvider;
 
-/** An optional, non-immutable companion to a {@link DynamicHub} instance. */
+import jdk.internal.vm.annotation.Stable;
+import sun.reflect.annotation.AnnotationType;
+import sun.reflect.generics.repository.ClassRepository;
+
+/**
+ * Storage for non-critical or mutable data of {@link DynamicHub}.
+ *
+ * Some of these fields are immutable and moving them to a separate read-only companion class might
+ * improve sharing between isolates and processes, but could increase image size.
+ */
 public final class DynamicHubCompanion {
-    private final DynamicHub hub;
+    /** Field used for module information access at run-time. */
+    final Module module;
 
-    private String packageName;
-    private Object classLoader = NO_CLASS_LOADER;
-    private ProtectionDomain protectionDomain;
-    private ReflectionData completeReflectionData;
+    /**
+     * The hub for the superclass, or null if an interface, a primitive type, or
+     * {@link java.lang.Object}.
+     *
+     * @see Class#getSuperclass()
+     */
+    final DynamicHub superHub;
 
-    public DynamicHubCompanion(DynamicHub hub) {
-        this.hub = hub;
+    /** Source file name if known; null otherwise. */
+    final String sourceFileName;
+
+    /** The {@link Modifier modifiers} of this class. */
+    final int modifiers;
+
+    /**
+     * The class that serves as the host for the nest. All nestmates have the same host. Initially
+     * set to {@code null} for runtime-loaded classes.
+     */
+    @Stable Class<?> nestHost;
+
+    /** The simple binary name of this class, as returned by {@code Class.getSimpleBinaryName0}. */
+    final String simpleBinaryName;
+
+    /**
+     * The class that declares this class, as returned by {@code Class.getDeclaringClass0} or an
+     * exception that happened at image-build time.
+     */
+    Object declaringClass;
+
+    final String signature;
+
+    /** Similar to {@code DynamicHub.flags}, but set later during the image build. */
+    @UnknownPrimitiveField(availability = BuildPhaseProvider.AfterHostedUniverse.class) //
+    @LayeredFieldValue(transformer = JNIAccessibleFlagTransformer.class) //
+    @Stable byte additionalFlags;
+
+    //
+    /**
+     * The hub for an array of this type, or null if the array type has been determined as
+     * uninstantiated by the static analysis. In layered builds, it is possible for this value to be
+     * initially set to null and then updated in a subsequent layer.
+     */
+    @LayeredFieldValue(transformer = ArrayHubTransformer.class) @Stable DynamicHub arrayHub;
+
+    /**
+     * The interfaces that this class implements. Either null (no interfaces), a {@link DynamicHub}
+     * (one interface), or a {@link DynamicHub}[] array (more than one interface).
+     */
+    @Stable Object interfacesEncoding;
+
+    /**
+     * Reference to a list of enum values for subclasses of {@link Enum}; null otherwise.
+     */
+    @Stable Object enumConstantsReference;
+
+    /**
+     * Back link to the SubstrateType used by the substrate meta access. Only used for the subset of
+     * types for which a SubstrateType exists.
+     */
+    @UnknownObjectField(availability = BuildPhaseProvider.AfterAnalysis.class, fullyQualifiedTypes = "com.oracle.svm.graal.meta.SubstrateType", canBeNull = true) //
+    @Stable DynamicHubProvider metaType;
+
+    /**
+     * Metadata for running class initializers at run time. Refers to a singleton marker object for
+     * classes/interfaces already initialized during image generation, i.e., this field is never
+     * null at run time.
+     */
+    @Stable ClassInitializationInfo classInitializationInfo;
+
+    /**
+     * Metadata for querying the reflection data. When using layered images this field is always
+     * null and should not be queried. Instead, use {@link LayeredReflectionMetadataSingleton}.
+     */
+    @UnknownObjectField(canBeNull = true, types = ImageReflectionMetadata.class, availability = BuildPhaseProvider.AfterCompilation.class) //
+    @Stable ReflectionMetadata reflectionMetadata;
+
+    /** Encoded compact image reflection metadata for non-layered image classes. */
+    @UnknownPrimitiveField(availability = BuildPhaseProvider.AfterCompilation.class) //
+    @Stable int encodedReflectionMetadata;
+
+    @UnknownObjectField(canBeNull = true, types = ImageDynamicHubMetadata.class, availability = BuildPhaseProvider.AfterCompilation.class) //
+    @Stable DynamicHubMetadata hubMetadata;
+
+    @Platforms(Platform.HOSTED_ONLY.class) //
+    @Stable DynamicHub dynamicHub;
+
+    /**
+     * Classloader used for loading this class. Most classes have the correct class loader set
+     * already at image build time. {@link PredefinedClassesSupport Predefined classes} get their
+     * classloader only at run time, before "loading" the field value is
+     * {@link DynamicHub#NO_CLASS_LOADER}.
+     */
+    Object classLoader;
+    DynamicHubProvider interpreterType;
+
+    String packageName;
+    ProtectionDomain protectionDomain;
+    ClassRepository genericInfo;
+    SoftReference<Target_java_lang_Class_ReflectionData<?>> reflectionData;
+    AnnotationType annotationType;
+    @UnknownObjectField(fullyQualifiedTypes = "java.lang.Class$AnnotationData", canBeNull = true, availability = BuildPhaseProvider.AfterCompilation.class) //
+    Object annotationData;
+    Constructor<?> cachedConstructor;
+    Object jfrEventConfiguration;
+    @Stable RuntimeDynamicAccessMetadata dynamicAccess;
+    @Stable RuntimeDynamicAccessMetadata canUnsafeAllocate;
+    Object classData;
+
+    @Platforms(Platform.HOSTED_ONLY.class)
+    static DynamicHubCompanion createHosted(Module module, DynamicHub superHub, String sourceFileName, int modifiers,
+                    Object classLoader, Class<?> nestHost, String simpleBinaryName, Object declaringClass, String signature, Object classData, DynamicHub dynamicHub) {
+        return new DynamicHubCompanion(module, superHub, sourceFileName, modifiers, classLoader, nestHost, simpleBinaryName, declaringClass, signature, classData, dynamicHub);
     }
 
-    public String getPackageName() {
-        if (packageName == null) {
-            packageName = hub.computePackageName();
+    @Platforms(Platform.HOSTED_ONLY.class)
+    private DynamicHubCompanion(Module module, DynamicHub superHub, String sourceFileName, int modifiers,
+                    Object classLoader, Class<?> nestHost, String simpleBinaryName, Object declaringClass, String signature, Object classData, DynamicHub dynamicHub) {
+        this(module, superHub, sourceFileName, modifiers, classLoader, nestHost, simpleBinaryName, declaringClass, signature, classData, (ProtectionDomain) null);
+        this.dynamicHub = dynamicHub;
+    }
+
+    static DynamicHubCompanion createAtRuntime(Module module, DynamicHub superHub, String sourceFileName, int modifiers,
+                    ClassLoader classLoader, String simpleBinaryName, Object declaringClass, String signature, ClassDefinitionInfo info) {
+        assert RuntimeClassLoading.isSupported();
+        return new DynamicHubCompanion(module, superHub, sourceFileName, modifiers, classLoader, info.dynamicNest, simpleBinaryName, declaringClass, signature, info.classData, info.protectionDomain);
+    }
+
+    private DynamicHubCompanion(Module module, DynamicHub superHub, String sourceFileName, int modifiers,
+                    Object classLoader, Class<?> nestHost, String simpleBinaryName, Object declaringClass, String signature, Object classData, ProtectionDomain protectionDomain) {
+        this.module = module;
+        this.superHub = superHub;
+        this.sourceFileName = sourceFileName;
+        this.modifiers = modifiers;
+        this.nestHost = nestHost;
+        this.simpleBinaryName = simpleBinaryName;
+        this.declaringClass = declaringClass;
+        this.signature = signature;
+
+        this.classLoader = classLoader;
+        this.classData = classData;
+        this.protectionDomain = protectionDomain;
+    }
+
+    public void setHubMetadata(RuntimeDynamicHubMetadata hubMetadata) {
+        this.hubMetadata = hubMetadata;
+    }
+
+    public void setReflectionMetadata(RuntimeReflectionMetadata reflectionMetadata) {
+        this.reflectionMetadata = reflectionMetadata;
+    }
+
+    @Platforms(Platform.HOSTED_ONLY.class)
+    public DynamicHub getDynamicHub() {
+        return dynamicHub;
+    }
+
+    /**
+     * In layered builds it is possible for a {@link DynamicHubCompanion#arrayHub} to become
+     * reachable in a later layer than the layer in which the companion is installed in. When this
+     * happens we must update the companion's field to point to the newly installed value.
+     */
+    @Platforms(Platform.HOSTED_ONLY.class)
+    static class ArrayHubTransformer extends LayeredFieldValueTransformer<DynamicHubCompanion> {
+        boolean appLayer = ImageLayerBuildingSupport.buildingApplicationLayer();
+
+        @Override
+        public boolean isValueAvailable(DynamicHubCompanion receiver) {
+            /*
+             * As soon as we have a non-null value we set the field. Otherwise, once the ready for
+             * compilation phase has been reached no new dynamic hubs will be added and the value
+             * can set.
+             */
+            return receiver.arrayHub != null || BuildPhaseProvider.isReadyForCompilation();
         }
-        return packageName;
-    }
 
-    boolean hasClassLoader() {
-        return classLoader != NO_CLASS_LOADER;
-    }
-
-    public ClassLoader getClassLoader() {
-        Object loader = classLoader;
-        VMError.guarantee(loader != NO_CLASS_LOADER);
-        return (ClassLoader) loader;
-    }
-
-    public void setClassLoader(ClassLoader loader) {
-        VMError.guarantee(classLoader == NO_CLASS_LOADER && loader != NO_CLASS_LOADER);
-        classLoader = loader;
-    }
-
-    public ProtectionDomain getProtectionDomain() {
-        if (protectionDomain == null) {
-            protectionDomain = ProtectionDomainSupport.allPermDomain();
+        @Override
+        public Result transform(DynamicHubCompanion receiver) {
+            /*
+             * When there is a concrete array hub value, then no update is needed in later layers.
+             * However, when both the value is null and we are not in the application layer, then we
+             * may update the value in a later layer.
+             */
+            return new Result(receiver.arrayHub, receiver.arrayHub == null && !appLayer);
         }
-        return protectionDomain;
-    }
 
-    public void setProtectionDomain(ProtectionDomain domain) {
-        VMError.guarantee(protectionDomain == null && domain != null);
-        protectionDomain = domain;
-    }
-
-    public ReflectionData getCompleteReflectionData() {
-        if (completeReflectionData == null) {
-            List<Method> newDeclaredMethods = new ArrayList<>(Arrays.asList(hub.rd.declaredMethods));
-            List<Method> newPublicMethods = new ArrayList<>(Arrays.asList(hub.rd.publicMethods));
-            List<Constructor<?>> newDeclaredConstructors = new ArrayList<>(Arrays.asList(hub.rd.declaredConstructors));
-            List<Constructor<?>> newPublicConstructors = new ArrayList<>(Arrays.asList(hub.rd.publicConstructors));
-            List<Method> newDeclaredPublicMethods = new ArrayList<>(Arrays.asList(hub.rd.declaredPublicMethods));
-
-            Pair<Executable[], MethodDescriptor[]> queriedAndHidingMethods = ImageSingletons.lookup(MethodMetadataDecoder.class).getQueriedAndHidingMethods(hub);
-            Executable[] queriedMethods = queriedAndHidingMethods.getLeft();
-            MethodDescriptor[] hidingMethods = queriedAndHidingMethods.getRight();
-            newMethods: for (Executable method : queriedMethods) {
-                if (method instanceof Constructor<?>) {
-                    Constructor<?> c = (Constructor<?>) method;
-                    for (Constructor<?> c2 : hub.rd.declaredConstructors) {
-                        if (Arrays.equals(c.getParameterTypes(), c2.getParameterTypes())) {
-                            continue newMethods;
-                        }
-                    }
-                    newDeclaredConstructors.add(c);
-                    if (Modifier.isPublic(c.getModifiers())) {
-                        newPublicConstructors.add(c);
-                    }
-                } else {
-                    Method m = (Method) method;
-                    for (Method m2 : hub.rd.declaredMethods) {
-                        if (m.getName().equals(m2.getName()) && Arrays.equals(m.getParameterTypes(), m2.getParameterTypes())) {
-                            continue newMethods;
-                        }
-                    }
-                    newDeclaredMethods.add(m);
-                    if (Modifier.isPublic(m.getModifiers())) {
-                        newPublicMethods.add(m);
-                        newDeclaredPublicMethods.add(m);
-                    }
-                }
-            }
-
-            /* Recursively add public superclass methods to the public methods list */
-            DynamicHub superHub = hub.getSuperHub();
-            if (superHub != null) {
-                addInheritedPublicMethods(newPublicMethods, superHub.privateGetPublicMethods(), hidingMethods, true);
-            }
-            for (DynamicHub interfaceHub : hub.getInterfaces()) {
-                addInheritedPublicMethods(newPublicMethods, interfaceHub.privateGetPublicMethods(), hidingMethods, hub.isInterface());
-            }
-
-            completeReflectionData = new ReflectionData(hub.rd.declaredFields, hub.rd.publicFields, hub.rd.publicUnhiddenFields, newDeclaredMethods.toArray(new Method[0]),
-                            newPublicMethods.toArray(new Method[0]),
-                            newDeclaredConstructors.toArray(new Constructor<?>[0]), newPublicConstructors.toArray(new Constructor<?>[0]), hub.rd.nullaryConstructor, hub.rd.declaredPublicFields,
-                            newDeclaredPublicMethods.toArray(new Method[0]), hub.rd.declaredClasses, hub.rd.permittedSubclasses, hub.rd.publicClasses, hub.rd.enclosingMethodOrConstructor,
-                            hub.rd.recordComponents);
+        @Override
+        public boolean isUpdateAvailable(DynamicHubCompanion receiver) {
+            /* A concrete new value has been found. */
+            return receiver.arrayHub != null;
         }
-        return completeReflectionData;
+
+        @Override
+        public Result update(DynamicHubCompanion receiver) {
+            assert receiver.arrayHub != null : "update should only be called when a valid arrayHub is available";
+            return new Result(receiver.arrayHub, false);
+        }
     }
 
-    private static void addInheritedPublicMethods(List<Method> newPublicMethods, Method[] parentMethods, MethodDescriptor[] hidingMethods, boolean includeStaticMethods) {
-        parentMethods: for (Method m : parentMethods) {
-            if (!includeStaticMethods && Modifier.isStatic(m.getModifiers())) {
-                continue;
-            }
-            for (Method m2 : newPublicMethods) {
-                if (m.getName().equals(m2.getName()) && Arrays.equals(m.getParameterTypes(), m2.getParameterTypes())) {
-                    if (m.getDeclaringClass() != m2.getDeclaringClass() && m2.getDeclaringClass().isAssignableFrom(m.getDeclaringClass())) {
-                        /* Need to store the more specific method */
-                        newPublicMethods.remove(m2);
-                        newPublicMethods.add(m);
-                    }
-                    continue parentMethods;
-                }
-            }
-            for (MethodDescriptor hidingMethod : hidingMethods) {
-                if (m.getName().equals(hidingMethod.getName()) && Arrays.equals(m.getParameterTypes(), hidingMethod.getParameterTypes())) {
-                    continue parentMethods;
-                }
-            }
-            newPublicMethods.add(m);
+    /**
+     * A class installed in an earlier layer can be registered for JNI access in a later layer. In
+     * that case, update the already installed companion with the newly set JNI-accessible bit.
+     */
+    @Platforms(Platform.HOSTED_ONLY.class)
+    static class JNIAccessibleFlagTransformer extends LayeredFieldValueTransformer<DynamicHubCompanion> {
+        boolean appLayer = ImageLayerBuildingSupport.buildingApplicationLayer();
+
+        @Override
+        public boolean isValueAvailable(@SuppressWarnings("unused") DynamicHubCompanion receiver) {
+            return BuildPhaseProvider.isReadyForCompilation();
+        }
+
+        @Override
+        public Result transform(DynamicHubCompanion receiver) {
+            boolean jniAccessible = DynamicHub.isJNIAccessibleFlagSet(receiver.additionalFlags);
+            return new Result(receiver.additionalFlags, !jniAccessible && !appLayer);
+        }
+
+        @Override
+        public boolean isUpdateAvailable(DynamicHubCompanion receiver) {
+            /*
+             * Wait until setSharedData has finalized the instantiated bit before caching the
+             * one-shot update result for the complete additionalFlags field.
+             */
+            return BuildPhaseProvider.isReadyForCompilation() && DynamicHub.isJNIAccessibleFlagSet(receiver.additionalFlags);
+        }
+
+        @Override
+        public Result update(DynamicHubCompanion receiver) {
+            assert DynamicHub.isJNIAccessibleFlagSet(receiver.additionalFlags) : "update should only be called when JNI accessibility was enabled";
+            return new Result(receiver.additionalFlags, false);
         }
     }
 }

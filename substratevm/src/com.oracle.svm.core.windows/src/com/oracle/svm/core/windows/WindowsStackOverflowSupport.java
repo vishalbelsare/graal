@@ -24,92 +24,46 @@
  */
 package com.oracle.svm.core.windows;
 
-import org.graalvm.nativeimage.ImageSingletons;
-import org.graalvm.nativeimage.Platform;
-import org.graalvm.nativeimage.Platforms;
 import org.graalvm.nativeimage.StackValue;
 import org.graalvm.nativeimage.c.struct.SizeOf;
 import org.graalvm.nativeimage.c.type.WordPointer;
-import org.graalvm.nativeimage.hosted.Feature;
 import org.graalvm.word.Pointer;
 import org.graalvm.word.UnsignedWord;
-import org.graalvm.word.WordFactory;
+import org.graalvm.word.impl.Word;
 
-import com.oracle.svm.core.annotate.AutomaticFeature;
-import com.oracle.svm.core.annotate.Uninterruptible;
-import com.oracle.svm.core.stack.StackOverflowCheck;
+import com.oracle.svm.shared.singletons.AutomaticallyRegisteredImageSingleton;
+import com.oracle.svm.guest.staging.core.stack.StackOverflowCheck;
 import com.oracle.svm.core.windows.headers.MemoryAPI;
+import com.oracle.svm.shared.Uninterruptible;
+import com.oracle.svm.shared.singletons.traits.BuiltinTraits.AllAccess;
+import com.oracle.svm.shared.singletons.traits.BuiltinTraits.SingleLayer;
+import com.oracle.svm.shared.singletons.traits.SingletonLayeredInstallationKind.InitialLayerOnly;
+import com.oracle.svm.shared.singletons.traits.SingletonTraits;
 
-@Platforms({Platform.WINDOWS.class})
-class WindowsStackOverflowSupport implements StackOverflowCheck.OSSupport {
-
+@AutomaticallyRegisteredImageSingleton(StackOverflowCheck.PlatformSupport.class)
+@SingletonTraits(access = AllAccess.class, layeredCallbacks = SingleLayer.class, layeredInstallationKind = InitialLayerOnly.class)
+final class WindowsStackOverflowSupport implements StackOverflowCheck.PlatformSupport {
+    @Override
     @Uninterruptible(reason = "Called from uninterruptible code.", mayBeInlined = true)
-    private static void getStackInformation(WordPointer stackEndPtr, WordPointer stackSizePtr) {
+    public boolean lookupStack(WordPointer stackBasePtr, WordPointer stackEndPtr) {
         int sizeOfMInfo = SizeOf.get(MemoryAPI.MEMORY_BASIC_INFORMATION.class);
         MemoryAPI.MEMORY_BASIC_INFORMATION minfo = StackValue.get(sizeOfMInfo);
-        MemoryAPI.VirtualQuery(minfo, minfo, WordFactory.unsigned(sizeOfMInfo));
-        Pointer stackBottom = (Pointer) minfo.AllocationBase();
-        stackEndPtr.write(stackBottom);
+        MemoryAPI.VirtualQuery(minfo, minfo, Word.unsigned(sizeOfMInfo));
+        Pointer bottom = (Pointer) minfo.AllocationBase();
+        stackEndPtr.write(bottom);
         UnsignedWord stackSize = minfo.RegionSize();
 
-        // Add up the sizes of all the regions with the same AllocationBase.
+        /* Add up the sizes of all the regions with the same AllocationBase. */
         while (true) {
-            MemoryAPI.VirtualQuery(stackBottom.add(stackSize), minfo, WordFactory.unsigned(sizeOfMInfo));
-            if (stackBottom.equal(minfo.AllocationBase())) {
+            MemoryAPI.VirtualQuery(bottom.add(stackSize), minfo, Word.unsigned(sizeOfMInfo));
+            if (bottom.equal(minfo.AllocationBase())) {
                 stackSize = stackSize.add(minfo.RegionSize());
             } else {
                 break;
             }
         }
-        stackSizePtr.write(stackSize);
-    }
 
-    @Uninterruptible(reason = "Called from uninterruptible code.", mayBeInlined = true)
-    @Override
-    public UnsignedWord lookupStackBase() {
-        WordPointer stackEndPtr = StackValue.get(WordPointer.class);
-        WordPointer stackSizePtr = StackValue.get(WordPointer.class);
-        getStackInformation(stackEndPtr, stackSizePtr);
-        UnsignedWord stackEnd = stackEndPtr.read();
-        UnsignedWord stackSize = stackSizePtr.read();
-        return stackEnd.add(stackSize);
-    }
-
-    @Uninterruptible(reason = "Called from uninterruptible code.", mayBeInlined = true)
-    @Override
-    public UnsignedWord lookupStackEnd() {
-        return lookupStackEnd(WordFactory.zero());
-    }
-
-    @Uninterruptible(reason = "Called from uninterruptible code.", mayBeInlined = true)
-    @Override
-    public UnsignedWord lookupStackEnd(UnsignedWord requestedStackSize) {
-        WordPointer stackEndPtr = StackValue.get(WordPointer.class);
-        WordPointer stackSizePtr = StackValue.get(WordPointer.class);
-        getStackInformation(stackEndPtr, stackSizePtr);
-        UnsignedWord stackEnd = stackEndPtr.read();
-
-        if (requestedStackSize.notEqual(WordFactory.zero())) {
-            /*
-             * if stackSize > requestedStackSize, then artificially limit stack end to match
-             * requested stack size.
-             */
-            UnsignedWord stackSize = stackSizePtr.read();
-            if (stackSize.aboveThan(requestedStackSize)) {
-                UnsignedWord stackAdjustment = stackSize.subtract(requestedStackSize);
-                return stackEnd.add(stackAdjustment);
-            }
-        }
-
-        return stackEnd;
-    }
-}
-
-@Platforms({Platform.WINDOWS.class})
-@AutomaticFeature
-class WindowsStackOverflowSupportFeature implements Feature {
-    @Override
-    public void afterRegistration(AfterRegistrationAccess access) {
-        ImageSingletons.add(StackOverflowCheck.OSSupport.class, new WindowsStackOverflowSupport());
+        stackBasePtr.write(bottom.add(stackSize));
+        return true;
     }
 }

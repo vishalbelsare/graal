@@ -24,19 +24,13 @@
  */
 package com.oracle.graal.pointsto.reports;
 
-import static com.oracle.graal.pointsto.reports.ReportUtils.fieldComparator;
-import static com.oracle.graal.pointsto.reports.ReportUtils.positionComparator;
-
 import java.io.PrintWriter;
-import java.util.Arrays;
 import java.util.HashMap;
 import java.util.Map;
-import java.util.stream.Collectors;
 
 import com.oracle.graal.pointsto.BigBang;
 import com.oracle.graal.pointsto.ObjectScanner;
 import com.oracle.graal.pointsto.ObjectScanningObserver;
-import com.oracle.graal.pointsto.api.PointstoOptions;
 import com.oracle.graal.pointsto.meta.AnalysisField;
 import com.oracle.graal.pointsto.meta.AnalysisType;
 
@@ -50,14 +44,9 @@ public final class AnalysisHeapHistogramPrinter extends ObjectScanner {
     }
 
     private static void doPrint(PrintWriter out, BigBang bb) {
-        if (!PointstoOptions.ExhaustiveHeapScan.getValue(bb.getOptions())) {
-            String types = Arrays.stream(bb.skippedHeapTypes()).map(t -> t.toJavaName()).collect(Collectors.joining(", "));
-            System.out.println("Exhaustive heap scanning is disabled. The analysis heap histogram will not contain all instances of types: " + types);
-            System.out.println("Exhaustive heap scanning can be turned on using -H:+ExhaustiveHeapScan.");
-        }
         Map<AnalysisType, Integer> histogram = new HashMap<>();
         AnalysisHeapHistogramPrinter printer = new AnalysisHeapHistogramPrinter(bb, histogram);
-        printer.scanBootImageHeapRoots(fieldComparator, positionComparator);
+        printer.scanBootImageHeapRoots(ReportUtils.fieldComparator(), ReportUtils.reasonComparator());
         printHistogram(out, histogram);
     }
 
@@ -91,23 +80,28 @@ public final class AnalysisHeapHistogramPrinter extends ObjectScanner {
         }
 
         @Override
-        public void forRelocatedPointerFieldValue(JavaConstant receiver, AnalysisField field, JavaConstant fieldValue) {
+        public boolean forRelocatedPointerFieldValue(JavaConstant receiver, AnalysisField field, JavaConstant fieldValue, ScanReason reason) {
+            return false;
         }
 
         @Override
-        public void forNullFieldValue(JavaConstant receiver, AnalysisField field) {
+        public boolean forNullFieldValue(JavaConstant receiver, AnalysisField field, ScanReason reason) {
+            return false;
         }
 
         @Override
-        public void forNonNullFieldValue(JavaConstant receiver, AnalysisField field, JavaConstant fieldValue) {
+        public boolean forNonNullFieldValue(JavaConstant receiver, AnalysisField field, JavaConstant fieldValue, ScanReason reason) {
+            return false;
         }
 
         @Override
-        public void forNullArrayElement(JavaConstant array, AnalysisType arrayType, int index) {
+        public boolean forNullArrayElement(JavaConstant array, AnalysisType arrayType, int index, ScanReason reason) {
+            return false;
         }
 
         @Override
-        public void forNonNullArrayElement(JavaConstant array, AnalysisType arrayType, JavaConstant elementConstant, AnalysisType elementType, int index) {
+        public boolean forNonNullArrayElement(JavaConstant array, AnalysisType arrayType, JavaConstant elementConstant, AnalysisType elementType, int index, ScanReason reason) {
+            return false;
         }
     }
 }

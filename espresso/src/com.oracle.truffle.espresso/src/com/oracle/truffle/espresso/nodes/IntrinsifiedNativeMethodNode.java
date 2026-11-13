@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2020, 2021, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2020, 2024, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -20,29 +20,33 @@
  * or visit www.oracle.com if you need additional information or have any
  * questions.
  */
-
 package com.oracle.truffle.espresso.nodes;
 
 import com.oracle.truffle.api.frame.Frame;
 import com.oracle.truffle.api.frame.VirtualFrame;
+import com.oracle.truffle.api.interop.NodeLibrary;
+import com.oracle.truffle.api.library.ExportLibrary;
+import com.oracle.truffle.api.library.ExportMessage;
 import com.oracle.truffle.espresso.impl.Method;
 import com.oracle.truffle.espresso.substitutions.CallableFromNative;
+import com.oracle.truffle.espresso.vm.VM;
 
-public class IntrinsifiedNativeMethodNode extends EspressoMethodNode {
+@ExportLibrary(NodeLibrary.class)
+final class IntrinsifiedNativeMethodNode extends EspressoInstrumentableRootNodeImpl {
     @Child private CallableFromNative nativeMethod;
     private final Object env;
 
-    public IntrinsifiedNativeMethodNode(CallableFromNative.Factory factory, Method method, Object env) {
-        super(method.getMethodVersion());
-        assert validParameterCount(factory, method);
-        this.nativeMethod = insert(factory.create(getMeta()));
+    IntrinsifiedNativeMethodNode(Method.MethodVersion methodVersion, CallableFromNative.Factory factory, Object env) {
+        super(methodVersion);
+        assert CallableFromNative.validParameterCount(factory, methodVersion);
+        this.nativeMethod = insert(factory.create());
         this.env = env;
     }
 
     @Override
-    Object executeBody(VirtualFrame frame) {
+    Object execute(VirtualFrame frame) {
         Object[] args = frame.getArguments();
-        Method method = getMethod();
+        Method method = getMethodVersion().getMethod();
         if (method.isStatic()) {
             int parameterCount = method.getParameterCount();
             Object[] newArgs = new Object[parameterCount + 1];
@@ -54,20 +58,18 @@ public class IntrinsifiedNativeMethodNode extends EspressoMethodNode {
     }
 
     @Override
-    void initializeBody(VirtualFrame frame) {
-        // nop
-    }
-
-    @Override
     public int getBci(Frame frame) {
-        return -2;
+        return VM.EspressoStackElement.NATIVE_BCI;
     }
 
-    public static boolean validParameterCount(CallableFromNative.Factory factory, Method method) {
-        /*
-         * Static native methods prepends the Class in the arg array, and instance methods do not
-         * include the receiver in the parameter count.
-         */
-        return (factory.parameterCount() == method.getParameterCount() + 1);
+    @ExportMessage
+    @SuppressWarnings("static-method")
+    public boolean hasScope(@SuppressWarnings("unused") Frame frame) {
+        return true;
+    }
+
+    @ExportMessage
+    public Object getScope(Frame frame, @SuppressWarnings("unused") boolean nodeEnter) {
+        return new SubstitutionScope(frame.getArguments(), getMethodVersion());
     }
 }

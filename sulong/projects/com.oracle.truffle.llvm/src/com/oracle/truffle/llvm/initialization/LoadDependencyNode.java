@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2021, Oracle and/or its affiliates.
+ * Copyright (c) 2022, 2023, Oracle and/or its affiliates.
  *
  * All rights reserved.
  *
@@ -37,7 +37,6 @@ import com.oracle.truffle.api.nodes.RootNode;
 import com.oracle.truffle.api.source.Source;
 import com.oracle.truffle.llvm.runtime.DefaultLibraryLocator;
 import com.oracle.truffle.llvm.runtime.LLVMContext;
-import com.oracle.truffle.llvm.runtime.LLVMLanguage;
 import com.oracle.truffle.llvm.runtime.LibraryLocator;
 import com.oracle.truffle.llvm.runtime.NativeContextExtension;
 import com.oracle.truffle.llvm.runtime.except.LLVMParserException;
@@ -45,8 +44,6 @@ import com.oracle.truffle.llvm.runtime.nodes.api.LLVMNode;
 import com.oracle.truffle.llvm.runtime.options.SulongEngineOption;
 
 import java.io.IOException;
-import java.nio.file.Path;
-import java.nio.file.Paths;
 
 public final class LoadDependencyNode extends LLVMNode {
 
@@ -67,70 +64,55 @@ public final class LoadDependencyNode extends LLVMNode {
     }
 
     public CallTarget execute() {
-        CallTarget callTarget = getContext().getCalltargetFromCache(libraryName);
+        LLVMContext context = getContext();
+        CallTarget callTarget = context.getCalltargetFromCache(libraryName);
+        if (LibraryLocator.loggingEnabled()) {
+            LibraryLocator.traceStaticInits(context, "load dependency execute, loading library", libraryLocator);
+            LibraryLocator.traceStaticInits(context, "load dependency execute, call target is", callTarget);
+        }
         if (callTarget != null) {
             return callTarget;
         } else {
-            // only create a source if the library has not already been parsed.
-            TruffleFile file = createTruffleFile(libraryName, null, libraryLocator);
-            CallTarget calls = getLanguage().getCachedLibrary(file.getPath());
-            if (calls != null) {
-                return calls;
-            } else {
-                Object sourceOrCallTarget = createDependencySource(libraryName, libraryName, true, file);
-                // A source is null if it's a native library, which will be added to the NFI
-                // context extension instead.
-                if (sourceOrCallTarget instanceof Source) {
-                    return getContext().getEnv().parseInternal((Source) sourceOrCallTarget);
-                } else if (sourceOrCallTarget instanceof CallTarget) {
-                    return (CallTarget) sourceOrCallTarget;
-                }
-            }
+            return parse(context);
         }
-        return null;
     }
 
     @TruffleBoundary
-    private Object createDependencySource(String libName, String libPath, boolean isNative, TruffleFile file) {
-        assert file != null;
-        if (!file.isRegularFile()) {
-            if (!isNative) {
-                throw new LLVMParserException("'" + file.getName() + "' is not a file or does not exist.");
-            } else {
-                TruffleFile nativeFile = createNativeTruffleFile(libName, libPath);
-                // null is returned if the NFIContextExtension does not exists.
-                if (nativeFile == null) {
-                    return null;
-                }
-                return createNativeLibraryCallTarget(nativeFile);
-            }
-        }
-
+    private CallTarget parse(LLVMContext context) {
         Source source;
-        LLVMLanguage language = getLanguage();
-        if (language.containsLibrarySource(file.getPath())) {
-            source = language.getLibrarySource(file.getPath());
-        } else {
-            try {
-                source = Source.newBuilder("llvm", file).internal(getContext().isInternalLibraryFile(file)).build();
-                language.addLibrarySource(file.getPath(), source);
-            } catch (IOException | SecurityException | OutOfMemoryError ex) {
-                throw new LLVMParserException("Error reading file " + file.getName() + ".");
-            }
+        try {
+            source = libraryLocator.locateSource(context, libraryName, reason);
+        } catch (IOException | SecurityException | OutOfMemoryError ex) {
+            throw new LLVMParserException("Error reading library " + libraryName + ".");
         }
-        return source;
+        if (source == null) {
+            TruffleFile nativeFile = createNativeTruffleFile(libraryName);
+            // null is returned if the NFIContextExtension does not exists.
+            if (nativeFile == null) {
+                return null;
+            }
+            return createNativeLibraryCallTarget(nativeFile);
+        } else {
+            CallTarget cached = getLanguage().getCachedLibrary(source);
+            if (LibraryLocator.loggingEnabled()) {
+                LibraryLocator.traceStaticInits(context, "load dependency execute, cached library", cached);
+            }
+            if (cached != null) {
+                return cached;
+            }
+            return getContext().getEnv().parseInternal(source);
+        }
     }
 
-    @TruffleBoundary
-    private TruffleFile createNativeTruffleFile(String libName, String libPath) {
+    private TruffleFile createNativeTruffleFile(String libName) {
         LLVMContext context = getContext();
         NativeContextExtension nativeContextExtension = context.getContextExtensionOrNull(NativeContextExtension.class);
         if (nativeContextExtension != null) {
-            TruffleFile file = DefaultLibraryLocator.INSTANCE.locate(context, libName, "<native library>");
+            TruffleFile file = DefaultLibraryLocator.INSTANCE.locateFile(context, libName, "<native library>");
             if (file == null) {
                 // Unable to locate the library -> will go to native
-                LibraryLocator.traceDelegateNative(context, libPath);
-                file = context.getEnv().getInternalTruffleFile(libPath);
+                LibraryLocator.traceDelegateNative(context, libName);
+                file = context.getEnv().getInternalTruffleFile(libName);
             }
             return file;
         }
@@ -146,19 +128,7 @@ public final class LoadDependencyNode extends LLVMNode {
         }
     }
 
-    @TruffleBoundary
-    private TruffleFile createTruffleFile(String libName, String libPath, LibraryLocator locator) {
-        LLVMContext context = getContext();
-        TruffleFile file = locator.locate(context, libName, reason);
-        if (file == null) {
-            if (libPath != null) {
-                file = context.getEnv().getInternalTruffleFile(libPath);
-            } else {
-                Path path = Paths.get(libName);
-                LibraryLocator.traceDelegateNative(context, path);
-                file = context.getEnv().getInternalTruffleFile(path.toUri());
-            }
-        }
-        return file;
+    public String getLibraryName() {
+        return libraryName;
     }
 }

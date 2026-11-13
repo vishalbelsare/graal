@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2017, 2017, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2021, 2021, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -24,13 +24,14 @@
  */
 package com.oracle.svm.core.code;
 
-import com.oracle.svm.core.jdk.InternalVMMethod;
+import com.oracle.svm.guest.staging.jdk.InternalVMMethod;
 
 /**
  * Holder class for generated factory methods (methods that combine object allocation and invocation
  * of a constructor).
  */
 @InternalVMMethod
+@FactoryMethodMarker
 public final class FactoryMethodHolder {
     private FactoryMethodHolder() {
     }

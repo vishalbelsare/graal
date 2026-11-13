@@ -20,24 +20,39 @@
  * or visit www.oracle.com if you need additional information or have any
  * questions.
  */
-
 package com.oracle.truffle.espresso.threads;
 
 public enum KillStatus {
     /**
      * Normal state: no Thread.stop() called, or ThreadDeath has already been thrown.
      */
-    NORMAL,
+    NORMAL(false, true),
     /**
      * Thread will throw an asynchronous ThreadDeath whenever possible.
      */
-    STOP,
+    STOP(true, true),
     /**
      * Thread is terminated, and is calling Thread.exit(). Ignore further stop signals.
      */
-    EXITING,
+    EXITING(false, false),
     /**
      * Thread is uncooperative: needs to be killed with a host exception. Unrecoverable state.
      */
-    KILL
+    KILL(true, false);
+
+    private final boolean asyncThrows;
+    private final boolean canStop;
+
+    KillStatus(boolean asyncThrows, boolean canStop) {
+        this.asyncThrows = asyncThrows;
+        this.canStop = canStop;
+    }
+
+    public boolean asyncThrows() {
+        return asyncThrows;
+    }
+
+    public boolean canStop() {
+        return canStop;
+    }
 }

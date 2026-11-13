@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2018, 2021, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2018, 2024, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * The Universal Permissive License (UPL), Version 1.0
@@ -167,10 +167,9 @@ final class HostClassLoader extends ClassLoader implements Closeable {
         }
     }
 
-    @SuppressWarnings("deprecation")
     private void definePackage(String className) {
         String packageName = getPackageName(className);
-        if (getPackage(packageName) == null) {
+        if (getDefinedPackage(packageName) == null) {
             definePackage(packageName, null, null, null, null, null, null, null);
         }
     }
@@ -343,6 +342,7 @@ final class HostClassLoader extends ClassLoader implements Closeable {
             }
             return new Resource(protectionDomain) {
 
+                @SuppressWarnings("deprecation")
                 @Override
                 public URL getURL() {
                     try {
@@ -400,6 +400,7 @@ final class HostClassLoader extends ClassLoader implements Closeable {
 
                 return new Resource(protectionDomain) {
 
+                    @SuppressWarnings("deprecation")
                     @Override
                     URL getURL() {
                         StringBuilder url = new StringBuilder("jar:");

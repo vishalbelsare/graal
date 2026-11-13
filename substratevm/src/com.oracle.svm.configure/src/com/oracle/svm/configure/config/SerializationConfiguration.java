@@ -27,76 +27,169 @@ package com.oracle.svm.configure.config;
 
 import java.io.IOException;
 import java.util.ArrayList;
-import java.util.Collections;
+import java.util.Comparator;
+import java.util.EnumSet;
 import java.util.List;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 
-import org.graalvm.nativeimage.impl.ConfigurationCondition;
 import org.graalvm.nativeimage.impl.RuntimeSerializationSupport;
 
+import com.oracle.svm.configure.ConditionalElement;
 import com.oracle.svm.configure.ConfigurationBase;
-import com.oracle.svm.configure.json.JsonWriter;
+import com.oracle.svm.configure.ConfigurationParser;
+import com.oracle.svm.configure.ConfigurationParserOption;
+import com.oracle.svm.configure.SerializationConfigurationParser;
+import com.oracle.svm.configure.UnresolvedAccessCondition;
+import com.oracle.svm.configure.config.conditional.AccessConditionResolver;
 
-public class SerializationConfiguration implements ConfigurationBase, RuntimeSerializationSupport {
+import jdk.graal.compiler.java.LambdaUtils;
+import jdk.graal.compiler.util.json.JsonPrinter;
+import jdk.graal.compiler.util.json.JsonWriter;
+
+public final class SerializationConfiguration extends ConfigurationBase<SerializationConfiguration, SerializationConfiguration.Predicate>
+                implements RuntimeSerializationSupport<UnresolvedAccessCondition> {
 
     private final Set<SerializationConfigurationType> serializations = ConcurrentHashMap.newKeySet();
+    private final Set<SerializationConfigurationLambdaCapturingType> lambdaSerializationCapturingTypes = ConcurrentHashMap.newKeySet();
+    private final ProxyConfiguration proxyConfiguration;
+    private final Set<ConditionalElement<List<String>>> interfaceListsSerializableProxies = ConcurrentHashMap.newKeySet();
 
     public SerializationConfiguration() {
+        proxyConfiguration = new ProxyConfiguration();
     }
 
     public SerializationConfiguration(SerializationConfiguration other) {
         serializations.addAll(other.serializations);
+        lambdaSerializationCapturingTypes.addAll(other.lambdaSerializationCapturingTypes);
+        interfaceListsSerializableProxies.addAll(other.interfaceListsSerializableProxies);
+        this.proxyConfiguration = new ProxyConfiguration(other.proxyConfiguration);
     }
 
-    public void removeAll(SerializationConfiguration other) {
+    @Override
+    public SerializationConfiguration copy() {
+        return new SerializationConfiguration(this);
+    }
+
+    @Override
+    protected void merge(SerializationConfiguration other) {
+        serializations.addAll(other.serializations);
+        lambdaSerializationCapturingTypes.addAll(other.lambdaSerializationCapturingTypes);
+        proxyConfiguration.merge(other.proxyConfiguration);
+    }
+
+    @Override
+    public void subtract(SerializationConfiguration other) {
         serializations.removeAll(other.serializations);
+        lambdaSerializationCapturingTypes.removeAll(other.lambdaSerializationCapturingTypes);
+        proxyConfiguration.subtract(other.proxyConfiguration);
     }
 
-    public boolean contains(ConfigurationCondition condition, String serializationTargetClass, String customTargetConstructorClass) {
-        return serializations.contains(createConfigurationType(condition, serializationTargetClass, customTargetConstructorClass));
+    @Override
+    protected void intersect(SerializationConfiguration other) {
+        serializations.retainAll(other.serializations);
+        lambdaSerializationCapturingTypes.retainAll(other.lambdaSerializationCapturingTypes);
+        proxyConfiguration.intersect(other.proxyConfiguration);
+    }
+
+    @Override
+    protected void removeIf(Predicate predicate) {
+        serializations.removeIf(predicate::testSerializationType);
+        lambdaSerializationCapturingTypes.removeIf(predicate::testLambdaSerializationType);
+    }
+
+    @Override
+    public void mergeConditional(UnresolvedAccessCondition condition, SerializationConfiguration other) {
+        for (SerializationConfigurationType type : other.serializations) {
+            serializations.add(new SerializationConfigurationType(condition, type.getQualifiedJavaName()));
+        }
+    }
+
+    public boolean contains(UnresolvedAccessCondition condition, String serializationTargetClass) {
+        return serializations.contains(createConfigurationType(condition, serializationTargetClass)) ||
+                        lambdaSerializationCapturingTypes.contains(createLambdaCapturingClassConfigurationType(condition, serializationTargetClass));
     }
 
     @Override
     public void printJson(JsonWriter writer) throws IOException {
-        writer.append('[').indent();
-        String prefix = "";
-        List<SerializationConfigurationType> list = new ArrayList<>(serializations);
-        Collections.sort(list);
-        for (SerializationConfigurationType type : list) {
-            writer.append(prefix).newline();
-            type.printJson(writer);
-            prefix = ",";
-        }
-        writer.unindent().newline();
-        writer.append(']');
+        List<SerializationConfigurationType> listOfCapturedClasses = new ArrayList<>(serializations);
+        JsonPrinter.printCollection(writer, listOfCapturedClasses, Comparator.naturalOrder(), SerializationConfigurationType::printJson);
     }
 
     @Override
-    public void register(ConfigurationCondition condition, Class<?>... classes) {
-        for (Class<?> clazz : classes) {
-            registerWithTargetConstructorClass(condition, clazz, null);
-        }
+    public void printLegacyJson(JsonWriter writer) throws IOException {
+        writer.appendObjectStart();
+        List<SerializationConfigurationType> listOfCapturedClasses = new ArrayList<>(serializations);
+        writer.quote("types").appendFieldSeparator();
+        JsonPrinter.printCollection(writer, listOfCapturedClasses, Comparator.naturalOrder(), SerializationConfigurationType::printLegacyJson);
+        writer.appendSeparator();
+        List<SerializationConfigurationLambdaCapturingType> listOfCapturingClasses = new ArrayList<>(lambdaSerializationCapturingTypes);
+        writer.quote("lambdaCapturingTypes").appendFieldSeparator();
+        JsonPrinter.printCollection(writer, listOfCapturingClasses, Comparator.naturalOrder(), SerializationConfigurationLambdaCapturingType::printJson);
+        writer.appendSeparator().quote("proxies").appendFieldSeparator();
+        printProxies(writer);
+        writer.appendObjectEnd();
     }
 
     @Override
-    public void registerWithTargetConstructorClass(ConfigurationCondition condition, Class<?> clazz, Class<?> customTargetConstructorClazz) {
-        registerWithTargetConstructorClass(condition, clazz.getName(), customTargetConstructorClazz == null ? null : customTargetConstructorClazz.getName());
+    public ConfigurationParser createParser(boolean combinedFileSchema, EnumSet<ConfigurationParserOption> parserOptions) {
+        return SerializationConfigurationParser.create(combinedFileSchema, AccessConditionResolver.identityResolver(), this, parserOptions);
     }
 
     @Override
-    public void registerWithTargetConstructorClass(ConfigurationCondition condition, String className, String customTargetConstructorClassName) {
-        serializations.add(createConfigurationType(condition, className, customTargetConstructorClassName));
+    public boolean supportsCombinedFile() {
+        return lambdaSerializationCapturingTypes.isEmpty() && interfaceListsSerializableProxies.isEmpty();
+    }
+
+    private void printProxies(JsonWriter writer) throws IOException {
+        List<ConditionalElement<List<String>>> lists = new ArrayList<>(interfaceListsSerializableProxies);
+        ProxyConfiguration.printProxyInterfaces(writer, lists);
+    }
+
+    @Override
+    public void registerIncludingAssociatedClasses(UnresolvedAccessCondition condition, Class<?> clazz) {
+        register(condition, false, clazz);
+    }
+
+    @Override
+    public void register(UnresolvedAccessCondition condition, boolean preserved, Class<?> clazz) {
+        register(condition, clazz.getName());
+    }
+
+    @Override
+    public void register(UnresolvedAccessCondition condition, String className) {
+        serializations.add(createConfigurationType(condition, className));
+    }
+
+    @Override
+    public void registerLambdaCapturingClass(UnresolvedAccessCondition condition, String lambdaCapturingClassName) {
+        lambdaSerializationCapturingTypes.add(createLambdaCapturingClassConfigurationType(condition, lambdaCapturingClassName.split(LambdaUtils.LAMBDA_SPLIT_PATTERN)[0]));
+    }
+
+    @Override
+    public void registerProxyClass(UnresolvedAccessCondition condition, List<String> implementedInterfaces) {
+        interfaceListsSerializableProxies.add(new ConditionalElement<>(condition, implementedInterfaces));
     }
 
     @Override
     public boolean isEmpty() {
-        return serializations.isEmpty();
+        return serializations.isEmpty() && lambdaSerializationCapturingTypes.isEmpty() && interfaceListsSerializableProxies.isEmpty();
     }
 
-    private static SerializationConfigurationType createConfigurationType(ConfigurationCondition condition, String className, String customTargetConstructorClassName) {
+    private static SerializationConfigurationType createConfigurationType(UnresolvedAccessCondition condition, String className) {
         String convertedClassName = SignatureUtil.toInternalClassName(className);
-        String convertedCustomTargetConstructorClassName = customTargetConstructorClassName == null ? null : SignatureUtil.toInternalClassName(customTargetConstructorClassName);
-        return new SerializationConfigurationType(condition, convertedClassName, convertedCustomTargetConstructorClassName);
+        return new SerializationConfigurationType(condition, convertedClassName);
+    }
+
+    private static SerializationConfigurationLambdaCapturingType createLambdaCapturingClassConfigurationType(UnresolvedAccessCondition condition, String className) {
+        String convertedClassName = SignatureUtil.toInternalClassName(className);
+        return new SerializationConfigurationLambdaCapturingType(condition, convertedClassName);
+    }
+
+    public interface Predicate {
+
+        boolean testSerializationType(SerializationConfigurationType type);
+
+        boolean testLambdaSerializationType(SerializationConfigurationLambdaCapturingType type);
     }
 }

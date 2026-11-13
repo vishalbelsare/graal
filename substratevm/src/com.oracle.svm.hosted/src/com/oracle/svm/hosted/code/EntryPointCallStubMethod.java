@@ -24,51 +24,36 @@
  */
 package com.oracle.svm.hosted.code;
 
-import java.lang.annotation.Annotation;
-import java.util.Objects;
+import static com.oracle.svm.util.GuestAnnotationAccess.newAnnotationValue;
 
-import com.oracle.svm.core.annotate.Uninterruptible;
-import com.oracle.svm.util.ReflectionUtil;
+import java.util.List;
 
+import com.oracle.svm.util.GuestAccess;
+
+import jdk.graal.compiler.annotation.AnnotationValue;
 import jdk.vm.ci.meta.ConstantPool;
 import jdk.vm.ci.meta.ResolvedJavaType;
 import jdk.vm.ci.meta.Signature;
 
-public abstract class EntryPointCallStubMethod extends NonBytecodeStaticMethod {
+public abstract class EntryPointCallStubMethod extends NonBytecodeMethod {
 
     protected EntryPointCallStubMethod(String name, ResolvedJavaType declaringClass, Signature signature, ConstantPool constantPool) {
-        super(name, declaringClass, signature, constantPool);
+        super(name, true, declaringClass, signature, constantPool);
     }
 
     /**
-     * Defines the {@link Uninterruptible} annotation returned for all call stub methods. The
-     * synthetic graphs set up the the fixed registers used for safepoint and stack overflow checks,
-     * so they must be uninterruptible. The method then called by the stub does not need to be
+     * Defines the {@code Uninterruptible} annotation returned for all call stub methods. The
+     * synthetic graphs set up the fixed registers used for safepoint and stack overflow checks, so
+     * they must be uninterruptible. The method then called by the stub does not need to be
      * uninterruptible itself.
      */
-    @Uninterruptible(reason = "Entry point", calleeMustBe = false)
-    @SuppressWarnings("unused")
-    private static void uninterruptibleAnnotationHolder() {
-    }
-
-    private static final Uninterruptible UNINTERRUPTIBLE_ANNOTATION = Objects.requireNonNull(
-                    ReflectionUtil.lookupMethod(EntryPointCallStubMethod.class, "uninterruptibleAnnotationHolder").getAnnotation(Uninterruptible.class));
+    private static final List<AnnotationValue> INJECTED_ANNOTATIONS = List.of(
+                    newAnnotationValue(GuestAccess.elements().Uninterruptible,
+                                    "reason", "Entry point",
+                                    "calleeMustBe", false));
 
     @Override
-    public final <T extends Annotation> T getAnnotation(Class<T> annotationClass) {
-        if (annotationClass == Uninterruptible.class) {
-            return annotationClass.cast(UNINTERRUPTIBLE_ANNOTATION);
-        }
-        return null;
-    }
-
-    @Override
-    public final Annotation[] getAnnotations() {
-        return new Annotation[]{UNINTERRUPTIBLE_ANNOTATION};
-    }
-
-    @Override
-    public final Annotation[] getDeclaredAnnotations() {
-        return new Annotation[]{UNINTERRUPTIBLE_ANNOTATION};
+    public List<AnnotationValue> getInjectedAnnotations() {
+        return INJECTED_ANNOTATIONS;
     }
 }

@@ -24,7 +24,8 @@
  */
 package com.oracle.svm.truffle.api;
 
-import static com.oracle.svm.core.graal.snippets.SubstrateAllocationSnippets.TLAB_LOCATIONS;
+import static com.oracle.svm.core.graal.snippets.SubstrateAllocationSnippets.GC_LOCATIONS;
+import static jdk.graal.compiler.core.common.spi.ForeignCallDescriptor.CallSideEffect.NO_SIDE_EFFECT;
 
 import org.graalvm.nativeimage.CurrentIsolate;
 import org.graalvm.nativeimage.IsolateThread;
@@ -33,25 +34,24 @@ import org.graalvm.nativeimage.Platforms;
 import org.graalvm.nativeimage.c.function.CodePointer;
 import org.graalvm.word.Pointer;
 
-import com.oracle.svm.core.SubstrateUtil;
-import com.oracle.svm.core.annotate.NeverInline;
-import com.oracle.svm.core.annotate.RestrictHeapAccess;
-import com.oracle.svm.core.annotate.Uninterruptible;
+import com.oracle.svm.shared.NeverInline;
+import com.oracle.svm.shared.util.SubstrateUtil;
+import com.oracle.svm.shared.Uninterruptible;
 import com.oracle.svm.core.deopt.DeoptimizationRuntime;
 import com.oracle.svm.core.deopt.Deoptimizer;
-import com.oracle.svm.core.log.Log;
-import com.oracle.svm.core.snippets.KnownIntrinsics;
+import com.oracle.svm.guest.staging.core.heap.RestrictHeapAccess;
+import com.oracle.svm.guest.staging.log.Log;
+import com.oracle.svm.guest.staging.core.graal.KnownIntrinsics;
 import com.oracle.svm.core.snippets.SnippetRuntime;
 import com.oracle.svm.core.snippets.SnippetRuntime.SubstrateForeignCallDescriptor;
-import com.oracle.svm.core.snippets.SubstrateForeignCallTarget;
-import com.oracle.svm.core.stack.StackOverflowCheck;
-import com.oracle.svm.core.thread.JavaThreads;
-import com.oracle.svm.core.threadlocal.FastThreadLocal;
-import com.oracle.svm.core.threadlocal.FastThreadLocalFactory;
-import com.oracle.svm.core.threadlocal.FastThreadLocalInt;
-import com.oracle.svm.core.threadlocal.FastThreadLocalObject;
-import com.oracle.svm.core.util.VMError;
-import com.oracle.truffle.api.CompilerDirectives;
+import com.oracle.svm.guest.staging.snippets.SubstrateForeignCallTarget;
+import com.oracle.svm.guest.staging.core.stack.StackOverflowCheck;
+import com.oracle.svm.core.thread.PlatformThreads;
+import com.oracle.svm.guest.staging.core.threadlocal.FastThreadLocal;
+import com.oracle.svm.guest.staging.core.threadlocal.FastThreadLocalFactory;
+import com.oracle.svm.guest.staging.core.threadlocal.FastThreadLocalInt;
+import com.oracle.svm.guest.staging.core.threadlocal.FastThreadLocalObject;
+import com.oracle.svm.shared.util.VMError;
 import com.oracle.truffle.api.impl.ThreadLocalHandshake;
 import com.oracle.truffle.api.nodes.Node;
 
@@ -61,13 +61,12 @@ import jdk.vm.ci.meta.SpeculationLog;
 
 public final class SubstrateThreadLocalHandshake extends ThreadLocalHandshake {
 
-    public static final SubstrateForeignCallDescriptor FOREIGN_POLL = SnippetRuntime.findForeignCall(SubstrateThreadLocalHandshake.class, "pollStub", true, TLAB_LOCATIONS);
+    public static final SubstrateForeignCallDescriptor FOREIGN_POLL = SnippetRuntime.findForeignCall(SubstrateThreadLocalHandshake.class, "pollStub", NO_SIDE_EFFECT, GC_LOCATIONS);
 
     static final SubstrateThreadLocalHandshake SINGLETON = new SubstrateThreadLocalHandshake();
 
     static final FastThreadLocalInt PENDING = FastThreadLocalFactory.createInt("SubstrateThreadLocalHandshake.PENDING").setMaxOffset(FastThreadLocal.FIRST_CACHE_LINE);
-    static final FastThreadLocalObject<TruffleSafepointImpl> STATE = FastThreadLocalFactory.createObject(TruffleSafepointImpl.class, "SubstrateThreadLocalHandshake.STATE")
-                    .setMaxOffset(FastThreadLocal.FIRST_CACHE_LINE);
+    static final FastThreadLocalObject<TruffleSafepointImpl> STATE = FastThreadLocalFactory.createObject(TruffleSafepointImpl.class, "SubstrateThreadLocalHandshake.STATE");
 
     @Platforms(Platform.HOSTED_ONLY.class)//
     static final ThreadLocal<Boolean> HOSTED_PENDING = ThreadLocal.withInitial(() -> Boolean.FALSE);
@@ -139,13 +138,7 @@ public final class SubstrateThreadLocalHandshake extends ThreadLocalHandshake {
         if (SubstrateUtil.HOSTED) {
             return HOSTED_STATE.get();
         } else {
-            TruffleSafepointImpl state = STATE.get();
-            assert state != null;
-            if (state == null) {
-                throw CompilerDirectives.shouldNotReachHere("Thread local handshake is not initialized for this thread. " +
-                                "Did you call getCurrent() outside while a polyglot context not entered?");
-            }
-            return state;
+            return STATE.get();
         }
     }
 
@@ -170,7 +163,7 @@ public final class SubstrateThreadLocalHandshake extends ThreadLocalHandshake {
              * thread is active.
              */
             assert t.isAlive() : "thread must remain alive while setting fast pending";
-            IsolateThread isolateThread = JavaThreads.getIsolateThreadUnsafe(t);
+            IsolateThread isolateThread = PlatformThreads.getIsolateThreadUnsafe(t);
             VMError.guarantee(isolateThread.isNonNull(), "Java thread must remain alive.");
             PENDING.setVolatile(isolateThread, 1);
         }

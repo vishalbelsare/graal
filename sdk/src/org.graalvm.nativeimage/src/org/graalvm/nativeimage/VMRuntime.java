@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2017, 2021, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2017, 2026, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * The Universal Permissive License (UPL), Version 1.0
@@ -67,7 +67,11 @@ public final class VMRuntime {
 
     /**
      * Shuts down the VM: Runs all shutdown hooks and waits for all finalization to complete.
-     *
+     * <p>
+     * This method should only be called once. Invoking this method multiple times can have
+     * continued effects. Also, although recommended, it is not strictly required for
+     * {@link #initialize} to be called before this method.
+     * 
      * @since 19.0
      */
     public static void shutdown() {
@@ -82,9 +86,6 @@ public final class VMRuntime {
      * @since 20.1
      */
     public static void dumpHeap(String outputFile, boolean live) throws IOException {
-        if (!ImageSingletons.contains(HeapDumpSupport.class)) {
-            throw new UnsupportedOperationException();
-        }
         ImageSingletons.lookup(HeapDumpSupport.class).dumpHeap(outputFile, live);
     }
 

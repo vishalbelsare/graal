@@ -24,34 +24,24 @@
  */
 package com.oracle.graal.pointsto.reports;
 
-import java.io.File;
 import java.io.PrintWriter;
-import java.util.Map;
+import java.text.NumberFormat;
+import java.util.Locale;
 import java.util.function.Consumer;
 
-import com.oracle.graal.pointsto.PointsToAnalysis;
 import com.oracle.graal.pointsto.BigBang;
-import com.oracle.graal.pointsto.flow.InstanceOfTypeFlow;
-import com.oracle.graal.pointsto.flow.MethodFlowsGraph;
+import com.oracle.graal.pointsto.PointsToAnalysis;
 import com.oracle.graal.pointsto.flow.MethodTypeFlow;
-import com.oracle.graal.pointsto.flow.context.BytecodeLocation;
 import com.oracle.graal.pointsto.meta.AnalysisField;
 import com.oracle.graal.pointsto.meta.AnalysisMethod;
 import com.oracle.graal.pointsto.meta.AnalysisType;
-import com.oracle.graal.pointsto.typestate.TypeState;
 
 public final class StatisticsPrinter {
 
     public static void print(BigBang bb, String reportsPath, String reportName) {
         StatisticsPrinter printer = new StatisticsPrinter(bb);
         Consumer<PrintWriter> consumer = printer::printStats;
-        String description = "analysis results stats";
-        if (AnalysisReportsOptions.AnalysisStatisticsFile.hasBeenSet(bb.getOptions())) {
-            final File file = new File(AnalysisReportsOptions.AnalysisStatisticsFile.getValue(bb.getOptions())).getAbsoluteFile();
-            ReportUtils.report(description, file.toPath(), consumer);
-        } else {
-            ReportUtils.report(description, reportsPath, "analysis_stats_" + reportName, "json", consumer);
-        }
+        ReportUtils.report("analysis results stats", reportsPath, "analysis_stats_" + reportName, "json", consumer);
     }
 
     private final BigBang bb;
@@ -106,7 +96,9 @@ public final class StatisticsPrinter {
     }
 
     public static void print(PrintWriter out, String key, double value) {
-        out.format("%s\"%s\": %.2f,%n", INDENT, key, value);
+        NumberFormat nf = NumberFormat.getInstance(Locale.ENGLISH);
+        nf.setGroupingUsed(false);
+        out.format("%s\"%s\": %s,%n", INDENT, key, nf.format(value));
     }
 
     public static void printLast(PrintWriter out, String key, long value) {
@@ -132,7 +124,7 @@ public final class StatisticsPrinter {
         int reachable = 0;
         int appReachable = 0;
         for (AnalysisType type : bb.getUniverse().getTypes()) {
-            if (type.isInstantiated()) {
+            if (type.isReachable()) {
                 reachable++;
                 if (!isRuntimeLibraryType(type)) {
                     appReachable++;
@@ -175,36 +167,23 @@ public final class StatisticsPrinter {
             /*- Type check stats are only available if points-to analysis is on. */
             return new long[4];
         }
-        PointsToAnalysis pointsToAnalysis = (PointsToAnalysis) bb;
+        PointsToAnalysis pta = (PointsToAnalysis) bb;
         long totalFilters = 0;
         long totalRemovableFilters = 0;
         long appTotalFilters = 0;
         long appTotalRemovableFilters = 0;
 
-        for (AnalysisMethod method : pointsToAnalysis.getUniverse().getMethods()) {
+        for (AnalysisMethod method : pta.getUniverse().getMethods()) {
 
-            boolean runtimeMethod = isRuntimeLibraryType(method.getDeclaringClass());
-            MethodTypeFlow methodFlow = PointsToAnalysis.assertPointsToAnalysisMethod(method).getTypeFlow();
-            MethodFlowsGraph originalFlows = methodFlow.getOriginalMethodFlows();
-
-            for (Map.Entry<Object, InstanceOfTypeFlow> entry : originalFlows.getInstanceOfFlows()) {
-                if (BytecodeLocation.isValidBci(entry.getKey())) {
-                    totalFilters++;
-                    InstanceOfTypeFlow originalInstanceOf = entry.getValue();
-
-                    boolean isSaturated = methodFlow.isSaturated(pointsToAnalysis, originalInstanceOf);
-                    TypeState instanceOfTypeState = methodFlow.foldTypeFlow(pointsToAnalysis, originalInstanceOf);
-                    if (!isSaturated && instanceOfTypeState.typesCount() < 2) {
-                        totalRemovableFilters++;
-                    }
-                    if (!runtimeMethod) {
-                        appTotalFilters++;
-                        if (!isSaturated && instanceOfTypeState.typesCount() < 2) {
-                            appTotalRemovableFilters++;
-                        }
-                    }
-                }
+            if (!method.isImplementationInvoked()) {
+                continue;
             }
+
+            MethodTypeFlow methodFlow = PointsToAnalysis.assertPointsToAnalysisMethod(method).getTypeFlow();
+            if (!methodFlow.flowsGraphCreated()) {
+                continue;
+            }
+            methodFlow.getMethodFlowsGraph();
         }
 
         return new long[]{totalFilters, totalRemovableFilters, appTotalFilters, appTotalRemovableFilters};

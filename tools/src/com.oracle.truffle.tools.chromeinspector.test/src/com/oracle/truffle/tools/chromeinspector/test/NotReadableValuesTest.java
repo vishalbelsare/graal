@@ -63,9 +63,9 @@ public class NotReadableValuesTest {
         InspectorTester tester = InspectorTester.start(true);
         tester.sendMessage("{\"id\":1,\"method\":\"Runtime.enable\"}");
         tester.sendMessage("{\"id\":2,\"method\":\"Debugger.enable\"}");
-        assertTrue(tester.compareReceivedMessages(
+        tester.receiveMessages(
                         "{\"result\":{},\"id\":1}\n" +
-                        "{\"result\":{},\"id\":2}\n"));
+                        "{\"result\":{\"debuggerId\":\"UniqueDebuggerId.", "},\"id\":2}\n");
         tester.sendMessage("{\"id\":3,\"method\":\"Runtime.runIfWaitingForDebugger\"}");
         assertTrue(tester.compareReceivedMessages(
                         "{\"result\":{},\"id\":3}\n" +
@@ -215,7 +215,7 @@ public class NotReadableValuesTest {
             }
 
             @Override
-            protected boolean hasLanguage() {
+            protected boolean hasLanguageId() {
                 // Provides the ProxyLanguage by default.
                 return true;
             }
@@ -277,7 +277,7 @@ public class NotReadableValuesTest {
             }
         }
 
-        private static class MetaObject extends ProxyInteropObject {
+        private static final class MetaObject extends ProxyInteropObject {
 
             @Override
             protected boolean isMetaObject() {
@@ -335,13 +335,13 @@ public class NotReadableValuesTest {
             }
         }
 
-        private static class ArrayValue extends ProxyInteropObject {
+        private static final class ArrayValue extends ProxyInteropObject {
 
             private static final long LENGTH = 6;
             private static final Set<Long> NOT_READABLE = new HashSet<>(Arrays.asList(new Long[]{2L, 3L}));
 
             @Override
-            protected boolean hasLanguage() {
+            protected boolean hasLanguageId() {
                 // Provides the ProxyLanguage by default.
                 return true;
             }

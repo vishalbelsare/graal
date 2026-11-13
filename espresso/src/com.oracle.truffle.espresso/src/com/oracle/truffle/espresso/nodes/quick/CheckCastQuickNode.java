@@ -24,12 +24,15 @@ package com.oracle.truffle.espresso.nodes.quick;
 
 import com.oracle.truffle.api.CompilerDirectives.TruffleBoundary;
 import com.oracle.truffle.api.frame.VirtualFrame;
-import com.oracle.truffle.espresso.bytecode.Bytecodes;
+import com.oracle.truffle.espresso.classfile.bytecode.Bytecodes;
+import com.oracle.truffle.espresso.impl.ClassRegistry;
 import com.oracle.truffle.espresso.impl.Klass;
 import com.oracle.truffle.espresso.meta.Meta;
 import com.oracle.truffle.espresso.nodes.BytecodeNode;
+import com.oracle.truffle.espresso.nodes.EspressoFrame;
 import com.oracle.truffle.espresso.nodes.bytecodes.InstanceOf;
-import com.oracle.truffle.espresso.runtime.StaticObject;
+import com.oracle.truffle.espresso.runtime.EspressoContext;
+import com.oracle.truffle.espresso.runtime.staticobject.StaticObject;
 
 public final class CheckCastQuickNode extends QuickNode {
 
@@ -46,14 +49,14 @@ public final class CheckCastQuickNode extends QuickNode {
     }
 
     @Override
-    public int execute(VirtualFrame frame) {
+    public int execute(VirtualFrame frame, boolean isContinuationResume) {
         BytecodeNode root = getBytecodeNode();
-        StaticObject receiver = BytecodeNode.peekObject(frame, top - 1);
+        StaticObject receiver = EspressoFrame.peekObject(frame, top - 1);
         if (StaticObject.isNull(receiver) || instanceOf.execute(receiver.getKlass())) {
             return stackEffectOf_CHECKCAST;
         }
         root.enterImplicitExceptionProfile();
-        BytecodeNode.popObject(frame, top - 1);
+        EspressoFrame.popObject(frame, top - 1);
         Meta meta = typeToCheck.getMeta();
         throw meta.throwExceptionWithMessage(meta.java_lang_ClassCastException,
                         getExceptionMessage(root, receiver));
@@ -61,6 +64,11 @@ public final class CheckCastQuickNode extends QuickNode {
 
     @TruffleBoundary
     private String getExceptionMessage(BytecodeNode root, StaticObject receiver) {
-        return receiver.getKlass().getType() + " cannot be cast to: " + typeToCheck.getType() + " in context " + root.getMethod().toString();
+        Klass receiverKlass = receiver.getKlass();
+        StringBuilder sb = new StringBuilder();
+        sb.append("class ").append(receiverKlass.getExternalName()).append(" cannot be cast to ").append(typeToCheck.getExternalName());
+        EspressoContext context = root.getMethod().getContext();
+        ClassRegistry.appendModuleAndLoadersDetails(context.getClassLoadingEnv(), receiverKlass, typeToCheck, sb, context);
+        return sb.toString();
     }
 }

@@ -24,6 +24,9 @@
  */
 package com.oracle.svm.core.posix.headers;
 
+import static com.oracle.svm.shared.Uninterruptible.CALLED_FROM_UNINTERRUPTIBLE_CODE;
+import static org.graalvm.nativeimage.c.function.CFunction.Transition.NO_TRANSITION;
+
 import org.graalvm.nativeimage.Platform;
 import org.graalvm.nativeimage.Platforms;
 import org.graalvm.nativeimage.c.CContext;
@@ -44,7 +47,9 @@ import org.graalvm.word.PointerBase;
 
 import com.oracle.svm.core.RegisterDumper;
 import com.oracle.svm.core.SubstrateSegfaultHandler;
-import com.oracle.svm.core.posix.PosixUtils;
+import com.oracle.svm.shared.util.SubstrateUtil;
+import com.oracle.svm.shared.Uninterruptible;
+import com.oracle.svm.core.posix.PosixSignalHandlerSupport;
 
 // Checkstyle: stop
 
@@ -66,17 +71,16 @@ public class Signal {
     @CConstant
     public static native int SIG_SETMASK();
 
-    @CFunction
-    public static native int sigprocmask(int how, sigset_tPointer set, sigset_tPointer oldset);
+    @CConstant
+    public static native int SIGEV_SIGNAL();
 
     @CPointerTo(nameOfCType = "sigset_t")
     public interface sigset_tPointer extends PointerBase {
     }
 
     /**
-     * Warning: use {@link #sigaction} or {@link PosixUtils#installSignalHandler}. Do NOT introduce
-     * calls to {@code signal} or {@code sigset}, which are not portable, and when running in
-     * HotSpot, signal chaining (libjsig) will print warnings.
+     * WARNING: do NOT introduce direct calls to {@code signal} or {@code sigset} as they are not
+     * portable. Besides that, signal chaining (libjsig) in HotSpot would print warnings.
      */
     public interface SignalDispatcher extends CFunctionPointer {
         @InvokeCFunctionPointer
@@ -110,7 +114,7 @@ public class Signal {
         VoidPointer si_addr();
     }
 
-    @Platforms({Platform.LINUX.class, Platform.DARWIN_AARCH64.class, Platform.IOS_AARCH64.class})
+    @Platforms({Platform.LINUX.class, Platform.DARWIN_AARCH64.class})
     @CPointerTo(nameOfCType = "long long int")
     public interface GregsPointer extends PointerBase {
         long read(int index);
@@ -123,15 +127,19 @@ public class Signal {
         GregsPointer uc_mcontext_linux_amd64_gregs();
 
         @CFieldAddress("uc_mcontext")
-        @Platforms({Platform.LINUX_AARCH64.class, Platform.ANDROID_AARCH64.class})
+        @Platforms({Platform.LINUX_AARCH64_BASE.class})
         mcontext_linux_aarch64_t uc_mcontext_linux_aarch64();
+
+        @CFieldAddress("uc_mcontext")
+        @Platforms({Platform.LINUX_RISCV64.class})
+        mcontext_linux_riscv64_t uc_mcontext_linux_riscv64();
 
         @CField("uc_mcontext")
         @Platforms({Platform.DARWIN_AMD64.class})
         AMD64DarwinMContext64 uc_mcontext_darwin_amd64();
 
         @CField("uc_mcontext")
-        @Platforms({Platform.DARWIN_AARCH64.class, Platform.IOS_AARCH64.class})
+        @Platforms({Platform.DARWIN_AARCH64.class})
         AArch64DarwinMContext64 uc_mcontext_darwin_aarch64();
     }
 
@@ -173,8 +181,17 @@ public class Signal {
         sigset_tPointer sa_mask();
     }
 
-    /** @param signum from {@link SignalEnum#getCValue()} */
-    @CFunction
+    @CStruct(addStructKeyword = true)
+    public interface sigevent extends PointerBase {
+        @CField
+        void sigev_notify(int value);
+
+        @CField
+        void sigev_signo(int value);
+    }
+
+    /** Don't call this function directly, use {@link PosixSignalHandlerSupport} instead. */
+    @CFunction(transition = NO_TRANSITION)
     public static native int sigaction(int signum, sigaction act, sigaction oldact);
 
     @CEnum
@@ -211,8 +228,16 @@ public class Signal {
         SIGXCPU,
         SIGXFSZ;
 
+        @Uninterruptible(reason = CALLED_FROM_UNINTERRUPTIBLE_CODE, mayBeInlined = true)
+        public int getCValue() {
+            if (SubstrateUtil.HOSTED) {
+                return CConstant.ValueAccess.get(this, "getCValue0");
+            }
+            return getCValue0();
+        }
+
         @CEnumValue
-        public native int getCValue();
+        private native int getCValue0();
     }
 
     @Platforms(Platform.LINUX.class)
@@ -222,8 +247,16 @@ public class Signal {
         SIGPOLL,
         SIGPWR;
 
+        @Uninterruptible(reason = CALLED_FROM_UNINTERRUPTIBLE_CODE, mayBeInlined = true)
+        public int getCValue() {
+            if (SubstrateUtil.HOSTED) {
+                return CConstant.ValueAccess.get(this, "getCValue0");
+            }
+            return getCValue0();
+        }
+
         @CEnumValue
-        public native int getCValue();
+        private native int getCValue0();
     }
 
     @Platforms(Platform.DARWIN.class)
@@ -233,15 +266,17 @@ public class Signal {
         SIGINFO,
         SIGEMT;
 
+        @Uninterruptible(reason = CALLED_FROM_UNINTERRUPTIBLE_CODE, mayBeInlined = true)
+        public int getCValue() {
+            if (SubstrateUtil.HOSTED) {
+                return CConstant.ValueAccess.get(this, "getCValue0");
+            }
+            return getCValue0();
+        }
+
         @CEnumValue
-        public native int getCValue();
+        private native int getCValue0();
     }
-
-    @CFunction
-    public static native int sigemptyset(sigset_tPointer set);
-
-    @CFunction
-    public static native int sigaddset(sigset_tPointer set, int signum);
 
     /**
      * Used in {@link SubstrateSegfaultHandler}. So, this must not be a {@link CEnum} as this would
@@ -328,7 +363,7 @@ public class Signal {
      * https://github.com/torvalds/linux/blob/9e1ff307c779ce1f0f810c7ecce3d95bbae40896/arch/arm64/include/uapi/asm/sigcontext.h#L28
      */
     @CStruct(value = "mcontext_t")
-    @Platforms({Platform.LINUX_AARCH64.class, Platform.ANDROID_AARCH64.class})
+    @Platforms({Platform.LINUX_AARCH64_BASE.class})
     public interface mcontext_linux_aarch64_t extends PointerBase {
         @CField
         long fault_address();
@@ -344,6 +379,17 @@ public class Signal {
 
         @CField
         long pstate();
+    }
+
+    /**
+     * Information about Linux's RISCV64 struct sigcontext uc_mcontext can be found at
+     * https://github.com/torvalds/linux/blob/9e1ff307c779ce1f0f810c7ecce3d95bbae40896/arch/riscv/include/uapi/asm/sigcontext.h#L17
+     */
+    @CStruct(value = "mcontext_t")
+    @Platforms({Platform.LINUX_RISCV64.class})
+    public interface mcontext_linux_riscv64_t extends PointerBase {
+        @CFieldAddress(value = "__gregs")
+        GregsPointer gregs();
     }
 
     /**
@@ -418,7 +464,7 @@ public class Signal {
      * Information about _STRUCT_ARM_THREAD_STATE64 can be found at
      * https://github.com/apple/darwin-xnu/blob/2ff845c2e033bd0ff64b5b6aa6063a1f8f65aa32/osfmk/mach/arm/_structs.h#L102
      */
-    @Platforms({Platform.DARWIN_AARCH64.class, Platform.IOS_AARCH64.class})
+    @Platforms({Platform.DARWIN_AARCH64.class})
     @CStruct(value = "__darwin_mcontext64", addStructKeyword = true)
     public interface AArch64DarwinMContext64 extends PointerBase {
         @CFieldAddress("__ss.__x")
@@ -437,4 +483,18 @@ public class Signal {
         long pc();
     }
 
+    public static class NoTransitions {
+        @CFunction(transition = NO_TRANSITION)
+        public static native int kill(int pid, int sig);
+
+        @CFunction(transition = NO_TRANSITION)
+        public static native int sigprocmask(int how, sigset_tPointer set, sigset_tPointer oldset);
+
+        @CFunction(transition = NO_TRANSITION)
+        public static native int sigemptyset(sigset_tPointer set);
+
+        @CFunction(transition = NO_TRANSITION)
+        public static native int sigaddset(sigset_tPointer set, int signum);
+
+    }
 }

@@ -27,7 +27,7 @@ package com.oracle.svm.core;
 import java.util.List;
 import java.util.Map;
 
-import org.graalvm.compiler.api.replacements.Fold;
+import jdk.graal.compiler.api.replacements.Fold;
 import org.graalvm.nativeimage.ImageSingletons;
 import org.graalvm.nativeimage.Platform;
 import org.graalvm.nativeimage.Platforms;
@@ -35,8 +35,8 @@ import org.graalvm.word.Pointer;
 
 import com.oracle.svm.core.code.FrameInfoEncoder;
 import com.oracle.svm.core.heap.SubstrateReferenceMapBuilder;
-import com.oracle.svm.core.log.Log;
-import com.oracle.svm.core.util.VMError;
+import com.oracle.svm.guest.staging.log.Log;
+import com.oracle.svm.shared.util.VMError;
 
 import jdk.vm.ci.code.Register;
 
@@ -98,6 +98,10 @@ public class CalleeSavedRegisters {
 
     public void verifySaveAreaOffsetInFrame(int checkedSaveAreaOffsetInFrame) {
         VMError.guarantee(saveAreaOffsetInFrame == checkedSaveAreaOffsetInFrame, "Must have a single value for the callee save register area");
+    }
+
+    public boolean calleeSaveable(Register register) {
+        return offsetsInSaveArea.get(register) != null;
     }
 
     public int getSaveAreaSize() {

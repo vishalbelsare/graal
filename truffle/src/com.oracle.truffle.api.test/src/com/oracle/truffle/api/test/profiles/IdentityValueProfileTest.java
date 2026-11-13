@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2014, 2018, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2014, 2022, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * The Universal Permissive License (UPL), Version 1.0
@@ -45,8 +45,8 @@ import static com.oracle.truffle.api.test.ReflectionUtils.invoke;
 import static com.oracle.truffle.api.test.ReflectionUtils.invokeStatic;
 import static com.oracle.truffle.api.test.ReflectionUtils.loadRelative;
 import static org.hamcrest.CoreMatchers.is;
+import static org.hamcrest.MatcherAssert.assertThat;
 import static org.junit.Assert.assertEquals;
-import static org.junit.Assert.assertThat;
 
 import org.junit.Before;
 import org.junit.BeforeClass;
@@ -82,7 +82,7 @@ public class IdentityValueProfileTest {
 
     @Before
     public void create() {
-        profile = (ValueProfile) invokeStatic(loadRelative(IdentityValueProfileTest.class, "ValueProfile$Identity"), "create");
+        profile = (ValueProfile) invokeStatic(loadRelative(IdentityValueProfileTest.class, "ValueProfile$Identity"), "create0");
     }
 
     private static boolean isGeneric(ValueProfile profile) {

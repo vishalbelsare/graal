@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2021, 2021, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2021, 2026, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * The Universal Permissive License (UPL), Version 1.0
@@ -41,54 +41,89 @@
 
 package org.graalvm.wasm.parser.validation;
 
-import org.graalvm.wasm.constants.Instructions;
+import java.util.ArrayList;
+import java.util.BitSet;
+
+import org.graalvm.wasm.SymbolTable;
+import org.graalvm.wasm.WasmType;
+import org.graalvm.wasm.parser.bytecode.BytecodeFixup;
+import org.graalvm.wasm.parser.bytecode.RuntimeBytecodeGen;
 
 /**
  * Represents the scope of a block structure during module validation.
  */
-public class ControlFrame {
-    private final int opcode;
-    private final byte[] paramTypes;
-    private final byte[] resultTypes;
+public abstract class ControlFrame {
+    private final int[] paramTypes;
+    private final int[] resultTypes;
+    private final SymbolTable symbolTable;
+
     private final int initialStackSize;
+    private final int legacyCatchDepth;
+    private boolean unwindLegacyCatches;
     private boolean unreachable;
+    private final int commonResultType;
+    protected BitSet initializedLocals;
+    private ArrayList<BytecodeFixup> delegateFixups;
 
     /**
-     * @param opcode The opcode of the block structure.
      * @param paramTypes The parameter value types of the block structure.
      * @param resultTypes The result value types of the block structure.
+     * @param symbolTable Necessary to look up the definitions of types in {@code paramTypes} and
+     *            {@code resultTypes}
      * @param initialStackSize The size of the value stack when entering this block structure.
-     * @param unreachable If the block structure should be declared unreachable.
+     * @param initializedLocals The set of locals which are already initialized at the start of this
+     *            function
      */
-    ControlFrame(int opcode, byte[] paramTypes, byte[] resultTypes, int initialStackSize, boolean unreachable) {
-        this.opcode = opcode;
+    ControlFrame(int[] paramTypes, int[] resultTypes, SymbolTable symbolTable, int initialStackSize, BitSet initializedLocals, int legacyCatchDepth) {
         this.paramTypes = paramTypes;
         this.resultTypes = resultTypes;
+        this.symbolTable = symbolTable;
         this.initialStackSize = initialStackSize;
-        this.unreachable = unreachable;
+        this.legacyCatchDepth = legacyCatchDepth;
+        this.unwindLegacyCatches = false;
+        this.unreachable = false;
+        this.commonResultType = WasmType.getCommonValueType(resultTypes);
+        this.initializedLocals = (BitSet) initializedLocals.clone();
     }
 
-    boolean isLoop() {
-        return opcode == Instructions.LOOP;
+    protected int[] paramTypes() {
+        return paramTypes;
     }
 
-    boolean isIf() {
-        return opcode == Instructions.IF;
-    }
-
-    public byte[] getResultTypes() {
+    public int[] resultTypes() {
         return resultTypes;
     }
 
-    public byte[] getLabelTypes() {
-        if (isLoop()) {
-            return paramTypes;
-        }
-        return resultTypes;
+    protected int resultTypeLength() {
+        return resultTypes.length;
     }
 
-    int getInitialStackSize() {
+    protected SymbolTable getSymbolTable() {
+        return symbolTable;
+    }
+
+    /**
+     * @return The union of all result types.
+     */
+    protected int commonResultType() {
+        return commonResultType;
+    }
+
+    /**
+     * @return The types that must be on the value stack when branching to this frame.
+     */
+    abstract int[] labelTypes();
+
+    protected int labelTypeLength() {
+        return labelTypes().length;
+    }
+
+    int initialStackSize() {
         return initialStackSize;
+    }
+
+    int legacyCatchDepth() {
+        return legacyCatchDepth;
     }
 
     void setUnreachable() {
@@ -97,5 +132,85 @@ public class ControlFrame {
 
     boolean isUnreachable() {
         return unreachable;
+    }
+
+    protected void resetUnreachable() {
+        this.unreachable = false;
+    }
+
+    boolean isLocalInitialized(int localIndex) {
+        return initializedLocals.get(localIndex);
+    }
+
+    void initializeLocal(int localIndex) {
+        initializedLocals.set(localIndex);
+    }
+
+    /**
+     * Performs checks and actions when exiting a frame.
+     */
+    abstract void exit(ParserState state, RuntimeBytecodeGen bytecode);
+
+    /**
+     * Registers a forward branch for fixing up and records whether it exits catches relative to
+     * this label's scope.
+     */
+    void registerForwardBranch(BytecodeFixup fixup, int sourceLegacyCatchDepth) {
+        registerBranch(sourceLegacyCatchDepth);
+        addLabelFixup(fixup);
+    }
+
+    /**
+     * Registers a backward branch and records whether it exits catches relative to this label's scope.
+     */
+    void registerBackwardBranch(int sourceLegacyCatchDepth) {
+        registerBranch(sourceLegacyCatchDepth);
+    }
+
+    /**
+     * Emits a branch to this frame, deferring target patching until the label is available.
+     * Subclasses with an already emitted label can override this to use a compact encoding.
+     */
+    void addBranch(RuntimeBytecodeGen bytecode, RuntimeBytecodeGen.BranchOp branchOp, RuntimeBytecodeGen.BranchHint branchHint, int sourceLegacyCatchDepth) {
+        registerForwardBranch(bytecode.addForwardBranch(branchOp, branchHint), sourceLegacyCatchDepth);
+    }
+
+    private void registerBranch(int sourceLegacyCatchDepth) {
+        // Use the entry depth: a legacy try exits outside its own catch clause.
+        unwindLegacyCatches |= sourceLegacyCatchDepth > legacyCatchDepth;
+    }
+
+    protected int addBranchLabel(RuntimeBytecodeGen bytecode) {
+        return bytecode.addLabel(resultTypeLength(), initialStackSize(), commonResultType(), legacyCatchDepth, unwindLegacyCatches);
+    }
+
+    /**
+     * Adds a fixup that targets this control frame's label. The fixup is patched immediately when
+     * the label is already available, or deferred until the frame emits its label.
+     *
+     * @param fixup The fixup that targets this frame's label.
+     */
+    abstract void addLabelFixup(BytecodeFixup fixup);
+
+    /**
+     * Adds a fixup used by legacy {@code delegate} to target this control frame. The fixup is
+     * patched with the exception-table location where exception dispatch should continue once
+     * control is delegated to this frame.
+     *
+     * @param fixup The fixup to patch with this frame's delegate continuation location.
+     */
+    void addDelegateFixup(BytecodeFixup fixup) {
+        if (delegateFixups == null) {
+            delegateFixups = new ArrayList<>();
+        }
+        delegateFixups.add(fixup);
+    }
+
+    protected void registerDelegateContinuationFixups(ParserState state, int tableIndex) {
+        if (delegateFixups != null) {
+            for (BytecodeFixup fixup : delegateFixups) {
+                state.addExceptionTableContinuationFixup(tableIndex, fixup);
+            }
+        }
     }
 }

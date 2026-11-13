@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2021, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2021, 2025, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * The Universal Permissive License (UPL), Version 1.0
@@ -40,12 +40,39 @@
  */
 package org.graalvm.nativeimage.impl;
 
-public interface RuntimeSerializationSupport {
+import java.util.Arrays;
+import java.util.List;
+import java.util.stream.Collectors;
 
-    void register(ConfigurationCondition condition, Class<?>... classes);
+import org.graalvm.nativeimage.ImageSingletons;
+import org.graalvm.nativeimage.dynamicaccess.AccessCondition;
 
-    void registerWithTargetConstructorClass(ConfigurationCondition condition, Class<?> clazz, Class<?> customTargetConstructorClazz);
+public interface RuntimeSerializationSupport<C> {
 
-    void registerWithTargetConstructorClass(ConfigurationCondition condition, String className, String customTargetConstructorClassName);
+    @SuppressWarnings("unchecked")
+    static RuntimeSerializationSupport<AccessCondition> singleton() {
+        return ImageSingletons.lookup(RuntimeSerializationSupport.class);
+    }
 
+    void registerIncludingAssociatedClasses(C condition, Class<?> clazz);
+
+    default void register(C condition, Class<?>... classes) {
+        Arrays.stream(classes).forEach(clazz -> register(condition, false, clazz));
+    }
+
+    void register(C condition, boolean preserved, Class<?> clazz);
+
+    void register(C condition, String clazz);
+
+    void registerLambdaCapturingClass(C condition, String lambdaCapturingClassName);
+
+    default void registerLambdaCapturingClass(C condition, Class<?> lambdaCapturingClass) {
+        registerLambdaCapturingClass(condition, lambdaCapturingClass.getName());
+    }
+
+    void registerProxyClass(C condition, List<String> implementedInterfaces);
+
+    default void registerProxyClass(C condition, Class<?>... implementedInterfaces) {
+        registerProxyClass(condition, Arrays.stream(implementedInterfaces).map(Class::getName).collect(Collectors.toList()));
+    }
 }

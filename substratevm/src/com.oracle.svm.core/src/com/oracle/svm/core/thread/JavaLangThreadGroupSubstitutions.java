@@ -24,62 +24,45 @@
  */
 package com.oracle.svm.core.thread;
 
+import java.lang.ref.WeakReference;
+
 import org.graalvm.nativeimage.Platform;
 import org.graalvm.nativeimage.Platforms;
+import org.graalvm.nativeimage.hosted.FieldValueTransformer;
 
-import com.oracle.svm.core.SubstrateUtil;
+import com.oracle.svm.shared.util.SubstrateUtil;
+import com.oracle.svm.shared.Uninterruptible;
 import com.oracle.svm.core.annotate.Alias;
 import com.oracle.svm.core.annotate.AnnotateOriginal;
 import com.oracle.svm.core.annotate.Inject;
 import com.oracle.svm.core.annotate.InjectAccessors;
 import com.oracle.svm.core.annotate.RecomputeFieldValue;
 import com.oracle.svm.core.annotate.TargetClass;
-import com.oracle.svm.core.annotate.TargetElement;
-import com.oracle.svm.core.annotate.Uninterruptible;
-import com.oracle.svm.core.jdk.NotLoomJDK;
-import com.oracle.svm.core.jdk.UninterruptibleUtils;
-
-import jdk.vm.ci.meta.MetaAccessProvider;
-import jdk.vm.ci.meta.ResolvedJavaField;
+import com.oracle.svm.guest.staging.core.jdk.UninterruptibleUtils;
+import com.oracle.svm.core.jfr.JfrThreadRepository;
+import com.oracle.svm.guest.staging.core.thread.ThreadStatus;
+import com.oracle.svm.shared.util.ReflectionUtil;
 
 @TargetClass(ThreadGroup.class)
 final class Target_java_lang_ThreadGroup {
 
-    @Alias @TargetElement(onlyWith = NotLoomJDK.class)//
-    @RecomputeFieldValue(kind = RecomputeFieldValue.Kind.Custom, declClass = ThreadGroupNUnstartedThreadsRecomputation.class, disableCaching = true)//
-    private int nUnstartedThreads;
-    @Alias @TargetElement(onlyWith = NotLoomJDK.class)//
-    @RecomputeFieldValue(kind = RecomputeFieldValue.Kind.Custom, declClass = ThreadGroupNThreadsRecomputation.class)//
-    private int nthreads;
-    @Alias @TargetElement(onlyWith = NotLoomJDK.class)//
+    @Inject //
     @RecomputeFieldValue(kind = RecomputeFieldValue.Kind.Custom, declClass = ThreadGroupThreadsRecomputation.class)//
-    private Thread[] threads;
+    Thread[] injectedThreads;
 
     /*
-     * JavaThreadsFeature.reachableThreadGroups is updated in an object replacer, during analysis,
-     * thus the recomputation may see an incomplete value. By disabling caching eventually the
-     * recomputed value will be the correct one. No additional caching is necessary since
-     * reachableThreadGroups will eventually reach a stable value during analysis and there is no
-     * risk to discover new objects in later phases.
+     * All ThreadGroups in the image heap are strong and will be stored in ThreadGroup.groups.
      */
-    @Alias @RecomputeFieldValue(kind = RecomputeFieldValue.Kind.Custom, declClass = ThreadGroupNGroupsRecomputation.class, disableCaching = true)//
-    private int ngroups;
-    @Alias @RecomputeFieldValue(kind = RecomputeFieldValue.Kind.Custom, declClass = ThreadGroupGroupsRecomputation.class, disableCaching = true)//
-    private ThreadGroup[] groups;
+    @Alias @RecomputeFieldValue(kind = RecomputeFieldValue.Kind.Reset)//
+    private int nweaks;
+    @Alias @RecomputeFieldValue(kind = RecomputeFieldValue.Kind.Reset)//
+    private WeakReference<ThreadGroup>[] weaks;
 
     @Inject @InjectAccessors(ThreadGroupIdAccessor.class) //
     public long id;
 
     @Inject @RecomputeFieldValue(kind = RecomputeFieldValue.Kind.Reset)//
     long injectedId;
-
-    @Alias
-    @TargetElement(onlyWith = NotLoomJDK.class)//
-    native void addUnstarted();
-
-    @Alias
-    @TargetElement(onlyWith = NotLoomJDK.class)//
-    native void add(Thread t);
 
     @AnnotateOriginal
     @Uninterruptible(reason = "Called from uninterruptible code.", mayBeInlined = true)
@@ -92,37 +75,37 @@ final class Target_java_lang_ThreadGroup {
  * This class assigns a unique id to each thread group, and this unique id is used by JFR.
  */
 class ThreadGroupIdAccessor {
-
-    private static final UninterruptibleUtils.AtomicLong nextID = new UninterruptibleUtils.AtomicLong(0L);
+    private static final UninterruptibleUtils.AtomicLong nextID = new UninterruptibleUtils.AtomicLong(JfrThreadRepository.VIRTUAL_THREAD_GROUP_ID + 1);
 
     @Uninterruptible(reason = "Called from uninterruptible code.", mayBeInlined = true)
     static long getId(Target_java_lang_ThreadGroup that) {
         if (that.injectedId == 0) {
-            that.injectedId = nextID.incrementAndGet();
+            Target_java_lang_ThreadGroup virtualThreadGroup = SubstrateUtil.cast(Target_java_lang_Thread.virtualThreadGroup(), Target_java_lang_ThreadGroup.class);
+            that.injectedId = that == virtualThreadGroup ? JfrThreadRepository.VIRTUAL_THREAD_GROUP_ID : nextID.getAndIncrement();
         }
         return that.injectedId;
     }
 }
 
 @Platforms(Platform.HOSTED_ONLY.class)
-class ThreadIdRecomputation implements RecomputeFieldValue.CustomFieldValueComputer {
+class ThreadIdRecomputation implements FieldValueTransformer {
     @Override
-    public Object compute(MetaAccessProvider metaAccess, ResolvedJavaField original, ResolvedJavaField annotated, Object receiver) {
+    public Object transform(Object receiver, Object originalValue) {
         Thread thread = (Thread) receiver;
         return JavaThreadsFeature.threadId(thread);
     }
 }
 
 @Platforms(Platform.HOSTED_ONLY.class)
-class ThreadStatusRecomputation implements RecomputeFieldValue.CustomFieldValueComputer {
+class ThreadStatusRecomputation implements FieldValueTransformer {
     @Override
-    public Object compute(MetaAccessProvider metaAccess, ResolvedJavaField original, ResolvedJavaField annotated, Object receiver) {
+    public Object transform(Object receiver, Object originalValue) {
         Thread thread = (Thread) receiver;
         if (thread.getState() == Thread.State.TERMINATED) {
             return ThreadStatus.TERMINATED;
         }
         assert thread.getState() == Thread.State.NEW : "All threads are in NEW state during image generation";
-        if (thread == JavaThreads.singleton().mainThread) {
+        if (thread == PlatformThreads.singleton().mainThread) {
             /* The main thread is recomputed as running. */
             return ThreadStatus.RUNNABLE;
         } else {
@@ -133,68 +116,37 @@ class ThreadStatusRecomputation implements RecomputeFieldValue.CustomFieldValueC
 }
 
 @Platforms(Platform.HOSTED_ONLY.class)
-class ThreadGroupNUnstartedThreadsRecomputation implements RecomputeFieldValue.CustomFieldValueComputer {
+class ThreadHolderRecomputation implements FieldValueTransformer {
     @Override
-    public Object compute(MetaAccessProvider metaAccess, ResolvedJavaField original, ResolvedJavaField annotated, Object receiver) {
-        ThreadGroup group = (ThreadGroup) receiver;
-        int result = 0;
-        for (Thread thread : JavaThreadsFeature.singleton().reachableThreads.keySet()) {
-            /* The main thread is recomputed as running and therefore not counted as unstarted. */
-            if (thread.getThreadGroup() == group && thread != JavaThreads.singleton().mainThread) {
-                result++;
-            }
+    public Object transform(Object receiver, Object originalValue) {
+        int threadStatus = ReflectionUtil.readField(ReflectionUtil.lookupClass(false, "java.lang.Thread$FieldHolder"), "threadStatus", receiver);
+        if (threadStatus == ThreadStatus.TERMINATED) {
+            return ThreadStatus.TERMINATED;
         }
-        return result;
-    }
-}
-
-@Platforms(Platform.HOSTED_ONLY.class)
-class ThreadGroupNThreadsRecomputation implements RecomputeFieldValue.CustomFieldValueComputer {
-    @Override
-    public Object compute(MetaAccessProvider metaAccess, ResolvedJavaField original, ResolvedJavaField annotated, Object receiver) {
-        ThreadGroup group = (ThreadGroup) receiver;
-
-        if (group == JavaThreads.singleton().mainGroup) {
-            /* The main group contains the main thread, which we recompute as running. */
-            return 1;
+        assert threadStatus == ThreadStatus.NEW : "All threads are in NEW state during image generation";
+        if (receiver == ReflectionUtil.readField(Thread.class, "holder", PlatformThreads.singleton().mainThread)) {
+            /* The main thread is recomputed as running. */
+            return ThreadStatus.RUNNABLE;
         } else {
-            /* No other thread group has a thread running at startup. */
-            return 0;
+            /* All other threads remain unstarted. */
+            return ThreadStatus.NEW;
         }
     }
 }
 
 @Platforms(Platform.HOSTED_ONLY.class)
-class ThreadGroupThreadsRecomputation implements RecomputeFieldValue.CustomFieldValueComputer {
+class ThreadGroupThreadsRecomputation implements FieldValueTransformer {
     @Override
-    public Object compute(MetaAccessProvider metaAccess, ResolvedJavaField original, ResolvedJavaField annotated, Object receiver) {
+    public Object transform(Object receiver, Object originalValue) {
         ThreadGroup group = (ThreadGroup) receiver;
 
-        if (group == JavaThreads.singleton().mainGroup) {
+        if (group == PlatformThreads.singleton().mainGroup) {
             /* The main group contains the main thread, which we recompute as running. */
-            return JavaThreads.singleton().mainGroupThreadsArray;
+            return PlatformThreads.singleton().mainGroupThreadsArray;
         } else {
             /* No other thread group has a thread running at startup. */
             return null;
         }
-    }
-}
-
-@Platforms(Platform.HOSTED_ONLY.class)
-class ThreadGroupNGroupsRecomputation implements RecomputeFieldValue.CustomFieldValueComputer {
-    @Override
-    public Object compute(MetaAccessProvider metaAccess, ResolvedJavaField original, ResolvedJavaField annotated, Object receiver) {
-        ThreadGroup group = (ThreadGroup) receiver;
-        return JavaThreadsFeature.singleton().reachableThreadGroups.get(group).ngroups;
-    }
-}
-
-@Platforms(Platform.HOSTED_ONLY.class)
-class ThreadGroupGroupsRecomputation implements RecomputeFieldValue.CustomFieldValueComputer {
-    @Override
-    public Object compute(MetaAccessProvider metaAccess, ResolvedJavaField original, ResolvedJavaField annotated, Object receiver) {
-        ThreadGroup group = (ThreadGroup) receiver;
-        return JavaThreadsFeature.singleton().reachableThreadGroups.get(group).groups;
     }
 }
 

@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2016, 2021, Oracle and/or its affiliates.
+ * Copyright (c) 2016, 2026, Oracle and/or its affiliates.
  *
  * All rights reserved.
  *
@@ -29,6 +29,7 @@
  */
 package com.oracle.truffle.llvm.runtime.nodes.cast;
 
+import com.oracle.truffle.api.ExactMath;
 import com.oracle.truffle.api.dsl.Cached;
 import com.oracle.truffle.api.dsl.GenerateAOT;
 import com.oracle.truffle.api.dsl.NodeChild;
@@ -36,6 +37,7 @@ import com.oracle.truffle.api.dsl.Specialization;
 import com.oracle.truffle.api.interop.InteropLibrary;
 import com.oracle.truffle.api.library.CachedLibrary;
 import com.oracle.truffle.llvm.runtime.CommonNodeFactory;
+import com.oracle.truffle.llvm.runtime.floating.LLVM128BitFloat;
 import com.oracle.truffle.llvm.runtime.nodes.cast.LLVMToI64Node.LLVMBitcastToI64Node;
 import com.oracle.truffle.llvm.runtime.floating.LLVM80BitFloat;
 import com.oracle.truffle.llvm.runtime.interop.convert.ForeignToLLVM;
@@ -118,7 +120,7 @@ public abstract class LLVMToDoubleNode extends LLVMExpressionNode {
 
         @Specialization
         protected double doDouble(boolean from) {
-            return from ? 1.0 : 0.0;
+            return from ? -1.0 : 0.0;
         }
 
         @Specialization
@@ -153,13 +155,16 @@ public abstract class LLVMToDoubleNode extends LLVMExpressionNode {
 
         @Specialization
         protected double doDouble(LLVM80BitFloat from) {
-            return from.getDoubleValue();
+            return from.toDoubleValue();
+        }
+
+        @Specialization
+        protected double doDouble(LLVM128BitFloat from) {
+            return from.toDoubleValue();
         }
     }
 
     public abstract static class LLVMUnsignedCastToDoubleNode extends LLVMToDoubleNode {
-
-        private static final double LEADING_BIT = 0x1.0p63;
 
         protected LLVMUnsignedCastToDoubleNode() {
         }
@@ -199,11 +204,7 @@ public abstract class LLVMToDoubleNode extends LLVMExpressionNode {
         }
 
         public static double doI64(long from) {
-            double val = from & Long.MAX_VALUE;
-            if (from < 0) {
-                val += LEADING_BIT;
-            }
-            return val;
+            return ExactMath.unsignedToDouble(from);
         }
 
         @Specialization

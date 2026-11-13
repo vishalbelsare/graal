@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2017, 2021, Oracle and/or its affiliates.
+ * Copyright (c) 2017, 2024, Oracle and/or its affiliates.
  *
  * All rights reserved.
  *
@@ -30,7 +30,6 @@
 package com.oracle.truffle.llvm.runtime.nodes.memory.store;
 
 import com.oracle.truffle.api.dsl.Cached;
-import com.oracle.truffle.api.dsl.GenerateAOT;
 import com.oracle.truffle.api.dsl.GenerateUncached;
 import com.oracle.truffle.api.dsl.Specialization;
 import com.oracle.truffle.api.library.CachedLibrary;
@@ -40,6 +39,7 @@ import com.oracle.truffle.llvm.runtime.nodes.api.LLVMStoreNode;
 import com.oracle.truffle.llvm.runtime.nodes.api.LLVMToNativeNode;
 import com.oracle.truffle.llvm.runtime.nodes.api.LLVMToPointerNode;
 import com.oracle.truffle.llvm.runtime.nodes.memory.load.LLVMDerefHandleGetReceiverNode;
+import com.oracle.truffle.llvm.runtime.nodes.memory.store.LLVMOffsetStoreNode.LLVMPrimitiveOffsetStoreNode;
 import com.oracle.truffle.llvm.runtime.nodes.memory.store.LLVMPointerStoreNodeGen.LLVMPointerOffsetStoreNodeGen;
 import com.oracle.truffle.llvm.runtime.pointer.LLVMManagedPointer;
 import com.oracle.truffle.llvm.runtime.pointer.LLVMNativePointer;
@@ -54,7 +54,7 @@ public abstract class LLVMPointerStoreNode extends LLVMStoreNode {
     public abstract void executeWithTarget(LLVMPointer address, Object value);
 
     @GenerateUncached
-    public abstract static class LLVMPointerOffsetStoreNode extends LLVMOffsetStoreNode {
+    public abstract static class LLVMPointerOffsetStoreNode extends LLVMPrimitiveOffsetStoreNode {
 
         public static LLVMPointerOffsetStoreNode create() {
             return LLVMPointerOffsetStoreNodeGen.create(null, null, null);
@@ -89,11 +89,17 @@ public abstract class LLVMPointerStoreNode extends LLVMStoreNode {
         }
 
         @Specialization(limit = "3")
-        @GenerateAOT.Exclude
         protected static void doManaged(LLVMManagedPointer addr, long offset, Object value,
                         @Cached LLVMToPointerNode toPointer,
                         @CachedLibrary("addr.getObject()") LLVMManagedWriteLibrary nativeWrite) {
             nativeWrite.writePointer(addr.getObject(), addr.getOffset() + offset, toPointer.executeWithTarget(value));
+        }
+
+        @Specialization(replaces = "doManaged")
+        protected static void doManagedAOT(LLVMManagedPointer addr, long offset, Object value,
+                        @Cached LLVMToPointerNode toPointer,
+                        @CachedLibrary(limit = "3") LLVMManagedWriteLibrary nativeWrite) {
+            doManaged(addr, offset, value, toPointer, nativeWrite);
         }
     }
 
@@ -126,10 +132,16 @@ public abstract class LLVMPointerStoreNode extends LLVMStoreNode {
     }
 
     @Specialization(limit = "3")
-    @GenerateAOT.Exclude
     protected static void doManaged(LLVMManagedPointer address, Object value,
                     @Cached LLVMToPointerNode toPointer,
                     @CachedLibrary("address.getObject()") LLVMManagedWriteLibrary nativeWrite) {
         nativeWrite.writePointer(address.getObject(), address.getOffset(), toPointer.executeWithTarget(value));
+    }
+
+    @Specialization(replaces = "doManaged")
+    protected static void doManagedAOT(LLVMManagedPointer address, Object value,
+                    @Cached LLVMToPointerNode toPointer,
+                    @CachedLibrary(limit = "3") LLVMManagedWriteLibrary nativeWrite) {
+        doManaged(address, value, toPointer, nativeWrite);
     }
 }

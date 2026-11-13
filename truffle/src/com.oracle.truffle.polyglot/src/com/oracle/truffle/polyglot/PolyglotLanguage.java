@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2017, 2021, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2017, 2026, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * The Universal Permissive License (UPL), Version 1.0
@@ -46,8 +46,11 @@ import static com.oracle.truffle.polyglot.EngineAccessor.NODES;
 
 import java.util.Set;
 
+import com.oracle.truffle.api.impl.TruffleVersions;
+import org.graalvm.home.Version;
 import org.graalvm.options.OptionDescriptors;
-import org.graalvm.polyglot.Language;
+import org.graalvm.polyglot.SandboxPolicy;
+import org.graalvm.polyglot.impl.AbstractPolyglotImpl.APIAccess;
 
 import com.oracle.truffle.api.CompilerAsserts;
 import com.oracle.truffle.api.CompilerDirectives;
@@ -61,16 +64,17 @@ final class PolyglotLanguage implements com.oracle.truffle.polyglot.PolyglotImpl
     final LanguageCache cache;
     final LanguageInfo info;
 
-    Language api; // effectively final
     final int engineIndex;
     final RuntimeException initError;
 
     private volatile OptionDescriptors options;
+    private volatile OptionDescriptors sourceOptions;
+    private volatile OptionValuesImpl emptySourceOptions;
     private volatile OptionValuesImpl optionValues;
     private volatile boolean initialized;
 
     private volatile PolyglotLanguageInstance initLanguage;
-    private boolean firstInstance = true;
+    private volatile boolean firstInstance = true;
 
     @CompilationFinal volatile Class<?> contextClass;
     volatile LocalLocation[] previousContextLocalLocations;
@@ -81,7 +85,7 @@ final class PolyglotLanguage implements com.oracle.truffle.polyglot.PolyglotImpl
         this.cache = cache;
         this.initError = initError;
         this.engineIndex = engineIndex;
-        this.info = NODES.createLanguage(this, cache.getId(), cache.getName(), cache.getVersion(), cache.getDefaultMimeType(), cache.getMimeTypes(), cache.isInternal(), cache.isInteractive());
+        this.info = NODES.createLanguage(cache, cache.getId(), cache.getName(), cache.getVersion(), cache.getDefaultMimeType(), cache.getMimeTypes(), cache.isInternal(), cache.isInteractive());
     }
 
     PolyglotLanguageContext getCurrentLanguageContext() {
@@ -90,6 +94,10 @@ final class PolyglotLanguage implements com.oracle.truffle.polyglot.PolyglotImpl
 
     boolean isFirstInstance() {
         return firstInstance;
+    }
+
+    boolean isInstantiated() {
+        return !firstInstance;
     }
 
     void initializeContextClass(Object contextImpl) {
@@ -130,9 +138,28 @@ final class PolyglotLanguage implements com.oracle.truffle.polyglot.PolyglotImpl
         }
     }
 
+    public OptionDescriptors getSourceOptions() {
+        try {
+            engine.checkState();
+            return getSourceOptionsInternal();
+        } catch (Throwable e) {
+            throw PolyglotImpl.guestToHostException(this.engine, e);
+        }
+    }
+
     OptionDescriptors getOptionsInternal() {
         ensureInitialized();
         return options;
+    }
+
+    OptionDescriptors getSourceOptionsInternal() {
+        ensureInitialized();
+        return sourceOptions;
+    }
+
+    OptionValuesImpl getEmptySourceOptionsInternal() {
+        ensureInitialized();
+        return emptySourceOptions;
     }
 
     private void ensureInitialized() {
@@ -179,16 +206,27 @@ final class PolyglotLanguage implements com.oracle.truffle.polyglot.PolyglotImpl
         return engine;
     }
 
+    @Override
+    public APIAccess getAPIAccess() {
+        return engine.apiAccess;
+    }
+
+    @Override
+    public PolyglotImpl getImpl() {
+        return engine.impl;
+    }
+
     private void ensureInitialized(PolyglotLanguageInstance instance) {
         if (!initialized) {
             synchronized (engine.lock) {
                 if (!initialized) {
                     try {
                         this.options = LANGUAGE.describeOptions(instance.spi, cache.getId());
+                        this.sourceOptions = LANGUAGE.describeSourceOptions(instance.spi, cache.getId());
+                        this.emptySourceOptions = new OptionValuesImpl(sourceOptions, SandboxPolicy.TRUSTED, false);
                     } catch (Exception e) {
                         throw new IllegalStateException(String.format("Error initializing language '%s' using class '%s'.", cache.getId(), cache.getClassName()), e);
                     }
-
                     initialized = true;
                 }
             }
@@ -199,7 +237,7 @@ final class PolyglotLanguage implements com.oracle.truffle.polyglot.PolyglotImpl
         if (optionValues == null) {
             synchronized (engine.lock) {
                 if (optionValues == null) {
-                    optionValues = new OptionValuesImpl(getOptionsInternal(), false);
+                    optionValues = new OptionValuesImpl(getOptionsInternal(), engine.sandboxPolicy, false);
                 }
             }
         }
@@ -237,7 +275,11 @@ final class PolyglotLanguage implements com.oracle.truffle.polyglot.PolyglotImpl
     public String getVersion() {
         final String version = cache.getVersion();
         if (version.equals("inherit")) {
-            return engine.getVersion();
+            try {
+                return TruffleVersions.readTruffleAPIVersion().toString();
+            } catch (Throwable t) {
+                throw PolyglotImpl.guestToHostException(engine, t);
+            }
         } else {
             return version;
         }
@@ -266,4 +308,53 @@ final class PolyglotLanguage implements com.oracle.truffle.polyglot.PolyglotImpl
         return true;
     }
 
+    static String websiteSubstitutions(String template) {
+        if (template.indexOf('$') < 0) {
+            return template;
+        }
+
+        StringBuilder ret = new StringBuilder();
+        int i = 0;
+        while (i < template.length()) {
+            char ch = template.charAt(i);
+            if (ch == '$' && template.charAt(i + 1) == '{') {
+                int end = template.indexOf('}', i + 2);
+                if (end >= 0) {
+                    String[] cmd = template.substring(i + 2, end).split(":", 2);
+                    Version v = Version.getCurrent();
+                    switch (cmd[0]) {
+                        case "graalvm-version":
+                            if (cmd.length == 1) {
+                                ret.append(v);
+                            } else {
+                                ret.append(v.format(cmd[1]));
+                            }
+                            break;
+                        case "graalvm-website-version":
+                            ret.append(v.format("%[R%d.%d]%[Sdev]"));
+                            break;
+                    }
+                    i = end + 1;
+                    continue;
+                }
+            }
+
+            ret.append(ch);
+            i++;
+        }
+        return ret.toString();
+    }
+
+    String getWebsite() {
+        return websiteSubstitutions(cache.getWebsite());
+    }
+
+    void validateSandbox(SandboxPolicy sandboxPolicy) {
+        SandboxPolicy languageSandboxPolicy = cache.getSandboxPolicy();
+        if (sandboxPolicy.isStricterThan(languageSandboxPolicy)) {
+            throw PolyglotEngineException.illegalArgument(PolyglotImpl.sandboxPolicyException(sandboxPolicy,
+                            String.format("The language %s can only be used up to the %s sandbox policy.", getId(), languageSandboxPolicy),
+                            String.format("do not enable %s language by removing it from a list of permitted languages in the Context.newBuilder(String...)", getId())));
+        }
+    }
 }

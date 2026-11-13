@@ -27,24 +27,24 @@ package com.oracle.svm.core.graal.snippets.aarch64;
 import java.util.Map;
 import java.util.function.Predicate;
 
-import org.graalvm.compiler.graph.Node;
-import org.graalvm.compiler.options.OptionValues;
-import org.graalvm.compiler.phases.util.Providers;
 import org.graalvm.nativeimage.ImageSingletons;
 import org.graalvm.nativeimage.Platform;
 import org.graalvm.nativeimage.Platforms;
 
-import com.oracle.svm.core.annotate.AutomaticFeature;
-import com.oracle.svm.core.graal.GraalFeature;
+import com.oracle.svm.shared.feature.AutomaticallyRegisteredFeature;
+import com.oracle.svm.core.feature.InternalFeature;
 import com.oracle.svm.core.graal.meta.RuntimeConfiguration;
 import com.oracle.svm.core.graal.snippets.NodeLoweringProvider;
 import com.oracle.svm.core.heap.RestrictHeapAccessCallees;
 
+import jdk.graal.compiler.graph.Node;
+import jdk.graal.compiler.options.OptionValues;
+import jdk.graal.compiler.phases.util.Providers;
 import jdk.vm.ci.meta.ResolvedJavaMethod;
 
-@AutomaticFeature
+@AutomaticallyRegisteredFeature
 @Platforms(Platform.AARCH64.class)
-class AArch64SnippetsFeature implements GraalFeature {
+public class AArch64SnippetsFeature implements InternalFeature {
 
     @Override
     public void registerLowerings(RuntimeConfiguration runtimeConfig, OptionValues options, Providers providers,
@@ -56,7 +56,7 @@ class AArch64SnippetsFeature implements GraalFeature {
         }
 
         AArch64ArithmeticSnippets.registerLowerings(options, providers, lowerings);
-        AArch64NonSnippetLowerings.registerLowerings(runtimeConfig, mustNotAllocatePredicate, options, providers, lowerings);
+        AArch64NonSnippetLowerings.registerLowerings(runtimeConfig, mustNotAllocatePredicate, options, providers, lowerings, hosted);
         PosixAArch64VaListSnippets.registerLowerings(options, providers, lowerings);
     }
 }

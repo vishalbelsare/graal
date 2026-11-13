@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2016, 2021, Oracle and/or its affiliates.
+ * Copyright (c) 2016, 2022, Oracle and/or its affiliates.
  *
  * All rights reserved.
  *
@@ -34,6 +34,7 @@ import com.oracle.truffle.llvm.parser.model.SymbolImpl;
 import com.oracle.truffle.llvm.parser.model.attributes.AttributesCodeEntry;
 import com.oracle.truffle.llvm.parser.model.attributes.AttributesGroup;
 import com.oracle.truffle.llvm.parser.model.visitors.SymbolVisitor;
+import com.oracle.truffle.llvm.runtime.types.FunctionType;
 import com.oracle.truffle.llvm.runtime.types.Type;
 
 public final class CallInstruction extends ValueInstruction implements Call {
@@ -46,11 +47,17 @@ public final class CallInstruction extends ValueInstruction implements Call {
 
     private final OperandBundle operandBundle;
 
-    private CallInstruction(Type type, AttributesCodeEntry paramAttr, int argCount, OperandBundle operandBundle) {
+    private boolean mustTail;
+
+    private final FunctionType functionType;
+
+    private CallInstruction(Type type, AttributesCodeEntry paramAttr, int argCount, OperandBundle operandBundle, FunctionType functionType, boolean mustTail) {
         super(type);
         this.paramAttr = paramAttr;
+        this.mustTail = mustTail;
         this.arguments = argCount == 0 ? NO_ARGS : new SymbolImpl[argCount];
         this.operandBundle = operandBundle;
+        this.functionType = functionType;
     }
 
     @Override
@@ -89,6 +96,11 @@ public final class CallInstruction extends ValueInstruction implements Call {
     }
 
     @Override
+    public FunctionType getFunctionType() {
+        return functionType;
+    }
+
+    @Override
     public void replace(SymbolImpl original, SymbolImpl replacement) {
         if (target == original) {
             target = replacement;
@@ -100,10 +112,15 @@ public final class CallInstruction extends ValueInstruction implements Call {
         }
     }
 
-    public static CallInstruction fromSymbols(IRScope scope, Type type, int targetIndex, int[] arguments, AttributesCodeEntry paramAttr, OperandBundle operandBundle) {
-        final CallInstruction inst = new CallInstruction(type, paramAttr, arguments.length, operandBundle);
+    public boolean getMustTail() {
+        return mustTail;
+    }
+
+    public static CallInstruction fromSymbols(IRScope scope, Type type, int targetIndex, int[] arguments, AttributesCodeEntry paramAttr, OperandBundle operandBundle, FunctionType functionType,
+                    boolean mustTail) {
+        final CallInstruction inst = new CallInstruction(type, paramAttr, arguments.length, operandBundle, functionType, mustTail);
         inst.target = scope.getSymbols().getForwardReferenced(targetIndex, inst);
-        Call.parseArguments(scope, inst.target, inst, inst.arguments, arguments);
+        Call.parseArguments(scope, inst, inst.arguments, arguments, functionType);
         return inst;
     }
 

@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2018, 2020, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2018, 2026, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * The Universal Permissive License (UPL), Version 1.0
@@ -47,13 +47,14 @@ import java.util.Map;
 import java.util.Map.Entry;
 import java.util.function.Function;
 
-import org.graalvm.polyglot.PolyglotException;
 import org.graalvm.polyglot.Value;
 import org.graalvm.polyglot.impl.AbstractPolyglotImpl;
 import org.graalvm.polyglot.impl.AbstractPolyglotImpl.APIAccess;
 import org.graalvm.polyglot.impl.AbstractPolyglotImpl.AbstractHostAccess;
 
 import com.oracle.truffle.api.CompilerDirectives.TruffleBoundary;
+import com.oracle.truffle.api.nodes.Node;
+import com.oracle.truffle.api.profiles.InlinedBranchProfile;
 
 final class PolyglotHostAccess extends AbstractHostAccess {
 
@@ -65,31 +66,43 @@ final class PolyglotHostAccess extends AbstractHostAccess {
     }
 
     @Override
-    public Object toGuestValue(Object polyglotContext, Object hostValue) {
-        PolyglotContextImpl internalContext = (PolyglotContextImpl) polyglotContext;
-        return toGuestValue(internalContext, hostValue);
+    public Object toGuestValue(Object originalNode, APIAccess apiAccess, Object hostValue) {
+        Node node = (Node) originalNode;
+        return toGuestValue(node, apiAccess, hostValue);
     }
 
-    static Object toGuestValue(PolyglotContextImpl context, Object hostValue) {
-        if (hostValue instanceof Value) {
-            Value receiverValue = (Value) hostValue;
-            PolyglotLanguageContext languageContext = (PolyglotLanguageContext) context.getAPIAccess().getContext(receiverValue);
-            PolyglotContextImpl valueContext = languageContext != null ? languageContext.context : null;
-            Object valueReceiver = context.getAPIAccess().getReceiver(receiverValue);
-            if (valueContext != context) {
-                valueReceiver = context.migrateValue(valueReceiver, valueContext);
-            }
-            return valueReceiver;
+    static Object toGuestValue(Node node, APIAccess access, Object hostValue) {
+        if (access.isValue(hostValue)) {
+            return migrateValue(node, access, hostValue, access.getValueReceiver(hostValue), InlinedBranchProfile.getUncached());
         } else if (PolyglotWrapper.isInstance(hostValue)) {
+            PolyglotContextImpl context = PolyglotFastThreadLocals.getContextWithNode(node);
             return context.migrateHostWrapper(PolyglotWrapper.asInstance(hostValue));
         }
         return hostValue;
+    }
+
+    static Object migrateValue(Node node, APIAccess access, Object hostValue, Object valueReceiver, InlinedBranchProfile migrationProfile) {
+        PolyglotContextImpl context = PolyglotFastThreadLocals.getContextWithNode(node);
+        PolyglotLanguageContext languageContext = (PolyglotLanguageContext) access.getValueContext(hostValue);
+        PolyglotContextImpl valueContext = languageContext != null ? languageContext.context : null;
+        if (valueContext != context) {
+            // Preserve the receiver's exact type until this conversion site needs migration.
+            migrationProfile.enter(node);
+            return context.migrateValue(valueReceiver, valueContext);
+        }
+        return valueReceiver;
     }
 
     @Override
     public <T> List<T> toList(Object internalContext, Object guestValue, boolean implementFunction, Class<T> elementClass, Type elementType) {
         PolyglotContextImpl context = (PolyglotContextImpl) internalContext;
         return PolyglotList.<T> create(context.getHostContext(), guestValue, implementFunction, elementClass, elementType);
+    }
+
+    @Override
+    public Object toByteSequence(Object internalContext, Object guestValue) {
+        PolyglotContextImpl context = (PolyglotContextImpl) internalContext;
+        return context.getAPIAccess().toByteSequence(PolyglotByteSequence.create(context.getHostContext(), guestValue));
     }
 
     @Override
@@ -111,15 +124,15 @@ final class PolyglotHostAccess extends AbstractHostAccess {
     }
 
     @Override
-    public Object toObjectProxy(Object internalContext, Class<?> clazz, Object obj) throws IllegalArgumentException {
+    public Object toObjectProxy(Object internalContext, Class<?> clazz, Type genericType, Object obj) throws IllegalArgumentException {
         PolyglotContextImpl context = (PolyglotContextImpl) internalContext;
-        return PolyglotObjectProxyHandler.newProxyInstance(clazz, obj, context.getHostContext());
+        return PolyglotObjectProxyHandler.newProxyInstance(clazz, genericType, obj, context.getHostContext());
     }
 
     @Override
-    public <T> T toFunctionProxy(Object internalContext, Class<T> functionalType, Object function) {
+    public <T> T toFunctionProxy(Object internalContext, Class<T> functionalType, Type genericType, Object function) {
         PolyglotContextImpl context = (PolyglotContextImpl) internalContext;
-        return PolyglotFunctionProxyHandler.create(functionalType, function, context.getHostContext());
+        return PolyglotFunctionProxyHandler.create(functionalType, genericType, function, context.getHostContext());
     }
 
     @Override
@@ -135,7 +148,7 @@ final class PolyglotHostAccess extends AbstractHostAccess {
     }
 
     @Override
-    public PolyglotException toPolyglotException(Object internalContext, Throwable e) {
+    public RuntimeException toPolyglotException(Object internalContext, Throwable e) {
         PolyglotContextImpl context = (PolyglotContextImpl) internalContext;
         return PolyglotImpl.guestToHostException(context.getHostContext(), e, true);
     }
@@ -154,13 +167,13 @@ final class PolyglotHostAccess extends AbstractHostAccess {
 
     @TruffleBoundary
     @Override
-    public Value[] toValues(Object internalContext, Object[] values, int startIndex) {
+    public Object[] toValues(Object internalContext, Object[] values, int startIndex) {
         return (((PolyglotContextImpl) internalContext).getHostContext()).toHostValues(values, startIndex);
     }
 
     @TruffleBoundary
     @Override
-    public Value[] toValues(Object internalContext, Object[] values) {
+    public Object[] toValues(Object internalContext, Object[] values) {
         return (((PolyglotContextImpl) internalContext).getHostContext()).toHostValues(values);
     }
 
@@ -180,15 +193,30 @@ final class PolyglotHostAccess extends AbstractHostAccess {
     }
 
     @Override
-    public void rethrowPolyglotException(Object internalContext, PolyglotException e) {
+    public Class<?> getPoylglotExceptionClass() {
+        return polyglot.getAPIAccess().getPolyglotExceptionClass();
+    }
+
+    @Override
+    public boolean isPolyglotException(RuntimeException e) {
+        return polyglot.getAPIAccess().isPolyglotException(e);
+    }
+
+    @Override
+    public Class<?> getValueClass() {
+        return polyglot.getAPIAccess().getValueClass();
+    }
+
+    @Override
+    public void rethrowPolyglotException(Object internalContext, RuntimeException polyglotException) {
         PolyglotContextImpl context = (PolyglotContextImpl) internalContext;
         APIAccess api = polyglot.getAPIAccess();
-        PolyglotExceptionImpl exceptionImpl = ((PolyglotExceptionImpl) api.getReceiver(e));
+        PolyglotExceptionImpl exceptionImpl = ((PolyglotExceptionImpl) api.getPolyglotExceptionReceiver(polyglotException));
         if (exceptionImpl.context == context || exceptionImpl.context == null || exceptionImpl.isHostException()) {
-            // for values of the same context the TruffleException is allowed to be unboxed
+            // for values of the same context the AbstractTruffleException is allowed to be unboxed
             // for host exceptions no guest values are bound therefore it can also be
             // unboxed
-            Throwable original = ((PolyglotExceptionImpl) api.getReceiver(e)).exception;
+            Throwable original = ((PolyglotExceptionImpl) api.getPolyglotExceptionReceiver(polyglotException)).exception;
             if (original instanceof RuntimeException) {
                 throw (RuntimeException) original;
             } else if (original instanceof Error) {

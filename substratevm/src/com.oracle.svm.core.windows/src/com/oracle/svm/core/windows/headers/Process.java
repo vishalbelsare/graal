@@ -30,9 +30,12 @@ import org.graalvm.nativeimage.c.function.CFunction;
 import org.graalvm.nativeimage.c.function.CFunction.Transition;
 import org.graalvm.nativeimage.c.struct.CStruct;
 import org.graalvm.nativeimage.c.type.CIntPointer;
+import org.graalvm.nativeimage.c.type.CUnsigned;
+import org.graalvm.nativeimage.c.type.VoidPointer;
 import org.graalvm.word.PointerBase;
 import org.graalvm.word.WordBase;
 
+import com.oracle.svm.core.windows.headers.WinBase.FILETIME;
 import com.oracle.svm.core.windows.headers.WinBase.HANDLE;
 import com.oracle.svm.core.windows.headers.WinBase.LPHANDLE;
 
@@ -68,6 +71,12 @@ public class Process {
 
     @CConstant
     public static native int SYNCHRONIZE();
+
+    @CConstant
+    public static native int THREAD_QUERY_LIMITED_INFORMATION();
+
+    @CConstant
+    public static native int TLS_OUT_OF_INDEXES();
 
     @CStruct
     public interface PCRITICAL_SECTION extends PointerBase {
@@ -136,6 +145,9 @@ public class Process {
         public static native void LeaveCriticalSection(PCRITICAL_SECTION mutex);
 
         @CFunction(transition = Transition.NO_TRANSITION)
+        public static native void DeleteCriticalSection(PCRITICAL_SECTION mutex);
+
+        @CFunction(transition = Transition.NO_TRANSITION)
         public static native void InitializeConditionVariable(PCONDITION_VARIABLE cond);
 
         @CFunction(transition = Transition.NO_TRANSITION)
@@ -146,5 +158,20 @@ public class Process {
 
         @CFunction(transition = Transition.NO_TRANSITION)
         public static native void WakeAllConditionVariable(PCONDITION_VARIABLE cond);
+
+        @CFunction(transition = Transition.NO_TRANSITION)
+        public static native int GetThreadTimes(HANDLE hThread, FILETIME creationTime, FILETIME exitTime, FILETIME kernelTime, FILETIME userTime);
+
+        @CFunction(transition = Transition.NO_TRANSITION)
+        public static native @CUnsigned int TlsAlloc();
+
+        @CFunction(transition = Transition.NO_TRANSITION)
+        public static native int TlsFree(@CUnsigned int dwTlsIndex);
+
+        @CFunction(transition = Transition.NO_TRANSITION)
+        public static native VoidPointer TlsGetValue(@CUnsigned int dwTlsIndex);
+
+        @CFunction(transition = Transition.NO_TRANSITION)
+        public static native int TlsSetValue(@CUnsigned int dwTlsIndex, VoidPointer lpTlsValue);
     }
 }

@@ -33,8 +33,6 @@ import com.oracle.svm.core.meta.SubstrateObjectConstant;
 import jdk.vm.ci.meta.JavaConstant;
 import jdk.vm.ci.meta.SpeculationLog;
 
-// Checkstyle: allow synchronization
-
 public class SubstrateSpeculationLog implements SpeculationLog {
 
     public static final class SubstrateSpeculation extends Speculation {
@@ -67,11 +65,11 @@ public class SubstrateSpeculationLog implements SpeculationLog {
 
     public void addFailedSpeculation(SpeculationReason speculation) {
         /*
-         * This method is called from inside the VMOperation that performs deoptimization, and
-         * thefore must not be synchronization free. Note that this even precludes using a
+         * This method may be called from inside a VMOperation that performs deoptimization, and
+         * therefore must be synchronization free. Note that this even precludes using a
          * ConcurrentHashMap, because it also has some code paths that require synchronization.
          *
-         * Therefore we use our own very simple atomic linked list.
+         * Therefore, we use our own very simple atomic linked list.
          */
         while (true) {
             LogEntry oldHead = addedFailedSpeculationsHead;

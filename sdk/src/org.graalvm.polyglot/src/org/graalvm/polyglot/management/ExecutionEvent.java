@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2018, 2021, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2018, 2023, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * The Universal Permissive License (UPL), Version 1.0
@@ -45,8 +45,7 @@ import java.util.List;
 import org.graalvm.polyglot.PolyglotException;
 import org.graalvm.polyglot.SourceSection;
 import org.graalvm.polyglot.Value;
-
-import org.graalvm.polyglot.impl.AbstractPolyglotImpl.AbstractManagementDispatch;
+import org.graalvm.polyglot.impl.AbstractPolyglotImpl.AbstractExecutionEventDispatch;
 
 /**
  * An execution event object passed to an execution listener consumer. Execution event instances
@@ -58,10 +57,10 @@ import org.graalvm.polyglot.impl.AbstractPolyglotImpl.AbstractManagementDispatch
  */
 public final class ExecutionEvent {
 
-    final AbstractManagementDispatch dispatch;
+    final AbstractExecutionEventDispatch dispatch;
     final Object receiver;
 
-    ExecutionEvent(AbstractManagementDispatch dispatch, Object receiver) {
+    ExecutionEvent(AbstractExecutionEventDispatch dispatch, Object receiver) {
         this.dispatch = dispatch;
         this.receiver = receiver;
     }
@@ -73,7 +72,7 @@ public final class ExecutionEvent {
      * @since 19.0
      */
     public SourceSection getLocation() {
-        return dispatch.getExecutionEventLocation(receiver);
+        return (SourceSection) dispatch.getExecutionEventLocation(receiver);
     }
 
     /**
@@ -99,8 +98,9 @@ public final class ExecutionEvent {
      *
      * @since 19.0
      */
+    @SuppressWarnings("unchecked")
     public List<Value> getInputValues() {
-        return dispatch.getExecutionEventInputValues(receiver);
+        return (List<Value>) (List<?>) dispatch.getExecutionEventInputValues(receiver);
     }
 
     /**
@@ -114,7 +114,7 @@ public final class ExecutionEvent {
      * @since 19.0
      */
     public Value getReturnValue() {
-        return dispatch.getExecutionEventReturnValue(receiver);
+        return (Value) dispatch.getExecutionEventReturnValue(receiver);
     }
 
     /**
@@ -128,7 +128,7 @@ public final class ExecutionEvent {
      * @since 19.0
      */
     public PolyglotException getException() {
-        return dispatch.getExecutionEventException(receiver);
+        return (PolyglotException) dispatch.getExecutionEventException(receiver);
     }
 
     /**

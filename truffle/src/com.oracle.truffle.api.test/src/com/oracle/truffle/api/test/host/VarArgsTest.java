@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2017, 2019, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2017, 2022, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * The Universal Permissive License (UPL), Version 1.0
@@ -174,17 +174,17 @@ public class VarArgsTest extends ProxyLanguageEnvTest {
             result = INTEROP.invokeMember(container, "withPorts", 80);
             Assert.assertEquals(container, result);
             result = INTEROP.invokeMember(container, "getPorts");
-            Assert.assertEquals(Arrays.asList(80), asJavaObject(List.class, (TruffleObject) result));
+            Assert.assertEquals(Arrays.asList(80), asJavaObject(List.class, result));
 
             result = INTEROP.invokeMember(container, "withPorts", new ListBasedTO(Arrays.asList(80)));
             Assert.assertEquals(container, result);
             result = INTEROP.invokeMember(container, "getPorts");
-            Assert.assertEquals(Arrays.asList(80), asJavaObject(List.class, (TruffleObject) result));
+            Assert.assertEquals(Arrays.asList(80), asJavaObject(List.class, result));
 
             result = INTEROP.invokeMember(container, "withPorts", asTruffleObject(new int[]{80}));
             Assert.assertEquals(container, result);
             result = INTEROP.invokeMember(container, "getPorts");
-            Assert.assertEquals(Arrays.asList(80), asJavaObject(List.class, (TruffleObject) result));
+            Assert.assertEquals(Arrays.asList(80), asJavaObject(List.class, result));
         }
     }
 

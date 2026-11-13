@@ -24,153 +24,55 @@
  */
 package com.oracle.svm.core.genscavenge;
 
-import static com.oracle.svm.core.genscavenge.BasicCollectionPolicies.Options.AllocationBeforePhysicalMemorySize;
-import static com.oracle.svm.core.genscavenge.BasicCollectionPolicies.Options.PercentTimeInIncrementalCollection;
-import static com.oracle.svm.core.genscavenge.CollectionPolicy.shouldCollectYoungGenSeparately;
-
-import org.graalvm.compiler.options.Option;
-import org.graalvm.nativeimage.Platform;
-import org.graalvm.nativeimage.Platforms;
 import org.graalvm.word.UnsignedWord;
-import org.graalvm.word.WordFactory;
+import org.graalvm.word.impl.Word;
 
-import com.oracle.svm.core.SubstrateGCOptions;
-import com.oracle.svm.core.heap.GCCause;
+import com.oracle.svm.guest.staging.core.heap.GCCause;
+import com.oracle.svm.core.heap.OutOfMemoryUtil;
 import com.oracle.svm.core.heap.PhysicalMemory;
-import com.oracle.svm.core.heap.ReferenceAccess;
-import com.oracle.svm.core.option.HostedOptionKey;
-import com.oracle.svm.core.option.RuntimeOptionKey;
-import com.oracle.svm.core.util.TimeUtils;
-import com.oracle.svm.core.util.VMError;
+import com.oracle.svm.shared.AlwaysInline;
+import com.oracle.svm.shared.util.TimeUtils;
+import com.oracle.svm.shared.util.UnsignedUtils;
+import com.oracle.svm.shared.util.VMError;
 
 /** Basic/legacy garbage collection policies. */
 final class BasicCollectionPolicies {
-    public static class Options {
-        @Option(help = "Percentage of total collection time that should be spent on young generation collections.")//
-        public static final RuntimeOptionKey<Integer> PercentTimeInIncrementalCollection = new RuntimeOptionKey<>(50);
-
-        @Option(help = "Bytes that can be allocated before (re-)querying the physical memory size") //
-        public static final HostedOptionKey<Long> AllocationBeforePhysicalMemorySize = new HostedOptionKey<>(1L * 1024L * 1024L);
-    }
-
-    @Platforms(Platform.HOSTED_ONLY.class)
-    static int getMaxSurvivorSpaces(Integer userValue) {
-        assert userValue == null || userValue >= 0;
-        return 0; // override option (if set): survivor spaces not supported
-    }
-
     private BasicCollectionPolicies() {
     }
 
-    abstract static class BasicPolicy implements CollectionPolicy {
-        protected static UnsignedWord m(long bytes) {
-            assert 0 <= bytes;
-            return WordFactory.unsigned(bytes).multiply(1024).multiply(1024);
+    abstract static class BasicPolicy extends AbstractCollectionPolicy {
+        BasicPolicy() {
+            super(NEW_RATIO, 0);
         }
 
         @Override
-        public boolean shouldCollectOnAllocation() {
-            UnsignedWord youngUsed = HeapImpl.getHeapImpl().getAccounting().getYoungUsedBytes();
-            return youngUsed.aboveOrEqual(getMaximumYoungGenerationSize());
+        protected void computeSizeParameters(RawSizeParameters newParamsOnStack) {
+            UnsignedWord maxHeap = getMaximumHeapSizeOptionValue() > 0 ? Word.unsigned(getMaximumHeapSizeOptionValue())
+                            : PhysicalMemory.size().unsignedDivide(100).multiply(HeapParameters.getMaximumHeapSizePercent());
+            maxHeap = alignDown(UnsignedUtils.min(maxHeap, getHeapSizeLimit()));
+
+            UnsignedWord maxYoung = getMaxNewSizeOptionValue() > 0 ? Word.unsigned(getMaxNewSizeOptionValue())
+                            : UnsignedUtils.min(maxHeap.unsignedDivide(100).multiply(HeapParameters.getMaximumYoungGenerationSizePercent()), Word.unsigned(256L * 1024 * 1024));
+            maxYoung = UnsignedUtils.min(alignDown(maxYoung), maxHeap);
+
+            UnsignedWord minHeap = getMinHeapSizeOptionValue() > 0 ? Word.unsigned(getMinHeapSizeOptionValue())
+                            : UnsignedUtils.min(maxYoung.multiply(2), maxHeap);
+            minHeap = alignUp(UnsignedUtils.min(minHeap, maxHeap));
+
+            UnsignedWord maxOld = maxHeap.subtract(maxYoung);
+
+            RawSizeParametersOnStackAccess.initialize(newParamsOnStack,
+                            maxYoung, maxYoung, maxYoung,
+                            Word.zero(), Word.zero(), Word.zero(),
+                            maxOld, maxOld, maxOld,
+                            Word.zero(),
+                            maxYoung, maxYoung,
+                            minHeap, maxHeap, maxHeap);
         }
 
         @Override
-        public UnsignedWord getCurrentHeapCapacity() {
-            return getMaximumHeapSize();
-        }
-
-        @Override
-        public void ensureSizeParametersInitialized() {
-            // Size parameters are recomputed from current values whenever they are queried
-        }
-
-        @Override
-        public void updateSizeParameters() {
-            // Sample the physical memory size, before the first GC but after some allocation.
-            UnsignedWord allocationBeforeUpdate = WordFactory.unsigned(AllocationBeforePhysicalMemorySize.getValue());
-            if (GCImpl.getGCImpl().getCollectionEpoch().equal(WordFactory.zero()) &&
-                            HeapImpl.getHeapImpl().getAccounting().getYoungUsedBytes().aboveOrEqual(allocationBeforeUpdate)) {
-                PhysicalMemory.tryInitialize();
-            }
-            // Size parameters are recomputed from current values whenever they are queried
-        }
-
-        @Override
-        public final UnsignedWord getMaximumHeapSize() {
-            long runtimeValue = SubstrateGCOptions.MaxHeapSize.getValue();
-            if (runtimeValue != 0L) {
-                return WordFactory.unsigned(runtimeValue);
-            }
-
-            /*
-             * If the physical size is known yet, the maximum size of the heap is a fraction of the
-             * size of the physical memory.
-             */
-            UnsignedWord addressSpaceSize = ReferenceAccess.singleton().getAddressSpaceSize();
-            if (PhysicalMemory.isInitialized()) {
-                UnsignedWord physicalMemorySize = PhysicalMemory.getCachedSize();
-                int maximumHeapSizePercent = HeapParameters.getMaximumHeapSizePercent();
-                /* Do not cache because `-Xmx` option parsing may not have happened yet. */
-                UnsignedWord result = physicalMemorySize.unsignedDivide(100).multiply(maximumHeapSizePercent);
-                if (result.belowThan(addressSpaceSize)) {
-                    return result;
-                }
-            }
-            return addressSpaceSize;
-        }
-
-        @Override
-        public final UnsignedWord getMaximumYoungGenerationSize() {
-            long runtimeValue = SubstrateGCOptions.MaxNewSize.getValue();
-            if (runtimeValue != 0L) {
-                return WordFactory.unsigned(runtimeValue);
-            }
-
-            /* If no value is set, use a fraction of the maximum heap size. */
-            UnsignedWord maxHeapSize = getMaximumHeapSize();
-            UnsignedWord youngSizeAsFraction = maxHeapSize.unsignedDivide(100).multiply(HeapParameters.getMaximumYoungGenerationSizePercent());
-            /* But not more than 256MB. */
-            UnsignedWord maxSize = m(256);
-            UnsignedWord youngSize = (youngSizeAsFraction.belowOrEqual(maxSize) ? youngSizeAsFraction : maxSize);
-            /* But do not cache the result as it is based on values that might change. */
-            return youngSize;
-        }
-
-        @Override
-        public final UnsignedWord getMinimumHeapSize() {
-            long runtimeValue = SubstrateGCOptions.MinHeapSize.getValue();
-            if (runtimeValue != 0L) {
-                /* If `-Xms` has been parsed from the command line, use that value. */
-                return WordFactory.unsigned(runtimeValue);
-            }
-
-            /* A default value chosen to delay the first full collection. */
-            UnsignedWord result = getMaximumYoungGenerationSize().multiply(2);
-            /* But not larger than -Xmx. */
-            if (result.aboveThan(getMaximumHeapSize())) {
-                result = getMaximumHeapSize();
-            }
-            /* But do not cache the result as it is based on values that might change. */
-            return result;
-        }
-
-        @Override
-        public UnsignedWord getSurvivorSpacesCapacity() {
-            return WordFactory.zero();
-        }
-
-        @Override
-        public final UnsignedWord getMaximumFreeAlignedChunksSize() {
+        public UnsignedWord getMaximumFreeAlignedChunksSize() {
             return getMaximumYoungGenerationSize();
-        }
-
-        @Override
-        public int getTenuringAge() {
-            return 1;
-        }
-
-        @Override
-        public void onCollectionBegin(boolean completeCollection, long requestingNanoTime) {
         }
 
         @Override
@@ -178,10 +80,10 @@ final class BasicCollectionPolicies {
         }
     }
 
-    public static final class OnlyIncrementally extends BasicPolicy {
+    static final class OnlyIncrementally extends BasicPolicy {
 
         @Override
-        public boolean shouldCollectCompletely(boolean followingIncrementalCollection) {
+        public boolean shouldCollectCompletely(boolean followingIncrementalCollection, boolean forcedCompleteCollection) {
             return false;
         }
 
@@ -191,14 +93,11 @@ final class BasicCollectionPolicies {
         }
     }
 
-    public static final class OnlyCompletely extends BasicPolicy {
+    static final class OnlyCompletely extends BasicPolicy {
 
         @Override
-        public boolean shouldCollectCompletely(boolean followingIncrementalCollection) {
-            if (!followingIncrementalCollection && shouldCollectYoungGenSeparately(false)) {
-                return false;
-            }
-            return true;
+        public boolean shouldCollectCompletely(boolean followingIncrementalCollection, boolean forcedCompleteCollection) {
+            return followingIncrementalCollection || !shouldCollectYoungGenSeparately(false);
         }
 
         @Override
@@ -207,15 +106,20 @@ final class BasicCollectionPolicies {
         }
     }
 
-    public static final class NeverCollect extends BasicPolicy {
+    static final class NeverCollect extends BasicPolicy {
 
         @Override
+        @AlwaysInline("Keep the allocation GC check inline in allocation slow paths.")
         public boolean shouldCollectOnAllocation() {
-            throw VMError.shouldNotReachHere("Caller is supposed to be aware of never-collect policy");
+            UnsignedWord edenUsed = HeapImpl.getAccounting().getEdenUsedBytes();
+            if (edenUsed.aboveThan(getMaximumHeapSize())) {
+                throw OutOfMemoryUtil.heapSizeExceeded();
+            }
+            return false;
         }
 
         @Override
-        public boolean shouldCollectCompletely(boolean followingIncrementalCollection) {
+        public boolean shouldCollectCompletely(boolean followingIncrementalCollection, boolean forcedCompleteCollection) {
             throw VMError.shouldNotReachHere("Collection must not be initiated in the first place");
         }
 
@@ -229,11 +133,15 @@ final class BasicCollectionPolicies {
      * A collection policy that delays complete collections until the heap has at least `-Xms` space
      * in it, and then tries to balance time in incremental and complete collections.
      */
-    public static final class BySpaceAndTime extends BasicPolicy {
+    static final class BySpaceAndTime extends BasicPolicy {
 
         @Override
-        public boolean shouldCollectCompletely(boolean followingIncrementalCollection) {
-            if (!followingIncrementalCollection && shouldCollectYoungGenSeparately(false)) {
+        public boolean shouldCollectCompletely(boolean followingIncrementalCollection, boolean forcedCompleteCollection) {
+            boolean collectYoungSeparately = shouldCollectYoungGenSeparately(false);
+            if (forcedCompleteCollection && !collectYoungSeparately) {
+                return true;
+            }
+            if (!followingIncrementalCollection && collectYoungSeparately) {
                 return false;
             }
             return estimateUsedHeapAtNextIncrementalCollection().aboveThan(getMaximumHeapSize()) ||
@@ -247,15 +155,15 @@ final class BasicCollectionPolicies {
         private UnsignedWord estimateUsedHeapAtNextIncrementalCollection() {
             UnsignedWord currentYoungBytes = HeapImpl.getHeapImpl().getYoungGeneration().getChunkBytes();
             UnsignedWord maxYoungBytes = getMaximumYoungGenerationSize();
-            UnsignedWord oldBytes = GCImpl.getGCImpl().getAccounting().getOldGenerationAfterChunkBytes();
+            UnsignedWord oldBytes = GCImpl.getAccounting().getOldGenerationAfterChunkBytes();
             return currentYoungBytes.add(maxYoungBytes).add(oldBytes);
         }
 
         private static boolean enoughTimeSpentOnIncrementalGCs() {
-            int incrementalWeight = PercentTimeInIncrementalCollection.getValue();
+            int incrementalWeight = SerialGCOptions.PercentTimeInIncrementalCollection.getValue();
             assert incrementalWeight >= 0 && incrementalWeight <= 100 : "BySpaceAndTimePercentTimeInIncrementalCollection should be in the range [0..100].";
 
-            GCAccounting accounting = GCImpl.getGCImpl().getAccounting();
+            GCAccounting accounting = GCImpl.getAccounting();
             long actualIncrementalNanos = accounting.getIncrementalCollectionTotalNanos();
             long completeNanos = accounting.getCompleteCollectionTotalNanos();
             long totalNanos = actualIncrementalNanos + completeNanos;

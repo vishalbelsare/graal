@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2013, 2017, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2013, 2023, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -24,17 +24,18 @@
  */
 package com.oracle.svm.core.graal.meta;
 
-import org.graalvm.compiler.core.common.spi.ForeignCallLinkage;
 import org.graalvm.nativeimage.Platform;
 import org.graalvm.nativeimage.Platforms;
 
-import com.oracle.svm.core.graal.code.SubstrateCallingConventionKind;
-import com.oracle.svm.core.meta.SharedMethod;
+import com.oracle.svm.jvmci.shared.code.SubstrateCallingConventionKind;
+import com.oracle.svm.jvmci.shared.meta.SharedMethod;
 import com.oracle.svm.core.snippets.SnippetRuntime.SubstrateForeignCallDescriptor;
-import com.oracle.svm.core.util.VMError;
-import com.oracle.svm.util.ClassUtil;
+import com.oracle.svm.shared.util.ClassUtil;
+import com.oracle.svm.shared.util.VMError;
 
+import jdk.graal.compiler.core.common.spi.ForeignCallLinkage;
 import jdk.vm.ci.code.CallingConvention;
+import jdk.vm.ci.code.CodeCacheProvider;
 import jdk.vm.ci.meta.AllocatableValue;
 import jdk.vm.ci.meta.JavaType;
 import jdk.vm.ci.meta.ResolvedJavaMethod;
@@ -68,11 +69,11 @@ public class SubstrateForeignCallLinkage implements ForeignCallLinkage {
 
     @Override
     public CallingConvention getIncomingCallingConvention() {
-        throw VMError.shouldNotReachHere();
+        throw VMError.shouldNotReachHereAtRuntime(); // ExcludeFromJacocoGeneratedReport
     }
 
     @Override
-    public long getMaxCallTargetOffset() {
+    public long getMaxCallTargetOffset(CodeCacheProvider codeCache) {
         return -1;
     }
 

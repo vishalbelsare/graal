@@ -1,235 +1,362 @@
 ---
 layout: docs
 toc_group: native-image
-link_title: Native Image
+link_title: Getting Started with Native Image
 permalink: /reference-manual/native-image/
 ---
+
 # Native Image
 
-Native Image is a technology to ahead-of-time compile Java code to a standalone executable, called a **native image**.
-This executable includes the application classes, classes from its dependencies, runtime library classes, and statically linked native code from JDK.
-It does not run on the Java VM, but includes necessary components like memory management, thread scheduling, and so on from a different runtime system, called "Substrate VM".
-Substrate VM is the name for the runtime components (like the deoptimizer, garbage collector, thread scheduling etc.).
-The resulting program has faster startup time and lower runtime memory overhead compared to a JVM.
+Native Image is a technology to compile Java code ahead-of-time to a binary&mdash;a **native executable**.
+A native executable includes only the code required at run time, that is the application classes, standard-library classes, the language runtime, and statically-linked native code from the JDK.
 
-The **Native Image builder** or `native-image` is a utility that processes all classes of an application and their dependencies, including those from the JDK.
-It statically analyzes these data to determine which classes and methods are reachable during the application execution.
-Then it ahead-of-time compiles that reachable code and data to a native executable for a specific operating system and architecture.
-This entire process is called **building an image** (or the **image build time**) to clearly distinguish it from the compilation of Java source code to bytecode.
+An executable file produced by Native Image has several important advantages, in that it
 
-Native Image supports JVM-based languages, e.g., Java, Scala, Clojure, Kotlin.
-The resulting image can, optionally, execute dynamic languages like JavaScript, Ruby, R or Python.
-Polyglot embeddings can also be compiled ahead-of-time.
-To inform `native-image` of a guest language used by an application, specify `--language:<languageId>` for each guest language (e.g., `--language:js`).
+- Uses a fraction of the resources required by the Java Virtual Machine, so is cheaper to run
+- Starts in milliseconds
+- Delivers peak performance immediately, with no warmup
+- Can be packaged into a lightweight container image for fast and efficient deployment
+- Presents a reduced attack surface
 
-* [Install Native Image](#install-native-image)
-* [Prerequisites](#prerequisites)
-* [Build a Native Image](#build-a-native-image)
-* [Build a Shared Library](#build-a-shared-library)
-* [How to Determine What Version of GraalVM a Native Image is Generated with](#how-to-determine-what-version-of-graalvm-a-native-image-is-generated-with)
-* [Ahead-of-time Compilation Limitations](#ahead-of-time-compilation-limitations)
+A native executable is created by the **Native Image builder** or `native-image` that processes your application classes and [other metadata](ReachabilityMetadata.md) to create a binary for a specific operating system and architecture.
+First, the `native-image` tool performs static analysis of your code to determine the classes and methods that are **reachable** when your application runs.
+Second, it compiles classes, methods, and resources into a binary.
+This entire process is called **build time** to clearly distinguish it from the compilation of Java source code to bytecode.
 
-### License
+The `native-image` tool can be used to build a **native executable**, which is the default, or a **native shared library**. This quick start guide focuses on building a native executable; to learn more about native shared libraries, go [here](InteropWithNativeCode.md).
 
-The Native Image technology is distributed as a separate installable to GraalVM.
-Native Image for GraalVM Community Edition is licensed under the [GPL 2 with Classpath Exception](https://github.com/oracle/graal/blob/master/substratevm/LICENSE).
+To get used to Native Image terminology and get better understanding of the technology, we recommend you to read the [Basics of Native Image](NativeImageBasics.md).
 
-Native Image for GraalVM Enterprise Edition is available as an Early Adopter feature.
-Early Adopter features are subject to ongoing development, testing, and modification.
-For more information, check the [Oracle Technology Network License Agreement for GraalVM Enterprise Edition](https://www.oracle.com/downloads/licenses/graalvm-otn-license.html).
+### Table of Contents
 
-## Install Native Image
+* [Build a Native Executable Using Maven or Gradle](#build-a-native-executable-using-maven-or-gradle)
+* [Build a Native Executable Using the `native-image` Tool](#build-a-native-executable-using-the-native-image-tool)
+* [Build Configuration](#build-configuration)
+* [Configuring Native Image with Third-Party Libraries](#configuring-native-image-with-third-party-libraries)
+* [Further Reading](#further-reading)
 
-Native Image can be added to GraalVM with the [GraalVM Updater](../graalvm-updater.md) tool.
+### Prerequisites
 
-Run this command to install Native Image:
-```shell
-gu install native-image
-```
-After this additional step, the `native-image` executable will become available in
-the `$JAVA_HOME/bin` directory.
+The `native-image` tool, available in the `bin` directory of your GraalVM installation, depends on the local toolchain (header files for the C library, `glibc-devel`, `zlib`, `gcc`, and/or `libstdc++-static`).
+These dependencies can be installed (if not yet installed) using a package manager on your machine.
+Choose your operating system to find instructions to meet the prerequisites.
 
-The above command will install Native Image from the GitHub catalog for GraalVM Community users.
-For GraalVM Enterprise users, the [manual installation](../graalvm-updater.md#manual-installation) is required.
+#### Linux
 
-## Prerequisites
-
-For compilation `native-image` depends on the local toolchain. Install `glibc-devel`, `zlib-devel` (header files for the C library and `zlib`) and `gcc`, using a package manager available on your OS. Some Linux distributions may additionally require `libstdc++-static`.
-
-On Oracle Linux use `yum` package manager:
+On Oracle Linux use the `yum` package manager:
 ```shell
 sudo yum install gcc glibc-devel zlib-devel
 ```
-You can still install `libstdc++-static` as long as the optional repositories are enabled (_ol7_optional_latest_ on Oracle Linux 7 and _ol8_codeready_builder_ on Oracle Linux 8).
+Some Linux distributions may additionally require `libstdc++-static`.
+You can install `libstdc++-static` if the optional repositories are enabled (_ol7_optional_latest_ on Oracle Linux 7, _ol8_codeready_builder_ on Oracle Linux 8, and _ol9_codeready_builder_ on Oracle Linux 9).
 
-On  Ubuntu Linux use `apt-get` package manager:
+On Ubuntu Linux use the `apt-get` package manager:
 ```shell
-sudo apt-get install build-essential libz-dev zlib1g-dev
+sudo apt-get install build-essential zlib1g-dev
 ```
-On other Linux distributions use `dnf` package manager:
+On other Linux distributions use the `dnf` package manager:
 ```shell
 sudo dnf install gcc glibc-devel zlib-devel libstdc++-static
 ```
+
+#### MacOS
+
 On macOS use `xcode`:
 ```shell
 xcode-select --install
 ```
 
-#### Prerequisites for Using Native Image on Windows
+#### Windows
 
-To start using Native Image on Windows, install [Visual Studio](https://visualstudio.microsoft.com/vs/) and Microsoft Visual C++(MSVC). There are two installation options:
-  * Install the Visual Studio Code Build Tools with the Windows 10 SDK
-  * Install Visual Studio Code with the Windows 10 SDK
+To use Native Image on Windows, you need Microsoft Visual C++ (MSVC) compiler version 14.x or later. The easiest way to install this is using the Windows Package Manager (`winget`), which comes pre-installed with Windows 10 (1709+) and Windows 11:
 
-You can use Visual Studio 2017 version 15.9 or later.
-
-Lastly, on Windows, the `native-image` builder will only work when it is executed from the **x64 Native Tools Command Prompt**.
-The command for initiating an x64 Native Tools command prompt is different if you only have the Visual Studio Build Tools installed, versus if you have the full VS Code 2019 installed.
-Check [this link](https://medium.com/graalvm/using-graalvm-and-native-image-on-windows-10-9954dc071311) for step-by-step instructions.
-
-## Build a Native Image
-
-A native image can be built as a standalone executable, which is the default, or as a shared library (see [Build a Shared Library](#build-a-shared-library)).
-For an image to be useful, it needs to have at least one entry point method.
-For standalone executables, Native Image supports Java main methods with a signature that takes the command line arguments as an array of strings:
-```java
-public static void main(String[] arg) { /* ... */ }
+```shell
+winget install --id Microsoft.VisualStudio.2022.BuildTools --source winget
 ```
-The executable images can have an arbitrary number of entry points, for example, to implement callbacks or APIs.
 
-To build a native image of a Java class file in the current working directory, use:
+You can also:
+
+* Install [Visual Studio 2022](https://visualstudio.microsoft.com/vs/older-downloads/) version 17.13.2 or any [compatible newer version](https://learn.microsoft.com/en-us/cpp/porting/binary-compat-2015-2017?view=msvc-170)
+* Install the Visual Studio Build Tools with the Windows 11 SDK (or a later version)
+* Install Visual Studio with the Windows 11 SDK (or a later version)
+
+All installation methods should include the Windows SDK. Native Image runs in both PowerShell and Command Prompt and will automatically detect your Visual Studio installation.
+
+For more information, see [Using GraalVM and Native Image on Windows](https://medium.com/graalvm/using-graalvm-and-native-image-on-windows-10-9954dc071311).
+
+## Build a Native Executable Using Maven or Gradle
+
+We provide Maven and Gradle plugins for Native Image to automate building, testing, and configuring native executables.
+Ensure `JAVA_HOME` points to a GraalVM installation so that the plugins can find the `native-image` tool.
+
+### Maven
+
+The [Maven plugin for Native Image](https://graalvm.github.io/native-build-tools/latest/maven-plugin.html) adds support for compiling a Java application into a native executable using [Apache Maven](https://maven.apache.org/).
+
+1. Create a new Maven Java project named “helloworld” in your favorite IDE or from your terminal with the following structure:
+    ```
+    ├── pom.xml
+    └── src
+        ├── main
+        │   └── java
+        │       └── com
+        │           └── example
+        │               └── App.java
+    ```
+    For example, you can run this command to create a new Maven project using the Maven Quickstart archetype:
+    ```bash
+    mvn archetype:generate \
+      -DarchetypeGroupId=org.apache.maven.archetypes \
+      -DarchetypeArtifactId=maven-archetype-quickstart \
+      -DarchetypeVersion=1.5 \
+      -DgroupId=com.example \
+      -DartifactId=helloworld \
+      -DinteractiveMode=false
+    ```
+
+2. Add the regular Maven plugins for compiling and assembling the project into an executable JAR file to your _pom.xml_ file:
+    ```xml
+    <build>
+        <plugins>
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-compiler-plugin</artifactId>
+                <version>3.12.1</version>
+                <configuration>
+                    <fork>true</fork>
+                </configuration>
+            </plugin>
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-jar-plugin</artifactId>
+                <version>3.3.0</version>
+                <configuration>
+                    <archive>
+                        <manifest>
+                            <mainClass>com.example.App</mainClass>
+                            <addClasspath>true</addClasspath>
+                        </manifest>
+                    </archive>
+                </configuration>
+            </plugin>
+        </plugins>
+    </build>
+    ```
+
+3. Enable the Maven plugin for Native Image by adding the following profile to _pom.xml_:
+    ```xml
+    <profiles>
+      <profile>
+        <id>native</id>
+        <build>
+          <plugins>
+            <plugin>
+              <groupId>org.graalvm.buildtools</groupId>
+              <artifactId>native-maven-plugin</artifactId>
+              <version>${native.maven.plugin.version}</version>
+              <extensions>true</extensions>
+              <executions>
+                <execution>
+                <id>build-native</id>
+                  <goals>
+                    <goal>compile-no-fork</goal>
+                  </goals>
+                  <phase>package</phase>
+                </execution>
+              </executions>
+            </plugin>
+          </plugins>
+        </build>
+      </profile>
+    </profiles>
+    ```
+    Set the `version` property to the latest plugin version (for example, by specifying the version via `<native.maven.plugin.version>` in the `<properties>` element). Keeping the plugin in a `native` profile preserves the default JVM build and enables native image generation only when you pass `-Pnative`. The `compile-no-fork` goal builds the native executable during the `package` phase without starting a second Maven lifecycle.
+
+4. Compile the project and build a native executable at one step:
+    ```bash
+    mvn -Pnative package
+    ```
+    The native executable, named `helloworld`, is created in the _target/_ directory of the project.
+    To build and run JUnit Platform tests as native executables, add the plugin `test` goal and run:
+    ```bash
+    mvn -Pnative test
+    ```
+    Use `-DskipTests` to skip all tests, or `-DskipNativeTests` to run only the regular JVM tests.
+
+5. Run the executable:
+    ```bash
+    ./target/helloworld
+    ```
+    That is it, you successfully created the native executable for your Java application using Maven.
+
+The Maven plugin for Native Image building offers many other features that may be required for an application with more complexity, such as resources autodetection, generating the required configuration, running JUnit Platform tests on a native executable, and so on, described in the [plugin reference documentation](https://graalvm.github.io/native-build-tools/latest/maven-plugin.html).
+
+### Gradle
+
+The [Gradle plugin for Native Image](https://graalvm.github.io/native-build-tools/latest/gradle-plugin.html) adds support for compiling a Java application into a native executable using the [Gradle build tool](https://gradle.org/).
+
+1. Create a new Gradle Java project named “helloworld” in your favorite IDE or from your terminal with the following structure:
+    ```
+    ├── app
+    │   ├── build.gradle
+    │   └── src
+    │       ├── main
+    │       │   ├── java
+    │       │   │   └── org
+    │       │   │       └── example
+    │       │   │           └── App.java
+    │       │   └── resources
+    ```
+
+    For example, initialize a new Gradle project with the `java` plugin:
+    - Create a new directory and enter it:
+        ```bash
+        mkdir helloworld && cd helloworld
+        ```
+    - Generate a project:
+        ```bash
+        gradle init --project-name helloworld --type java-application --test-framework junit-jupiter --dsl groovy
+        ```
+        Follow the prompts.
+        This command sets up a new Java application with the necessary directory structure and build files. The generated project uses an `app` subproject, so the application code and the plugin configuration live in _app/build.gradle_.
+
+        > If caching was enabled by the project generator in the _gradle.properties_ file, comment out or remove the `org.gradle.configuration-cache=true` line.
+
+2. Enable the Gradle plugin for Native Image by adding the following to the `plugins` section of _app/build.gradle_:
+    ```
+    plugins {
+    // ...
+    id 'org.graalvm.buildtools.native' version 'x.x.x'
+    }
+    ```
+    Specify the latest plugin version for the `'x.x.x'` version value. Apply it together with the `application` or `java` plugin. By default, the native executable name is derived from the project name, and the main class is taken from the application configuration.
+
+3. Build a native executable by running `./gradlew nativeCompile`:
+    ```bash
+    ./gradlew nativeCompile
+    ```
+    The native executable, named `app`, is created in the _app/build/native/nativeCompile/_ directory of the project.
+    Related tasks you may want to use are `./gradlew nativeRun` to build and run the native executable, and `./gradlew nativeTest` to build and run native JUnit tests.
+
+4. Run the native executable:
+    ```bash
+    ./app/build/native/nativeCompile/app
+    ```
+    That is it, you successfully created the native executable for your Java application using Gradle.
+
+The Gradle plugin for Native Image building has many other features that may be required for an application with more complexity, such as resources autodetection, generating the required configuration, running JUnit Platform tests on a native executable, and so on, described in the [plugin reference documentation](https://graalvm.github.io/native-build-tools/latest/gradle-plugin.html).
+
+## Build a Native Executable Using the `native-image` Tool
+
+The `native-image` tool takes Java bytecode as its input.
+You can build a native executable from a class file, from a JAR file, or from a module (with Java 9 and higher).
+
+### From a Class
+
+To build a native executable from a Java class file in the current working directory, use the following command:
 ```shell
 native-image [options] class [imagename] [options]
 ```
 
-To build a native image of a JAR file, use:
-```shell
-native-image [options] -jar jarfile [imagename] [options]
-```
+For example, build a native executable for a HelloWorld application.
 
-The `native-image` command needs to provide the class path for all classes using the familiar option from the java launcher: `-cp` followed by a list of
-directories or JAR files, separated by `:` on Linux and macOS platforms, or `;` on Windows.
-The name of the class containing the main method is the last argument, or you can use `-jar` and provide a JAR file that specifies the main method in its manifest.
-
-As an example, take this small Java program that reverses a String using recursion:
-```java
-public class Example {
-
-    public static void main(String[] args) {
-        String str = "Native Image is awesome";
-        String reversed = reverseString(str);
-        System.out.println("The reversed string is: " + reversed);
+1. Save this code into file named _HelloWorld.java_:
+    ```java
+    public class HelloWorld {
+        public static void main(String[] args) {
+            System.out.println("Hello, Native World!");
+        }
     }
+    ```
 
-    public static String reverseString(String str) {
-        if (str.isEmpty())
-            return str;
-        return reverseString(str.substring(1)) + str.charAt(0);
-    }
-}
-```
-Compile it and build a native image from the Java class:
+2. Compile it and build a native executable from the Java class:
+    ```shell
+    javac HelloWorld.java
+    native-image HelloWorld
+    ```
+    It will create a native executable, `helloworld`, in the current working directory.
+
+3. Run the application:
+
+    ```shell
+    ./helloworld
+    ```
+    You can time it to see the resources used:
+
+    ```shell
+    time -f 'Elapsed Time: %e s Max RSS: %M KB' ./helloworld
+    # Hello, Native World!
+    # Elapsed Time: 0.00 s Max RSS: 7620 KB
+    ```
+
+### From a JAR file
+
+To build a native executable from a JAR file in the current working directory, use the following command:
 ```shell
-javac Example.java
-native-image Example
+native-image [options] -jar jarfile [imagename]
 ```
-The native image builder ahead-of-time compiles the `Example` class into a standalone executable, `example`, in the current working directory.
-Run the executable:
+
+The default behavior of `native-image` is aligned with the `java` command which means you can pass the `-jar`, `-cp`, `-m`  options to build with Native Image as you would normally do with `java`. For example, `java -jar App.jar someArgument` becomes `native-image -jar App.jar` and `./App someArgument`.
+
+[Follow this guide](guides/build-native-executable-from-jar.md) to build a native executable from a JAR file.
+
+### From a Module
+
+You can also convert a modularized Java application into a native executable.
+
+The command to build a native executable from a Java module is:
 ```shell
-./example
+native-image [options] --module <module>[/<mainclass>] [options]
 ```
 
-Another option to the native image builder that might be helpful is `--install-exit-handlers`.
-It is not recommended to register the default signal handlers when building a shared library.
-However, it is desirable to include signal handlers when building a native image for containerized environments, like Docker containers.
-The `--install-exit-handlers` option gives you the same signal handlers that a JVM does.
+For more information about how to produce a native executable from a modular Java application, see [Building a HelloWorld Java Module into a Native Executable](guides/build-java-module-app-aot.md).
 
-For more complex examples, visit the [native image generation](../../examples/native-image-examples.md) or [compiling a Java and Kotlin app ahead-of-time](../../examples/java-kotlin-aot.md) pages.
+## Build Configuration
 
-## Build a Shared Library
+There many options you can pass to the `native-image` tool to configure the build process.
+Run `native-image --help` to see the full list.
+The options passed to `native-image` are evaluated left-to-right.
 
-To build a native image as a shared library of a Java class file, pass  `--shared` to the native image builder.
-The created shared library will have the main method of the given Java class as its entrypoint method.
-```shell
-native-image class [libraryname] --shared
-```
-To build a native image as a shared library of a JAR file, use:
-```shell
-native-image -jar jarfile [libraryname] --shared
-```
+For different build tweaks and to learn more about build time configuration, see [Native Image Build Configuration](BuildConfiguration.md).
 
-Note: if you build a shared library where you do not specify a main class, you must append the `-H:Name=` flag to specify the library name: `-H:Name=libraryname`.
+Native Image will output the progress and various statistics during the build.
+To learn more about the output and the different build phases, see [Build Output](BuildOutput.md).
+For more detailed insights regarding the contents of a native executable, see [Build Reports](BuildReport.md).
 
-As mentioned in the previous section, you need to have at least one entry point method for a native image to be useful.
-For shared libraries, Native Image provides the `@CEntryPoint` annotation to specify entry point methods that should be exported and callable from C.
-Entry point methods must be static and may only have non-object parameters and return types – this includes Java primitives, but also Word types (including pointers).
-One of the parameters of an entry point method has to be of type `IsolateThread` or `Isolate`.
-This parameter provides the current thread's execution context for the call.
+## Native Image and Third-Party Libraries
 
-For example:
+For more complex applications that use external libraries, you must provide the `native-image` tool with metadata.
 
-```java
-@CEntryPoint static int add(IsolateThread thread, int a, int b) {
-    return a + b;
-}
-```
+Building a standalone binary with `native-image` takes place under a "closed world assumption".
+The `native-image` tool performs an analysis to see which classes, methods, and fields within your application are reachable and must be included in the native executable.
+The analysis is static: it does not run your application.
+This means that all the bytecode in your application that can be called at runtime must be known (observed and analyzed) at build time.
 
-When building a shared library, an additional C header file is generated.
-This header file contains declarations for the [C API](C-API.md), which allows creating isolates and attaching threads from C code, as well as declarations for each entry point in the source code.
-The generated C declaration for the above example is:
-```c
-int add(graal_isolatethread_t* thread, int a, int b);
-```
+The analysis can determine some cases of dynamic class loading, but it cannot always exhaustively predict all usages of the Java Native Interface (JNI), Java Reflection, Dynamic Proxy objects, or class path resources.
+To deal with these dynamic features of Java, you inform the analysis with details of the classes that use Reflection, Proxy, and so on, or what classes to be dynamically loaded.
+To achieve this, you either provide the `native-image` tool with JSON-formatted configuration files or pre-compute metadata in the code.
 
-Shared library images and executable images alike can have an arbitrary number of entry points, for example, to implement callbacks or APIs.
+To learn more about metadata, ways to provide it, and supported metadata types, see [Reachability Metadata](ReachabilityMetadata.md). For a comprehensive reference of JSON configuration fields, see the [Metadata JSON Format Reference](ReachabilityMetadata.md#metadata-json-format-reference).
+To automatically collect metadata for your application, see [Automatic Collection of Metadata](AutomaticMetadataCollection.md).
 
-## How to Determine What Version of GraalVM an Image Is Generated with
+Some applications may need additional configuration to be compiled with Native Image.
+For more details, see [Native Image Compatibility Guide](Compatibility.md).
 
-Assuming you have a Java class file, _EmptyHello.class_ , containing an empty main method and have generated an empty shared object emptyhello with the Native Image builder:
-```shell
-native-image -cp hello EmptyHello
-[emptyhello:11228]    classlist:     149.59 ms
-...
-```
+Native Image can also interop with native languages through a custom API.
+Using this API, you can specify custom native entry points into your Java application and build it into a native shared library.
+To learn more, see [Interoperability with Native Code](InteropWithNativeCode.md).
 
-If you do not know what GraalVM distribution is set to the `PATH` environment variable, how to determine if a native image was compiled with Community or
-Enterprise Edition?
-Run this command:
-```shell
-strings emptyhello | grep com.oracle.svm.core.VM
-```
+### Further Reading
 
-The expected output should match the following:
-```shell
-com.oracle.svm.core.VM GraalVM <version> Java 11 EE
-```
+This getting started guide is intended for new users or those with little experience of using Native Image.
+We strongly recommend these users to check the [Basics of Native Image](NativeImageBasics.md) page to better understand some key aspects before going deeper.
 
-**Note:**
-Python source code or LLVM bitcode interpreted or compiled with GraalVM Community Edition will not have the same security characteristics as the same code interpreted or compiled using GraalVM Enterprise Edition.
-There is a GraalVM string embedded in each image that allows to figure out the version and variant of the base (Community or Enterprise) used to build an image.
-The following command will query that information from an image:
-```shell
-strings <path to native-image exe or shared object> | grep com.oracle.svm.core.VM
-```
+Check [user guides](guides/guides.md) to become more experienced with Native Image, find demo examples, and learn about potential usage scenarios.
 
-Here is an example output:
-```shell
-com.oracle.svm.core.VM.Target.LibC=com.oracle.svm.core.posix.linux.libc.GLibC
-com.oracle.svm.core.VM.Target.Platform=org.graalvm.nativeimage.Platform$LINUX_AMD64
-com.oracle.svm.core.VM.Target.StaticLibraries=liblibchelper.a|libnet.a|libffi.a|libextnet.a|libnio.a|libjava.a|libfdlibm.a|libzip.a|libjvm.a
-com.oracle.svm.core.VM=GraalVM <version> Java 11
-com.oracle.svm.core.VM.Target.Libraries=pthread|dl|z|rt
-com.oracle.svm.core.VM.Target.CCompiler=gcc|redhat|x86_64|10.2.1
-```
+For a gradual learning process, check the Native Image [Build Overview](BuildOverview.md) and [Build Configuration](BuildConfiguration.md) documentation.
 
-If the image was build with Oracle GraalVM Enterprise Edition the output would instead contain:
-```shell
-com.oracle.svm.core.VM=GraalVM <version> Java 11 EE
-```
+Consider running interactive workshops to get some practical experience: go to [Luna Labs](https://luna.oracle.com/) and search for "Native Image".
 
-## Ahead-of-time Compilation Limitations
+If you have stumbled across a potential bug, please [submit an issue in GitHub](https://github.com/oracle/graal/issues/new/choose).
 
-There is a small portion of Java features are not susceptible to ahead-of-time compilation, and will therefore miss out on the performance advantages.
-To be able to build a highly optimized native executable, GraalVM runs an aggressive static analysis that requires a closed-world assumption, which means that all classes and all bytecodes that are reachable at run time must be known at build time. 
-Therefore, it is not possible to load new data that have not been available during ahead-of-time compilation.
-Continue reading to [GraalVM Native Image Compatibility and Optimization](Limitations.md).
+If you would like to contribute to Native Image, follow our standard [contributing workflow](contribute/Contributing.md).

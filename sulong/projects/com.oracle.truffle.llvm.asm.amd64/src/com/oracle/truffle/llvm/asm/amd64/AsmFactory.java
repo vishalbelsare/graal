@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2016, 2021, Oracle and/or its affiliates.
+ * Copyright (c) 2016, 2026, Oracle and/or its affiliates.
  *
  * All rights reserved.
  *
@@ -111,8 +111,10 @@ import com.oracle.truffle.llvm.runtime.nodes.asm.LLVMAMD64IncNodeFactory.LLVMAMD
 import com.oracle.truffle.llvm.runtime.nodes.asm.LLVMAMD64IncNodeFactory.LLVMAMD64InclNodeGen;
 import com.oracle.truffle.llvm.runtime.nodes.asm.LLVMAMD64IncNodeFactory.LLVMAMD64IncqNodeGen;
 import com.oracle.truffle.llvm.runtime.nodes.asm.LLVMAMD64IncNodeFactory.LLVMAMD64IncwNodeGen;
+import com.oracle.truffle.llvm.runtime.nodes.asm.LLVMAMD64LoadControlWordNodeGen;
 import com.oracle.truffle.llvm.runtime.nodes.asm.LLVMAMD64LoadFlagsFactory.LLVMAMD64LahfNodeGen;
 import com.oracle.truffle.llvm.runtime.nodes.asm.LLVMAMD64LoadFlagsFactory.LLVMAMD64ReadFlagswNodeGen;
+import com.oracle.truffle.llvm.runtime.nodes.asm.LLVMAMD64ReadControlWordNodeGen;
 import com.oracle.truffle.llvm.runtime.nodes.asm.LLVMAMD64MulNodeFactory.LLVMAMD64MulbNodeGen;
 import com.oracle.truffle.llvm.runtime.nodes.asm.LLVMAMD64MulNodeFactory.LLVMAMD64MullNodeGen;
 import com.oracle.truffle.llvm.runtime.nodes.asm.LLVMAMD64MulNodeFactory.LLVMAMD64MulqNodeGen;
@@ -248,6 +250,7 @@ import com.oracle.truffle.llvm.runtime.nodes.vars.LLVMWriteNodeFactory.LLVMWrite
 import com.oracle.truffle.llvm.runtime.nodes.vars.LLVMWriteNodeFactory.LLVMWriteI64NodeGen;
 import com.oracle.truffle.llvm.runtime.nodes.vars.LLVMWriteNodeFactory.LLVMWritePointerNodeGen;
 import com.oracle.truffle.llvm.runtime.nodes.vars.StructLiteralNodeGen;
+import com.oracle.truffle.llvm.runtime.types.FunctionType;
 import com.oracle.truffle.llvm.runtime.types.PointerType;
 import com.oracle.truffle.llvm.runtime.types.PrimitiveType;
 import com.oracle.truffle.llvm.runtime.types.PrimitiveType.PrimitiveKind;
@@ -750,7 +753,7 @@ public class AsmFactory {
                             throw invalidOperandType(dstType);
                     }
                 }
-            case "bswap":
+            case "bswap": {
                 LLVMExpressionNode src = getOperandLoad(dstType, operand);
                 switch (getPrimitiveType(dstType)) {
                     case I32:
@@ -763,6 +766,18 @@ public class AsmFactory {
                         throw invalidOperandType(dstType);
                 }
                 break;
+            }
+            case "fstcw":
+            case "fnstcw": {
+                dstType = PrimitiveType.I16;
+                statements.add(getOperandStore(dstType, operand, LLVMAMD64ReadControlWordNodeGen.create()));
+                return;
+            }
+            case "fldcw": {
+                dstType = PrimitiveType.I16;
+                statements.add(LLVMAMD64LoadControlWordNodeGen.create(getOperandLoad(dstType, operand)));
+                return;
+            }
             default:
                 statements.add(LLVMUnsupportedInstructionNode.create(UnsupportedReason.INLINE_ASSEMBLER, operation));
                 return;
@@ -1813,9 +1828,10 @@ public class AsmFactory {
                     slot = getRegisterSlot(reg);
                     todoRegisters.remove(reg);
                     LLVMExpressionNode argnode = LLVMArgNodeGen.create(arg.getInIndex());
-                    if (argTypes.get(arg.getInIndex()) instanceof PointerType) {
+                    Type type = argTypes.get(arg.getInIndex());
+                    if (type instanceof PointerType || type instanceof FunctionType) {
                         arguments.add(LLVMWritePointerNodeGen.create(slot, argnode));
-                    } else if (argTypes.get(arg.getInIndex()) instanceof VectorType) {
+                    } else if (type instanceof VectorType) {
                         arguments.add(LLVMWriteNodeFactory.LLVMWriteVectorNodeGen.create(slot, argnode));
                     } else {
                         LLVMExpressionNode node = CommonNodeFactory.createSignedCast(argnode, PrimitiveType.I64);
@@ -1829,7 +1845,7 @@ public class AsmFactory {
                     arguments.add(LLVMWriteI64NodeGen.create(slot, node));
                 } else if (arg.getType() instanceof VectorType) {
                     arguments.add(LLVMWriteNodeFactory.LLVMWriteVectorNodeGen.create(slot, argnode));
-                } else if (arg.getType() instanceof PointerType) {
+                } else if (arg.getType() instanceof PointerType || arg.getType() instanceof FunctionType) {
                     arguments.add(LLVMWritePointerNodeGen.create(slot, argnode));
                 } else {
                     throw invalidOperandType(arg.getType());

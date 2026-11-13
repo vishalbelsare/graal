@@ -24,35 +24,22 @@
  */
 package com.oracle.svm.hosted;
 
-// Checkstyle: allow reflection
-
 import java.lang.reflect.Method;
 
-import org.graalvm.compiler.serviceprovider.JavaVersionUtil;
+import com.oracle.svm.shared.util.ReflectionUtil;
 
-import com.oracle.svm.core.util.VMError;
-import com.oracle.svm.util.ReflectionUtil;
+import jdk.internal.loader.ClassLoaders;
 
 public class BootLoaderSupport {
 
-    /**
-     * Gets the boot loader or {@code null} if it does not exist.
-     */
+    private static ClassLoader bootLoader;
+
     public static ClassLoader getBootLoader() {
-        if (JavaVersionUtil.JAVA_SPEC <= 8) {
-            // In JDK 8 there is not boot class loader class
-            return null;
+        if (bootLoader != null) {
+            return bootLoader;
         }
-        Class<?> classLoadersClass;
-        try {
-            // Checkstyle: stop
-            classLoadersClass = Class.forName("jdk.internal.loader.ClassLoaders");
-            // Checkstyle: resume
-            Method method = ReflectionUtil.lookupMethod(classLoadersClass, "bootLoader");
-            Object r = method.invoke(null);
-            return (ClassLoader) r;
-        } catch (ReflectiveOperationException e) {
-            throw VMError.shouldNotReachHere("Cannot get access to the boot loader", e);
-        }
+        Method method = ReflectionUtil.lookupMethod(ClassLoaders.class, "bootLoader");
+        bootLoader = ReflectionUtil.invokeMethod(method, null);
+        return bootLoader;
     }
 }

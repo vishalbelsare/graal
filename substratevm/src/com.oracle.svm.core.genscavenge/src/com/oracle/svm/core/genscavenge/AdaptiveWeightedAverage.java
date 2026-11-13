@@ -24,9 +24,13 @@
  */
 package com.oracle.svm.core.genscavenge;
 
+import static com.oracle.svm.shared.Uninterruptible.CALLED_FROM_UNINTERRUPTIBLE_CODE;
+
 import org.graalvm.word.UnsignedWord;
 
-import com.oracle.svm.core.util.UnsignedUtils;
+import com.oracle.svm.shared.util.BasedOnJDKFile;
+import com.oracle.svm.shared.util.UnsignedUtils;
+import com.oracle.svm.shared.Uninterruptible;
 
 /**
  * A weighted average maintains a running, weighted average of some floating-point value.
@@ -36,26 +40,34 @@ import com.oracle.svm.core.util.UnsignedUtils;
  *
  * This serves as our best estimate of a future unknown.
  */
+@BasedOnJDKFile("https://github.com/graalvm/labs-openjdk/blob/jdk-25-ga/src/hotspot/share/gc/shared/gcUtil.hpp")
+@BasedOnJDKFile("https://github.com/graalvm/labs-openjdk/blob/jdk-25-ga/src/hotspot/share/gc/shared/gcUtil.cpp")
 class AdaptiveWeightedAverage {
     static final int OLD_THRESHOLD = 100;
 
-    private final int weight;
+    private final double weight;
 
     private double average;
     private long sampleCount;
     private boolean isOld;
 
-    AdaptiveWeightedAverage(int weight) {
+    /** @param weight Weight of newest sample in percent, from 0 (exclusive) to 100 (inclusive). */
+    AdaptiveWeightedAverage(double weight) {
         this(weight, 0);
     }
 
-    AdaptiveWeightedAverage(int weight, double avg) {
+    AdaptiveWeightedAverage(double weight, double avg) {
+        assert weight > 0 && weight <= 100;
         this.weight = weight;
         this.average = avg;
     }
 
     public double getAverage() {
         return average;
+    }
+
+    public long getCount() {
+        return sampleCount;
     }
 
     public void sample(double value) {
@@ -76,16 +88,17 @@ class AdaptiveWeightedAverage {
          * it meaningful. We'd like the first weight used to be 1, the second to be 1/2, etc until
          * we have OLD_THRESHOLD/weight samples.
          */
-        long countWeight = 0;
+        double countWeight = 0;
         if (!isOld) { // avoid division by zero if the counter wraps
-            countWeight = OLD_THRESHOLD / sampleCount;
+            countWeight = OLD_THRESHOLD / (double) sampleCount;
         }
-        long adaptiveWeight = Math.max(weight, countWeight);
+        double adaptiveWeight = Math.max(weight, countWeight);
         return expAvg(avg, sample, adaptiveWeight);
     }
 
-    private static double expAvg(double avg, double sample, long adaptiveWeight) {
-        assert adaptiveWeight <= 100 : "weight must be a percentage";
+    @Uninterruptible(reason = CALLED_FROM_UNINTERRUPTIBLE_CODE, mayBeInlined = true)
+    static double expAvg(double avg, double sample, double adaptiveWeight) {
+        assert adaptiveWeight > 0 && adaptiveWeight <= 100 : "weight must be a percentage";
         return (100.0 - adaptiveWeight) * avg / 100.0 + adaptiveWeight * sample / 100.0;
     }
 }
@@ -103,7 +116,7 @@ class AdaptivePaddedAverage extends AdaptiveWeightedAverage {
     private double paddedAverage;
     private double deviation;
 
-    AdaptivePaddedAverage(int weight, int padding) {
+    AdaptivePaddedAverage(double weight, int padding) {
         this(weight, padding, false);
     }
 
@@ -112,7 +125,7 @@ class AdaptivePaddedAverage extends AdaptiveWeightedAverage {
      *            allowed to change. This is to prevent zero samples from drastically changing the
      *            padded average.
      */
-    AdaptivePaddedAverage(int weight, int padding, boolean noZeroDeviations) {
+    AdaptivePaddedAverage(double weight, int padding, boolean noZeroDeviations) {
         super(weight);
         this.padding = padding;
         this.noZeroDeviations = noZeroDeviations;
@@ -130,9 +143,5 @@ class AdaptivePaddedAverage extends AdaptiveWeightedAverage {
 
     public double getPaddedAverage() {
         return paddedAverage;
-    }
-
-    public double getDeviation() {
-        return deviation;
     }
 }

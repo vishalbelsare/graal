@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2017, 2020, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2017, 2022, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * The Universal Permissive License (UPL), Version 1.0
@@ -63,7 +63,6 @@ import org.junit.Test;
 
 import com.oracle.truffle.api.CompilerDirectives;
 import com.oracle.truffle.api.CompilerDirectives.TruffleBoundary;
-import com.oracle.truffle.api.TruffleLanguage;
 import com.oracle.truffle.api.TruffleLanguage.Env;
 import com.oracle.truffle.api.interop.InteropException;
 import com.oracle.truffle.api.interop.InteropLibrary;
@@ -139,9 +138,90 @@ public class AsCollectionsTest {
         } catch (IndexOutOfBoundsException ioobex) {
             // O.K.
         }
+
+        // Test add is unsupported
+        try {
+            interopList.add("d");
+            fail();
+        } catch (UnsupportedOperationException ex) {
+            // O.K.
+        }
+
+        // Test add is unsupported
+        try {
+            interopList.add(0, "e");
+            fail();
+        } catch (UnsupportedOperationException ex) {
+            // O.K.
+        }
+
         Object old = interopList.set(1, "bbb");
         assertEquals("b", old);
         assertEquals("bbb", interopList.get(1));
+    }
+
+    @Test
+    public void testAsExpandableList() {
+        ArrayList origList = new ArrayList(4);
+        origList.add("a");
+        origList.add("b");
+        origList.add("c");
+        TruffleObject to = new ExpandableListBasedTO(origList);
+        assertTrue(INTEROP.hasArrayElements(to));
+
+        List interopList = asJavaObject(List.class, to);
+        assertEquals(origList.size(), interopList.size());
+        assertEquals(origList.toString(), new ArrayList<>(interopList).toString());
+        assertEquals(origList.toString(), interopList.toString());
+        // Test get out of bounds
+        try {
+            interopList.get(3);
+            fail();
+        } catch (IndexOutOfBoundsException ioobex) {
+            // O.K.
+        }
+        // Test set out of bounds
+        try {
+            interopList.set(3, "1000");
+            fail();
+        } catch (IndexOutOfBoundsException ioobex) {
+            // O.K.
+        }
+        Object old = interopList.set(1, "bbb");
+        assertEquals("b", old);
+        assertEquals("bbb", interopList.get(1));
+
+        // Test add out of bounds
+        try {
+            interopList.add(1000, "1000");
+            fail();
+        } catch (IndexOutOfBoundsException ioobex) {
+            // O.K.
+        }
+        try {
+            interopList.add(-1, "-1");
+            fail();
+        } catch (IndexOutOfBoundsException ioobex) {
+            // O.K.
+        }
+
+        // test add/append with no index given
+        interopList.add("ccc");
+        assertEquals("ccc", interopList.get(3));
+
+        // test add minimum index
+        interopList.add(0, "ddd");
+        // test add in between index
+        interopList.add(1, "eee");
+        // test add maximum index
+        interopList.add(6, "fff");
+        assertEquals("ddd", interopList.get(0));
+        assertEquals("eee", interopList.get(1));
+        assertEquals("a", interopList.get(2));
+        assertEquals("bbb", interopList.get(3));
+        assertEquals("c", interopList.get(4));
+        assertEquals("ccc", interopList.get(5));
+        assertEquals("fff", interopList.get(6));
     }
 
     @Test
@@ -313,13 +393,88 @@ public class AsCollectionsTest {
         }
 
         @ExportMessage
-        boolean hasLanguage() {
+        boolean hasLanguageId() {
             return true;
         }
 
         @ExportMessage
-        Class<? extends TruffleLanguage<?>> getLanguage() {
-            return ProxyLanguage.class;
+        String getLanguageId() {
+            return ProxyLanguage.ID;
+        }
+
+        @ExportMessage
+        @TruffleBoundary
+        Object toDisplayString(boolean sideEffects) {
+            return list.toString();
+        }
+
+    }
+
+    @ExportLibrary(InteropLibrary.class)
+    @SuppressWarnings({"static-method", "unused"})
+    static final class ExpandableListBasedTO implements TruffleObject {
+
+        final ArrayList list;
+
+        ExpandableListBasedTO(ArrayList list) {
+            this.list = list;
+        }
+
+        @ExportMessage
+        boolean hasArrayElements() {
+            return true;
+        }
+
+        @ExportMessage
+        @TruffleBoundary
+        Object readArrayElement(long index) throws InvalidArrayIndexException {
+            try {
+                return list.get((int) index);
+            } catch (IndexOutOfBoundsException ioob) {
+                throw InvalidArrayIndexException.create(index);
+            }
+        }
+
+        @ExportMessage
+        @TruffleBoundary
+        Object writeArrayElement(long index, Object value) throws InvalidArrayIndexException {
+            if (index == getArraySize()) {
+                return list.add(value);
+            } else {
+                try {
+                    list.set((int) index, value);
+                    return value;
+                } catch (IndexOutOfBoundsException ioob) {
+                    throw InvalidArrayIndexException.create(index);
+                }
+            }
+        }
+
+        @ExportMessage
+        @TruffleBoundary
+        long getArraySize() {
+            return list.size();
+        }
+
+        @ExportMessage(name = "isArrayElementReadable")
+        @ExportMessage(name = "isArrayElementModifiable")
+        boolean isArrayElementReadable(long index) {
+            return index >= 0 && index < getArraySize();
+        }
+
+        @ExportMessage(name = "isArrayElementInsertable")
+        boolean isArrayElementModifiable(long index) {
+            return index >= 0 && index <= getArraySize();
+        }
+
+        @ExportMessage
+        boolean hasLanguageId() {
+            return true;
+        }
+
+        @ExportMessage
+        String getLanguageId() {
+            return ProxyLanguage.ID;
         }
 
         @ExportMessage
@@ -382,13 +537,13 @@ public class AsCollectionsTest {
         }
 
         @ExportMessage
-        boolean hasLanguage() {
+        boolean hasLanguageId() {
             return true;
         }
 
         @ExportMessage
-        Class<? extends TruffleLanguage<?>> getLanguage() {
-            return ProxyLanguage.class;
+        String getLanguageId() {
+            return ProxyLanguage.ID;
         }
 
         @ExportMessage

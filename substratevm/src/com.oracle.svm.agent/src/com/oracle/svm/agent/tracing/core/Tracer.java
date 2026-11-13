@@ -25,10 +25,10 @@
 package com.oracle.svm.agent.tracing.core;
 
 import java.util.Arrays;
-import java.util.HashMap;
-import java.util.Map;
 
-import com.oracle.svm.jni.nativeapi.JNIMethodId;
+import org.graalvm.collections.EconomicMap;
+
+import com.oracle.svm.core.jni.headers.JNIMethodId;
 
 public abstract class Tracer {
     /** Value to explicitly express {@code null} in a trace, instead of omitting the value. */
@@ -59,7 +59,7 @@ public abstract class Tracer {
     }
 
     public void traceInitialization() {
-        Map<String, Object> entry = new HashMap<>();
+        EconomicMap<String, Object> entry = EconomicMap.create();
         entry.put("tracer", "meta");
         entry.put("event", "initialization");
         entry.put("version", "1");
@@ -67,10 +67,18 @@ public abstract class Tracer {
     }
 
     public void tracePhaseChange(String phase) {
-        Map<String, Object> entry = new HashMap<>();
+        EconomicMap<String, Object> entry = EconomicMap.create();
         entry.put("tracer", "meta");
         entry.put("event", "phase_change");
         entry.put("phase", phase);
+        traceEntry(entry);
+    }
+
+    public void traceTrackReflectionMetadata(boolean trackReflectionMetadata) {
+        EconomicMap<String, Object> entry = EconomicMap.create();
+        entry.put("tracer", "meta");
+        entry.put("event", "track_reflection_metadata");
+        entry.put("track", trackReflectionMetadata);
         traceEntry(entry);
     }
 
@@ -86,14 +94,15 @@ public abstract class Tracer {
      * @param declaringClass If the traced call resolves a member of {@code clazz}, this can be
      *            specified to provide the (super)class which actually declares that member.
      * @param callerClass The class on the call stack which performed the call.
-     * @param result The result of the call.
+     * @param result The result of the call or an indication on whether to handle the call if the
+     *            result is not required in the processor.
      * @param stackTrace Full stack trace leading to (and including) the call, or null if not
      *            available. The first element of this array represents the top of the stack.
      *
      * @param args Arguments to the call, which may contain arrays (which can contain more arrays)
      */
     public void traceCall(String tracer, String function, Object clazz, Object declaringClass, Object callerClass, Object result, JNIMethodId[] stackTrace, Object... args) {
-        Map<String, Object> entry = new HashMap<>();
+        EconomicMap<String, Object> entry = EconomicMap.create();
         entry.put("tracer", tracer);
         entry.put("function", function);
         if (clazz != null) {
@@ -117,5 +126,5 @@ public abstract class Tracer {
         traceEntry(entry);
     }
 
-    protected abstract void traceEntry(Map<String, Object> entry);
+    protected abstract void traceEntry(EconomicMap<String, Object> entry);
 }

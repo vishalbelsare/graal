@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2016, 2021, Oracle and/or its affiliates.
+ * Copyright (c) 2016, 2026, Oracle and/or its affiliates.
  *
  * All rights reserved.
  *
@@ -29,6 +29,7 @@
  */
 package com.oracle.truffle.llvm.runtime.nodes.cast;
 
+import com.oracle.truffle.api.ExactMath;
 import com.oracle.truffle.api.dsl.Cached;
 import com.oracle.truffle.api.dsl.GenerateAOT;
 import com.oracle.truffle.api.dsl.NodeChild;
@@ -36,6 +37,7 @@ import com.oracle.truffle.api.dsl.Specialization;
 import com.oracle.truffle.api.interop.InteropLibrary;
 import com.oracle.truffle.api.library.CachedLibrary;
 import com.oracle.truffle.llvm.runtime.CommonNodeFactory;
+import com.oracle.truffle.llvm.runtime.floating.LLVM128BitFloat;
 import com.oracle.truffle.llvm.runtime.nodes.cast.LLVMToI64Node.LLVMBitcastToI64Node;
 import com.oracle.truffle.llvm.runtime.floating.LLVM80BitFloat;
 import com.oracle.truffle.llvm.runtime.interop.convert.ForeignToLLVM;
@@ -116,7 +118,7 @@ public abstract class LLVMToFloatNode extends LLVMExpressionNode {
 
         @Specialization
         protected float doFloat(boolean from) {
-            return from ? 1.0f : 0.0f;
+            return from ? -1.0f : 0.0f;
         }
 
         @Specialization
@@ -153,11 +155,14 @@ public abstract class LLVMToFloatNode extends LLVMExpressionNode {
         protected float doFloat(LLVM80BitFloat from) {
             return from.getFloatValue();
         }
+
+        @Specialization
+        protected float doFloat(LLVM128BitFloat from) {
+            return from.toFloatValue();
+        }
     }
 
     public abstract static class LLVMUnsignedCastToFloatNode extends LLVMToFloatNode {
-
-        private static final float LEADING_BIT = 0x1.0p63f;
 
         protected LLVMUnsignedCastToFloatNode() {
         }
@@ -197,11 +202,7 @@ public abstract class LLVMToFloatNode extends LLVMExpressionNode {
         }
 
         public static float doI64(long from) {
-            float val = from & Long.MAX_VALUE;
-            if (from < 0) {
-                val += LEADING_BIT;
-            }
-            return val;
+            return ExactMath.unsignedToFloat(from);
         }
 
         @Specialization

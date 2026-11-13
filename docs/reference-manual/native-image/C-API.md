@@ -1,13 +1,15 @@
 ---
 layout: docs
-toc_group: native-image
-link_title: Native Image C API
-permalink: /reference-manual/native-image/C-API/
+toc_group: native-code-interoperability
+link_title: C API
+permalink: /reference-manual/native-image/native-code-interoperability/C-API/
+redirect_from: /reference-manual/native-image/C-API/
 ---
-#  Native Image C API
 
-Native Image provides an API for the C language for initializing isolates and attaching threads for use with the entry point feature that is demonstrated [here](README.md#images-and-entry-points).
-The C API is available when Native Image is built as a shared library and its declarations are included in the header file that is generated during the build.
+# Native Image C API
+
+Native Image provides a GraalVM-specific API to manage Java objects from the C/C++ languages, initialize isolates and attach threads.
+The C API is available when Native Image is built as a shared library and its declarations are included in the header file that is generated during the native image build.
 
 ```c
 /*
@@ -15,7 +17,7 @@ The C API is available when Native Image is built as a shared library and its de
  * passed to an entry point as the execution context.
  */
 struct __graal_isolate_t;
-typedef struct _graal_isolate_t graal_isolate_t;
+typedef struct __graal_isolate_t graal_isolate_t;
 
 /*
  * Structure representing a thread that is attached to an isolate. A pointer to
@@ -26,8 +28,29 @@ struct __graal_isolatethread_t;
 typedef struct __graal_isolatethread_t graal_isolatethread_t;
 
 /* Parameters for the creation of a new isolate. */
+enum { __graal_create_isolate_params_version = 5 };
 struct __graal_create_isolate_params_t {
-    /* for future use */
+    /* Version of this struct. Set to __graal_create_isolate_params_version after zeroing this struct. */
+    int version;
+
+    /* Fields introduced in version 1 */
+    __graal_uword  reserved_address_space_size; /* Size of virtual address space to reserve for the heap. */
+
+    /* Fields introduced in version 2. Internal usage, do not use. */
+    const char    *auxiliary_image_path;                /* Path to an auxiliary image to load. */
+    __graal_uword  auxiliary_image_reserved_space_size; /* Reserved bytes for loading an auxiliary image. */
+
+    /* Fields introduced in version 3 */
+    int            argc;                        /* Number of char* argument strings in argv. */
+    char         **argv;                        /* Array of argument strings, parsed like command line arguments. */
+    int            pkey;                        /* Isolate protection key or domain. Internal usage, do not use. */
+
+    /* Fields introduced in version 4 */
+    char           ignore_unrecognized_args;    /* Ignore unrecognized arguments in argv when 1. */
+    char           _reserved_4;                 /* Internal usage, do not use. */
+
+    /* Fields introduced in version 5 */
+    char           _reserved_5;                 /* Internal usage, do not use. */
 };
 typedef struct __graal_create_isolate_params_t graal_create_isolate_params_t;
 
@@ -35,8 +58,8 @@ typedef struct __graal_create_isolate_params_t graal_create_isolate_params_t;
  * Create a new isolate, considering the passed parameters (which may be NULL).
  * Returns 0 on success, or a non-zero value on failure.
  * On success, the current thread is attached to the created isolate, and the
- * address of the isolate and the isolate thread structures is written to the
- * passed pointers if they are not NULL.
+ * address of the isolate and the isolate thread are written to the passed pointers
+ * if they are not NULL.
  */
 int graal_create_isolate(graal_create_isolate_params_t* params, graal_isolate_t** isolate, graal_isolatethread_t** thread);
 
@@ -57,9 +80,8 @@ int graal_attach_thread(graal_isolate_t* isolate, graal_isolatethread_t** thread
 graal_isolatethread_t* graal_get_current_thread(graal_isolate_t* isolate);
 
 /*
- * Given an isolate thread structure, determines to which isolate it belongs and
- * returns the address of its isolate structure. If an error occurs, returns NULL
- * instead.
+ * Given an isolate thread structure, determines to which isolate it belongs and returns
+ * the address of its isolate structure. If an error occurs, returns NULL instead.
  */
 graal_isolate_t* graal_get_isolate(graal_isolatethread_t* thread);
 
@@ -72,11 +94,26 @@ graal_isolate_t* graal_get_isolate(graal_isolatethread_t* thread);
 int graal_detach_thread(graal_isolatethread_t* thread);
 
 /*
- * Tears down the passed isolate, waiting for any attached threads to detach from
- * it, then discards the isolate's objects, threads, and any other state or context
- * that is associated with it.
+ * Tears down the isolate of the passed (and still attached) isolate thread,
+ * waiting for any attached threads to detach from it, then discards its objects,
+ * threads, and any other state or context that is associated with it.
  * Returns 0 on success, or a non-zero value on failure.
+ *
+ * If this call blocks indefinitely, this means there are still Java threads running
+ * which do not terminate after receiving the Thread.interrupt() event.
+ * To prevent indefinite blocking, these threads should be cooperatively shut down
+ * within Java before invoking this call.
+ * To diagnose such issues, use the option '-R:TearDownWarningSeconds=<secs>' to detect
+ * the threads that are still running.
+ * This will print the stack traces of all threads that block tear-down.
  */
 int graal_tear_down_isolate(graal_isolatethread_t* thread);
 ```
-In addition to the C level API, there is also a way to initialize an isolate from Java and thus use Java and Native Image to [implement native methods in Java](ImplementingNativeMethodsInJavaWithSVM.md).
+
+In addition to the C level API, you can use the [JNI Invocation API](JNIInvocationAPI.md) to create an isolate from Java, expose and call Java methods embedded in a native shared library.
+
+### Related Documentation
+
+- [Build a Native Shared Library](guides/build-native-shared-library.md)
+- [Interoperability with Native Code](InteropWithNativeCode.md)
+- [JNI Invocation API](JNIInvocationAPI.md)

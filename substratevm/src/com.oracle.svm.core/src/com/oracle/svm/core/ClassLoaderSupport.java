@@ -24,13 +24,17 @@
  */
 package com.oracle.svm.core;
 
-import java.io.InputStream;
+import java.io.IOException;
+import java.net.URI;
 import java.util.List;
 import java.util.Locale;
+import java.util.Map;
 import java.util.ResourceBundle;
 
+import org.graalvm.collections.EconomicSet;
 import org.graalvm.nativeimage.Platform;
 import org.graalvm.nativeimage.Platforms;
+import org.graalvm.nativeimage.dynamicaccess.AccessCondition;
 
 @Platforms(Platform.HOSTED_ONLY.class)
 public abstract class ClassLoaderSupport {
@@ -48,16 +52,31 @@ public abstract class ClassLoaderSupport {
 
     protected abstract boolean isNativeImageClassLoaderImpl(ClassLoader classLoader);
 
+    public record ConditionWithOrigin(AccessCondition condition, Object origin, boolean preserved) {
+        public ConditionWithOrigin(AccessCondition condition, Object origin) {
+            this(condition, origin, false);
+        }
+    }
+
     public interface ResourceCollector {
+        List<ConditionWithOrigin> isIncluded(Module module, String resourceName, URI resourceURI);
 
-        boolean isIncluded(String moduleName, String resourceName);
+        void addResourceEntry(Module module, String resourceName, Object origin);
 
-        void addResource(String moduleName, String resourceName, InputStream resourceStream);
+        default void addResourceConditionally(Module module, String resourceName, AccessCondition condition, Object origin) {
+            addResourceConditionally(module, resourceName, condition, origin, false);
+        }
 
-        void addDirectoryResource(String moduleName, String dir, String content);
+        void addResourceConditionally(Module module, String resourceName, AccessCondition condition, Object origin, boolean preserved);
+
+        void registerNegativeQuery(Module module, String resourceName);
+
+        void registerIOException(Module module, String resourceName, IOException e, boolean linkAtBuildTime);
     }
 
     public abstract void collectResources(ResourceCollector resourceCollector);
 
     public abstract List<ResourceBundle> getResourceBundle(String bundleName, Locale locale);
+
+    public abstract Map<String, EconomicSet<Module>> getPackageToModules();
 }

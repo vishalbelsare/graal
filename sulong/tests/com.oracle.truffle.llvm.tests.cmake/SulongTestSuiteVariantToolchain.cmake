@@ -1,5 +1,5 @@
 #
-# Copyright (c) 2021, Oracle and/or its affiliates.
+# Copyright (c) 2021, 2026, Oracle and/or its affiliates.
 #
 # All rights reserved.
 #
@@ -32,20 +32,21 @@ include_guard(GLOBAL)
 include(SulongCommon)
 
 macro(setupCompiler)
-    requireVariable(TOOLCHAIN_CLANG)
-    requireVariable(TOOLCHAIN_CLANGXX)
-    setCompilerConfig(CMAKE_C_COMPILER ${TOOLCHAIN_CLANG})
-    setCompilerConfig(CMAKE_CXX_COMPILER ${TOOLCHAIN_CLANGXX})
+    overrideCompilerConfig(CMAKE_C_COMPILER TOOLCHAIN_CLANG)
+    overrideCompilerConfig(CMAKE_CXX_COMPILER TOOLCHAIN_CLANGXX)
     noFortranSupport()
 endmacro()
 
 macro(setupOptions)
     # this must be called after compiler checks
 
+    set(OUTPUT "${SULONG_CURRENT_VARIANT}")
     if(SULONG_BUILD_SHARED_OBJECT)
-        set(OUTPUT "${SULONG_CURRENT_VARIANT}")
+        if (WIN32)
+          set(CMAKE_WINDOWS_EXPORT_ALL_SYMBOLS TRUE)
+        endif()
     else()
-        set(OUTPUT "${SULONG_CURRENT_VARIANT}.bc")
+        set(SUFFIX ".bc")
     endif()
 
     # set optimization levels
@@ -58,8 +59,13 @@ macro(setupOptions)
         # do nothing
     elseif(SULONG_CURRENT_OPT_LEVEL)
         # non-empty but not in the known list
-        message(FATAL_ERROR "Unknonw opt-level: ${SULONG_CURRENT_OPT_LEVEL}")
+        message(FATAL_ERROR "Unknown opt-level: ${SULONG_CURRENT_OPT_LEVEL}")
     endif()
+
+    # verbose output to help debugging problems with the toolchain wrappers
+    string(PREPEND CMAKE_EXE_LINKER_FLAGS "-v ")
+    string(PREPEND CMAKE_C_FLAGS "-v ")
+    string(PREPEND CMAKE_CXX_FLAGS "-v ")
 
     if(SULONG_CURRENT_POST_OPT)
         message(WARNING "post-opt is only meaningful for compile-mode 'bitcode', current mode: ${SULONG_CURRENT_COMPILE_MODE}")

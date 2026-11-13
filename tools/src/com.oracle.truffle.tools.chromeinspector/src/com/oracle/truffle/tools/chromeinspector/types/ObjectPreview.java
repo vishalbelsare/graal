@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2019, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2019, 2026, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -34,8 +34,8 @@ import com.oracle.truffle.api.debug.DebugValue;
 import com.oracle.truffle.api.nodes.LanguageInfo;
 import com.oracle.truffle.tools.chromeinspector.types.TypeInfo.SUBTYPE;
 import com.oracle.truffle.tools.chromeinspector.types.TypeInfo.TYPE;
-import com.oracle.truffle.tools.utils.json.JSONArray;
-import com.oracle.truffle.tools.utils.json.JSONObject;
+import org.graalvm.shadowed.org.json.JSONArray;
+import org.graalvm.shadowed.org.json.JSONObject;
 
 final class ObjectPreview {
 
@@ -68,7 +68,11 @@ final class ObjectPreview {
             json.putOpt("description", valueStr);
         } else {
             DebugValue metaObject = RemoteObject.getMetaObject(debugValue, language, err);
-            String metaType = null;
+            // Keep ObjectPreview.description string-valued even when there is no meta-object.
+            // JSONObject.putOpt() would omit a null value, but VS Code's js-debug currently
+            // assumes array/typed-array previews have a description string and parses it for
+            // the element count.
+            String metaType = "";
             if (metaObject != null) {
                 metaType = RemoteObject.toMetaName(metaObject, err);
                 if (isArray) {

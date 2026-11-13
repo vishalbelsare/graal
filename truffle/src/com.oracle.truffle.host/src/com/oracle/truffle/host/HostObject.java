@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2016, 2021, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2016, 2026, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * The Universal Permissive License (UPL), Version 1.0
@@ -41,15 +41,18 @@
 package com.oracle.truffle.host;
 
 import java.lang.reflect.Array;
+import java.math.BigDecimal;
+import java.math.BigInteger;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.nio.ReadOnlyBufferException;
-import java.sql.Time;
 import java.time.Duration;
 import java.time.Instant;
 import java.time.LocalDate;
 import java.time.LocalDateTime;
 import java.time.LocalTime;
+import java.time.OffsetDateTime;
+import java.time.OffsetTime;
 import java.time.ZoneId;
 import java.time.ZonedDateTime;
 import java.util.Date;
@@ -59,22 +62,29 @@ import java.util.Map;
 import java.util.NoSuchElementException;
 import java.util.Objects;
 
+import com.oracle.truffle.api.interop.HeapIsolationException;
+import org.graalvm.polyglot.impl.AbstractPolyglotImpl;
+import org.graalvm.polyglot.impl.AbstractPolyglotImpl.APIAccess;
 import org.graalvm.polyglot.impl.AbstractPolyglotImpl.AbstractHostAccess;
-import org.graalvm.polyglot.proxy.Proxy;
 
+import com.oracle.truffle.api.CompilerAsserts;
 import com.oracle.truffle.api.CompilerDirectives;
 import com.oracle.truffle.api.CompilerDirectives.CompilationFinal;
 import com.oracle.truffle.api.CompilerDirectives.TruffleBoundary;
-import com.oracle.truffle.api.TruffleLanguage;
 import com.oracle.truffle.api.TruffleStackTrace;
+import com.oracle.truffle.api.dsl.Bind;
 import com.oracle.truffle.api.dsl.Cached;
-import com.oracle.truffle.api.dsl.Cached.Exclusive;
 import com.oracle.truffle.api.dsl.Cached.Shared;
 import com.oracle.truffle.api.dsl.Fallback;
+import com.oracle.truffle.api.dsl.GenerateCached;
+import com.oracle.truffle.api.dsl.GenerateInline;
 import com.oracle.truffle.api.dsl.GenerateUncached;
+import com.oracle.truffle.api.dsl.NeverDefault;
 import com.oracle.truffle.api.dsl.Specialization;
+import com.oracle.truffle.api.exception.AbstractTruffleException;
 import com.oracle.truffle.api.interop.ArityException;
 import com.oracle.truffle.api.interop.ExceptionType;
+import com.oracle.truffle.api.interop.InteropException;
 import com.oracle.truffle.api.interop.InteropLibrary;
 import com.oracle.truffle.api.interop.InvalidArrayIndexException;
 import com.oracle.truffle.api.interop.InvalidBufferOffsetException;
@@ -87,14 +97,16 @@ import com.oracle.truffle.api.interop.UnsupportedTypeException;
 import com.oracle.truffle.api.library.CachedLibrary;
 import com.oracle.truffle.api.library.ExportLibrary;
 import com.oracle.truffle.api.library.ExportMessage;
+import com.oracle.truffle.api.nodes.EncapsulatingNodeReference;
 import com.oracle.truffle.api.nodes.Node;
-import com.oracle.truffle.api.profiles.BranchProfile;
-import com.oracle.truffle.api.profiles.ValueProfile;
+import com.oracle.truffle.api.profiles.InlinedBranchProfile;
+import com.oracle.truffle.api.profiles.InlinedExactClassProfile;
 import com.oracle.truffle.api.utilities.TriState;
 import com.oracle.truffle.host.HostContext.ToGuestValueNode;
+import com.oracle.truffle.host.HostContextFactory.ToGuestValueNodeGen;
 
 @ExportLibrary(InteropLibrary.class)
-@SuppressWarnings("unused")
+@SuppressWarnings({"unused"})
 final class HostObject implements TruffleObject {
 
     static final int LIMIT = 5;
@@ -155,38 +167,10 @@ final class HostObject implements TruffleObject {
             HostObject hostObject = (HostObject) obj;
             return new HostObject(hostObject.obj, context, hostObject.extraInfo);
         } else if (obj instanceof HostException) {
-            return new HostException(((HostException) obj).getOriginal(), context);
+            return ((HostException) obj).withContext(context);
         } else {
             throw CompilerDirectives.shouldNotReachHere("Parameter must be HostObject or HostException.");
         }
-    }
-
-    static boolean isJavaInstance(HostLanguage language, Class<?> targetType, Object javaObject) {
-        Object unboxed = unboxHostObject(language, javaObject);
-        if (unboxed != null) {
-            return targetType.isInstance(unboxed);
-        }
-        return false;
-    }
-
-    static Object unboxHostObject(HostLanguage language, Object value) {
-        Object v = HostLanguage.unwrapIfScoped(language, value);
-        if (v instanceof HostObject) {
-            return ((HostObject) v).obj;
-        } else if (v instanceof HostException) {
-            return ((HostException) v).delegate.obj;
-        }
-        return null;
-    }
-
-    static Object valueOf(HostLanguage language, Object value) {
-        Object v = HostLanguage.unwrapIfScoped(language, value);
-        if (v instanceof HostObject) {
-            return ((HostObject) v).obj;
-        } else if (v instanceof HostException) {
-            return ((HostException) v).delegate.obj;
-        }
-        return v;
     }
 
     @Override
@@ -227,19 +211,40 @@ final class HostObject implements TruffleObject {
                         @Cached("receiver.isStaticClass()") boolean cachedStatic,
                         @Cached("receiver.getLookupClass()") Class<?> cachedClazz,
                         @Cached("name") String cachedName,
-                        @Cached("doUncached(receiver, name)") boolean cachedReadable) {
-            assert cachedReadable == doUncached(receiver, name);
+                        @Cached("hasHostMember(receiver, name)") boolean cachedReadable) {
+            assert cachedReadable == hasHostMember(receiver, name);
             return cachedReadable;
         }
 
         @Specialization(replaces = "doCached")
-        static boolean doUncached(HostObject receiver, String name) {
+        static boolean doUncached(HostObject receiver, String name,
+                        @Bind Node node,
+                        @Shared @Cached LookupThisFieldNode lookupThisField,
+                        @Shared @Cached ReadFieldNode readField,
+                        @Shared @CachedLibrary(limit = "LIMIT") InteropLibrary interop) {
+            if (hasHostMember(receiver, name)) {
+                return true;
+            }
             if (receiver.isNull()) {
                 return false;
             }
-            return HostInteropReflect.isReadable(receiver, receiver.getLookupClass(), name, receiver.isStaticClass(), receiver.isClass());
+            HostFieldDesc thisField = lookupThisField.execute(node, receiver, receiver.getLookupClass());
+            if (thisField != null) {
+                Object delegate = readField.execute(node, thisField, receiver);
+                return interop.isMemberReadable(delegate, name);
+            }
+            return false;
         }
 
+        static boolean hasHostMember(HostObject receiver, String name) {
+            if (receiver.isNull()) {
+                return false;
+            }
+            if (HostInteropReflect.isReadable(receiver, receiver.getLookupClass(), name, receiver.isStaticClass(), receiver.isClass())) {
+                return true;
+            }
+            return HostInteropReflect.ADAPTER_SUPER_MEMBER.equals(name) && !receiver.isStaticClass() && !receiver.isClass() && HostAdapterFactory.isAdapterInstance(receiver.obj);
+        }
     }
 
     @ExportLibrary(InteropLibrary.class)
@@ -269,9 +274,10 @@ final class HostObject implements TruffleObject {
 
         @ExportMessage
         String readArrayElement(long idx,
-                        @Cached BranchProfile error) throws InvalidArrayIndexException {
+                        @Bind Node node,
+                        @Cached InlinedBranchProfile error) throws InvalidArrayIndexException {
             if (!isArrayElementReadable(idx)) {
-                error.enter();
+                error.enter(node);
                 throw InvalidArrayIndexException.create(idx);
             }
             return keys[(int) idx];
@@ -289,22 +295,26 @@ final class HostObject implements TruffleObject {
 
     @ExportMessage
     Object readMember(String name,
-                    @Shared("lookupField") @Cached LookupFieldNode lookupField,
-                    @Shared("readField") @Cached ReadFieldNode readField,
-                    @Shared("lookupMethod") @Cached LookupMethodNode lookupMethod,
-                    @Cached LookupInnerClassNode lookupInnerClass,
-                    @Shared("error") @Cached BranchProfile error) throws UnsupportedMessageException, UnknownIdentifierException {
+                    @Bind Node node,
+                    @Shared @Cached LookupFieldNode lookupField,
+                    @Shared @Cached ReadFieldNode readField,
+                    @Shared @Cached LookupMethodNode lookupMethod,
+                    // force sharing to avoid mixing shared and exclusive caches
+                    @Shared @Cached LookupInnerClassNode lookupInnerClass,
+                    @Shared @Cached LookupThisFieldNode lookupThisField,
+                    @Shared @CachedLibrary(limit = "LIMIT") InteropLibrary interop,
+                    @Shared @Cached InlinedBranchProfile error) throws UnsupportedMessageException, UnknownIdentifierException {
         if (isNull()) {
-            error.enter();
+            error.enter(node);
             throw UnsupportedMessageException.create();
         }
         boolean isStatic = isStaticClass();
         Class<?> lookupClass = getLookupClass();
-        HostFieldDesc foundField = lookupField.execute(this, lookupClass, name, isStatic);
+        HostFieldDesc foundField = lookupField.execute(node, this, lookupClass, name, isStatic);
         if (foundField != null) {
-            return readField.execute(foundField, this);
+            return readField.execute(node, foundField, this);
         }
-        HostMethodDesc foundMethod = lookupMethod.execute(this, lookupClass, name, isStatic);
+        HostMethodDesc foundMethod = lookupMethod.execute(node, this, lookupClass, name, isStatic);
         if (foundMethod != null) {
             return new HostFunction(foundMethod, this.obj, this.context);
         }
@@ -314,7 +324,7 @@ final class HostObject implements TruffleObject {
             if (HostInteropReflect.STATIC_TO_CLASS.equals(name)) {
                 return HostObject.forClass(lookupClass, context);
             }
-            Class<?> innerclass = lookupInnerClassNode.execute(lookupClass, name);
+            Class<?> innerclass = lookupInnerClassNode.execute(node, lookupClass, name);
             if (innerclass != null) {
                 return HostObject.forStaticClass(innerclass, context);
             }
@@ -322,8 +332,16 @@ final class HostObject implements TruffleObject {
             return HostObject.forStaticClass(asClass(), context);
         } else if (HostInteropReflect.ADAPTER_SUPER_MEMBER.equals(name) && HostAdapterFactory.isAdapterInstance(this.obj)) {
             return HostAdapterFactory.getSuperAdapter(this);
+        } else {
+            HostFieldDesc thisField = lookupThisField.execute(node, this, lookupClass);
+            if (thisField != null) {
+                Object delegate = readField.execute(node, thisField, this);
+                if (interop.isMemberReadable(delegate, name)) {
+                    return interop.readMember(delegate, name);
+                }
+            }
         }
-        error.enter();
+        error.enter(node);
         throw UnknownIdentifierException.create(name);
     }
 
@@ -335,19 +353,40 @@ final class HostObject implements TruffleObject {
                         @Cached("receiver.isStaticClass()") boolean cachedStatic,
                         @Cached("receiver.getLookupClass()") Class<?> cachedClazz,
                         @Cached("name") String cachedName,
-                        @Cached("doUncached(receiver, name)") boolean cachedModifiable) {
-            assert cachedModifiable == doUncached(receiver, name);
+                        @Cached("doHostModifiable(receiver, name)") boolean cachedModifiable) {
+            assert cachedModifiable == doHostModifiable(receiver, name);
             return cachedModifiable;
         }
 
         @Specialization(replaces = "doCached")
-        static boolean doUncached(HostObject receiver, String name) {
+        static boolean doUncached(HostObject receiver, String name,
+                        @Bind Node node,
+                        @Shared @Cached LookupThisFieldNode lookupThisField,
+                        @Shared @Cached ReadFieldNode readField,
+                        @Shared @CachedLibrary(limit = "LIMIT") InteropLibrary interop) {
+            if (doHostModifiable(receiver, name)) {
+                return true;
+            }
+            if (receiver.isNull()) {
+                return false;
+            }
+            if (IsMemberReadable.hasHostMember(receiver, name)) {
+                return false;
+            }
+            HostFieldDesc thisField = lookupThisField.execute(node, receiver, receiver.getLookupClass());
+            if (thisField != null) {
+                Object delegate = readField.execute(node, thisField, receiver);
+                return interop.isMemberModifiable(delegate, name);
+            }
+            return false;
+        }
+
+        static boolean doHostModifiable(HostObject receiver, String name) {
             if (receiver.isNull()) {
                 return false;
             }
             return HostInteropReflect.isModifiable(receiver, receiver.getLookupClass(), name, receiver.isStaticClass());
         }
-
     }
 
     @ExportMessage
@@ -372,34 +411,107 @@ final class HostObject implements TruffleObject {
         }
     }
 
-    @SuppressWarnings("static-method")
     @ExportMessage
-    boolean isMemberInsertable(String member) {
+    boolean isMemberInsertable(String member,
+                    @Bind Node node,
+                    @Shared @Cached LookupThisFieldNode lookupThisField,
+                    @Shared @Cached ReadFieldNode readField,
+                    @Shared @CachedLibrary(limit = "LIMIT") InteropLibrary interop) {
+        if (isNull()) {
+            return false;
+        }
+        if (IsMemberReadable.hasHostMember(this, member)) {
+            return false;
+        }
+        HostFieldDesc thisField = lookupThisField.execute(node, this, getLookupClass());
+        if (thisField != null) {
+            Object delegate = readField.execute(node, thisField, this);
+            return interop.isMemberInsertable(delegate, member);
+        }
         return false;
     }
 
     @ExportMessage
     void writeMember(String member, Object value,
-                    @Shared("lookupField") @Cached LookupFieldNode lookupField,
-                    @Cached WriteFieldNode writeField,
-                    @Shared("error") @Cached BranchProfile error)
+                    @Bind Node node,
+                    @Shared @Cached LookupFieldNode lookupField,
+                    @Shared @Cached LookupThisFieldNode lookupThisField,
+                    @Shared @Cached ReadFieldNode readField,
+                    @Shared @Cached WriteFieldNode writeField,
+                    @Shared @CachedLibrary(limit = "LIMIT") InteropLibrary interop,
+                    @Shared @Cached InlinedBranchProfile error)
                     throws UnsupportedMessageException, UnknownIdentifierException, UnsupportedTypeException {
         if (isNull()) {
-            error.enter();
+            error.enter(node);
             throw UnsupportedMessageException.create();
         }
-        HostFieldDesc f = lookupField.execute(this, getLookupClass(), member, isStaticClass());
-        if (f == null) {
-            error.enter();
+        Class<?> lookupClass = getLookupClass();
+        boolean isStatic = isStaticClass();
+        HostFieldDesc f = lookupField.execute(node, this, lookupClass, member, isStatic);
+        if (f != null) {
+            try {
+                writeField.execute(node, f, this, value);
+                return;
+            } catch (ClassCastException | NullPointerException e) {
+                // conversion failed by ToJavaNode
+                error.enter(node);
+                throw UnsupportedTypeException.create(new Object[]{value}, getMessage(e));
+            }
+        }
+        HostFieldDesc thisField = lookupThisField.execute(node, this, lookupClass);
+        if (thisField != null && !IsMemberReadable.hasHostMember(this, member)) {
+            Object delegate = readField.execute(node, thisField, this);
+            interop.writeMember(delegate, member, value);
+            return;
+        }
+        error.enter(node);
+        throw UnknownIdentifierException.create(member);
+    }
+
+    @ExportMessage
+    boolean isMemberRemovable(String member,
+                    @Bind Node node,
+                    @Shared @Cached LookupThisFieldNode lookupThisField,
+                    @Shared @Cached ReadFieldNode readField,
+                    @Shared @CachedLibrary(limit = "LIMIT") InteropLibrary interop) {
+        if (isNull()) {
+            return false;
+        }
+        if (IsMemberReadable.hasHostMember(this, member)) {
+            return false;
+        }
+        HostFieldDesc thisField = lookupThisField.execute(node, this, getLookupClass());
+        if (thisField != null) {
+            Object delegate = readField.execute(node, thisField, this);
+            return interop.isMemberRemovable(delegate, member);
+        }
+        return false;
+    }
+
+    @ExportMessage
+    void removeMember(String member,
+                    @Bind Node node,
+                    @Shared @Cached LookupThisFieldNode lookupThisField,
+                    @Shared @Cached ReadFieldNode readField,
+                    @Shared @CachedLibrary(limit = "LIMIT") InteropLibrary interop,
+                    @Shared @Cached InlinedBranchProfile error) throws UnsupportedMessageException, UnknownIdentifierException {
+        if (isNull()) {
+            error.enter(node);
+            throw UnsupportedMessageException.create();
+        }
+        Class<?> lookupClass = getLookupClass();
+        HostFieldDesc thisField = lookupThisField.execute(node, this, lookupClass);
+        if (thisField != null) {
+            if (!IsMemberReadable.hasHostMember(this, member)) {
+                Object delegate = readField.execute(node, thisField, this);
+                interop.removeMember(delegate, member);
+                return;
+            }
+            error.enter(node);
             throw UnknownIdentifierException.create(member);
         }
-        try {
-            writeField.execute(f, this, value);
-        } catch (ClassCastException | NullPointerException e) {
-            // conversion failed by ToJavaNode
-            error.enter();
-            throw UnsupportedTypeException.create(new Object[]{value}, getMessage(e));
-        }
+        error.enter(node);
+        throw UnsupportedMessageException.create();
     }
 
     @TruffleBoundary
@@ -431,14 +543,15 @@ final class HostObject implements TruffleObject {
 
     @ExportMessage
     Object invokeMember(String name, Object[] args,
-                    @Shared("lookupMethod") @Cached LookupMethodNode lookupMethod,
-                    @Shared("hostExecute") @Cached HostExecuteNode executeMethod,
-                    @Shared("lookupField") @Cached LookupFieldNode lookupField,
-                    @Shared("readField") @Cached ReadFieldNode readField,
+                    @Bind Node node,
+                    @Shared @Cached LookupMethodNode lookupMethod,
+                    @Shared @Cached HostExecuteNode hostExecute,
+                    @Shared @Cached LookupFieldNode lookupField,
+                    @Shared @Cached ReadFieldNode readField,
                     @CachedLibrary(limit = "5") InteropLibrary fieldValues,
-                    @Shared("error") @Cached BranchProfile error) throws UnsupportedTypeException, ArityException, UnsupportedMessageException, UnknownIdentifierException {
+                    @Shared @Cached InlinedBranchProfile error) throws UnsupportedTypeException, ArityException, UnsupportedMessageException, UnknownIdentifierException {
         if (isNull()) {
-            error.enter();
+            error.enter(node);
             throw UnsupportedMessageException.create();
         }
 
@@ -446,57 +559,62 @@ final class HostObject implements TruffleObject {
         Class<?> lookupClass = getLookupClass();
 
         // (1) look for a method; if found, invoke it on obj.
-        HostMethodDesc foundMethod = lookupMethod.execute(this, lookupClass, name, isStatic);
+        HostMethodDesc foundMethod = lookupMethod.execute(node, this, lookupClass, name, isStatic);
         if (foundMethod != null) {
-            return executeMethod.execute(foundMethod, obj, args, context);
+            return hostExecute.execute(node, foundMethod, obj, args, context);
         }
 
         // (2) look for a field; if found, read its value and if that IsExecutable, Execute it.
-        HostFieldDesc foundField = lookupField.execute(this, lookupClass, name, isStatic);
+        HostFieldDesc foundField = lookupField.execute(node, this, lookupClass, name, isStatic);
         if (foundField != null) {
-            Object fieldValue = readField.execute(foundField, this);
+            Object fieldValue = readField.execute(node, foundField, this);
             if (fieldValues.isExecutable(fieldValue)) {
                 return fieldValues.execute(fieldValue, args);
             }
         }
-        error.enter();
+        error.enter(node);
         throw UnknownIdentifierException.create(name);
     }
 
     @ExportMessage
     static class IsArrayElementReadable {
 
-        @Specialization(guards = "isArray.execute(receiver)", limit = "1")
+        @Specialization(guards = "receiver.isNull()")
+        static boolean doNull(HostObject receiver, long index) {
+            return false;
+        }
+
+        @Specialization(guards = {"!receiver.isNull()", "receiver.isArray(hostClassCache)"})
         static boolean doArray(HostObject receiver, long index,
-                        @Shared("isArray") @Cached IsArrayNode isArray) {
+                        @Shared @Cached(value = "receiver.getHostClassCache()", allowUncached = true) HostClassCache hostClassCache) {
             long size = Array.getLength(receiver.obj);
             return index >= 0 && index < size;
         }
 
-        @Specialization(guards = "isList.execute(receiver)", limit = "1")
+        @Specialization(guards = {"!receiver.isNull()", "receiver.isList(hostClassCache)"})
         static boolean doList(HostObject receiver, long index,
-                        @Shared("isList") @Cached IsListNode isList,
-                        @Shared("error") @Cached BranchProfile error) {
+                        @Bind Node node,
+                        @Shared @Cached(value = "receiver.getHostClassCache()", allowUncached = true) HostClassCache hostClassCache,
+                        @Shared @Cached InlinedBranchProfile error) {
             try {
                 long size = GuestToHostCalls.getListSize(receiver);
                 return index >= 0 && index < size;
             } catch (Throwable t) {
-                error.enter();
+                error.enter(node);
                 throw receiver.context.hostToGuestException(t);
             }
         }
 
-        @Specialization(guards = "isMapEntry.execute(receiver)", limit = "1")
+        @Specialization(guards = {"!receiver.isNull()", "receiver.isMapEntry(hostClassCache)"})
         static boolean doMapEntry(HostObject receiver, long index,
-                        @Shared("isMapEntry") @Cached IsMapEntryNode isMapEntry) {
+                        @Shared @Cached(value = "receiver.getHostClassCache()", allowUncached = true) HostClassCache hostClassCache) {
             return index >= 0 && index < 2;
         }
 
-        @Specialization(guards = {"!isList.execute(receiver)", "!isArray.execute(receiver)", "!isMapEntry.execute(receiver)"}, limit = "1")
+        @Specialization(guards = {"!receiver.isNull()", "!receiver.isList(hostClassCache)", "!receiver.isArray(hostClassCache)",
+                        "!receiver.isMapEntry(hostClassCache)"})
         static boolean doNotArrayOrList(HostObject receiver, long index,
-                        @Shared("isList") @Cached IsListNode isList,
-                        @Shared("isArray") @Cached IsArrayNode isArray,
-                        @Shared("isMapEntry") @Cached IsMapEntryNode isMapEntry) {
+                        @Shared @Cached(value = "receiver.getHostClassCache()", allowUncached = true) HostClassCache hostClassCache) {
             return false;
         }
     }
@@ -504,72 +622,94 @@ final class HostObject implements TruffleObject {
     @ExportMessage
     static class IsArrayElementModifiable {
 
-        @Specialization(guards = "isArray.execute(receiver)", limit = "1")
+        @Specialization(guards = "receiver.isNull()")
+        static boolean doNull(HostObject receiver, long index) {
+            return false;
+        }
+
+        @Specialization(guards = {"!receiver.isNull()", "receiver.isArray(hostClassCache)"})
         static boolean doArray(HostObject receiver, long index,
-                        @Shared("isArray") @Cached IsArrayNode isArray) {
+                        @Shared @Cached(value = "receiver.getHostClassCache()", allowUncached = true) HostClassCache hostClassCache) {
             long size = Array.getLength(receiver.obj);
             return index >= 0 && index < size;
         }
 
-        @Specialization(guards = "isList.execute(receiver)", limit = "1")
+        @Specialization(guards = {"!receiver.isNull()", "receiver.isList(hostClassCache)"})
         static boolean doList(HostObject receiver, long index,
-                        @Shared("isList") @Cached IsListNode isList,
-                        @Shared("error") @Cached BranchProfile error) {
+                        @Bind Node node,
+                        @Shared @Cached(value = "receiver.getHostClassCache()", allowUncached = true) HostClassCache hostClassCache,
+                        @Shared @Cached InlinedBranchProfile error) {
             try {
                 long size = GuestToHostCalls.getListSize(receiver);
                 return index >= 0 && index < size;
             } catch (Throwable t) {
-                error.enter();
+                error.enter(node);
                 throw receiver.context.hostToGuestException(t);
             }
         }
 
-        @Specialization(guards = "isMapEntry.execute(receiver)", limit = "1")
+        @Specialization(guards = {"!receiver.isNull()", "receiver.isMapEntry(hostClassCache)"})
         static boolean doMapEntry(HostObject receiver, long index,
-                        @Shared("isMapEntry") @Cached IsMapEntryNode isMapEntry) {
+                        @Shared @Cached(value = "receiver.getHostClassCache()", allowUncached = true) HostClassCache hostClassCache) {
             return index == 1;
         }
 
-        @Specialization(guards = {"!isList.execute(receiver)", "!isArray.execute(receiver)", "!isMapEntry.execute(receiver)"}, limit = "1")
+        @Specialization(guards = {"!receiver.isNull()", "!receiver.isList(hostClassCache)", "!receiver.isArray(hostClassCache)",
+                        "!receiver.isMapEntry(hostClassCache)"})
         static boolean doNotArrayOrList(HostObject receiver, long index,
-                        @Shared("isList") @Cached IsListNode isList,
-                        @Shared("isArray") @Cached IsArrayNode isArray,
-                        @Shared("isMapEntry") @Cached IsMapEntryNode isMapEntry) {
+                        @Shared @Cached(value = "receiver.getHostClassCache()", allowUncached = true) HostClassCache hostClassCache) {
             return false;
         }
     }
 
     @ExportMessage
-    boolean isArrayElementInsertable(long index, @Shared("isList") @Cached IsListNode isList,
-                    @Shared("error") @Cached BranchProfile error) {
-        try {
-            return isList.execute(this) && GuestToHostCalls.getListSize(this) == index;
-        } catch (Throwable t) {
-            error.enter();
-            throw context.hostToGuestException(t);
+    static class IsArrayElementInsertable {
+
+        @Specialization(guards = "receiver.isNull()")
+        static boolean doNull(HostObject receiver, long index) {
+            return false;
+        }
+
+        @Specialization(guards = "!receiver.isNull()")
+        static boolean doNonNull(HostObject receiver,
+                        long index,
+                        @Bind Node node,
+                        @Shared @Cached(value = "receiver.getHostClassCache()", allowUncached = true) HostClassCache hostClassCache,
+                        @Shared @Cached InlinedBranchProfile error) {
+            try {
+                return receiver.isList(hostClassCache) && GuestToHostCalls.getListSize(receiver) == index;
+            } catch (Throwable t) {
+                error.enter(node);
+                throw receiver.context.hostToGuestException(t);
+            }
         }
     }
 
     @ExportMessage
     static class WriteArrayElement {
 
-        @Specialization(guards = {"isArray.execute(receiver)"}, limit = "1")
-        @SuppressWarnings("unchecked")
+        @Specialization(guards = "receiver.isNull()")
+        static void doNull(HostObject receiver, long index, Object value) throws UnsupportedMessageException {
+            throw UnsupportedMessageException.create();
+        }
+
+        @Specialization(guards = {"!receiver.isNull()", "receiver.isArray(hostClassCache)"})
         static void doArray(HostObject receiver, long index, Object value,
-                        @Shared("toHost") @Cached HostToTypeNode toHostNode,
-                        @Shared("isArray") @Cached IsArrayNode isArray,
-                        @Cached ArraySet arraySet,
-                        @Shared("error") @Cached BranchProfile error) throws InvalidArrayIndexException, UnsupportedTypeException {
+                        @Bind Node node,
+                        @Shared @Cached(inline = true) HostToTypeNode toHost,
+                        @Shared @Cached(value = "receiver.getHostClassCache()", allowUncached = true) HostClassCache hostClassCache,
+                        @Shared @Cached ArraySet arraySet,
+                        @Shared @Cached InlinedBranchProfile error) throws InvalidArrayIndexException, UnsupportedTypeException {
             if (index < 0 || Integer.MAX_VALUE < index) {
-                error.enter();
+                error.enter(node);
                 throw InvalidArrayIndexException.create(index);
             }
             Object obj = receiver.obj;
             Object javaValue;
             try {
-                javaValue = toHostNode.execute(receiver.context, value, obj.getClass().getComponentType(), null, true);
+                javaValue = toHost.execute(node, receiver.context, value, obj.getClass().getComponentType(), null, true);
             } catch (RuntimeException e) {
-                error.enter();
+                error.enter(node);
                 RuntimeException ee = unboxEngineException(receiver, e);
                 if (ee != null) {
                     throw UnsupportedTypeException.create(new Object[]{value}, getMessage(ee));
@@ -577,28 +717,28 @@ final class HostObject implements TruffleObject {
                 throw e;
             }
             try {
-                arraySet.execute(obj, (int) index, javaValue);
+                arraySet.execute(node, obj, (int) index, javaValue);
             } catch (ArrayIndexOutOfBoundsException e) {
-                error.enter();
+                error.enter(node);
                 throw InvalidArrayIndexException.create(index);
             }
         }
 
-        @Specialization(guards = {"isList.execute(receiver)"}, limit = "1")
-        @SuppressWarnings("unchecked")
+        @Specialization(guards = {"!receiver.isNull()", "receiver.isList(hostClassCache)"})
         static void doList(HostObject receiver, long index, Object value,
-                        @Shared("isList") @Cached IsListNode isList,
-                        @Shared("toHost") @Cached HostToTypeNode toHostNode,
-                        @Shared("error") @Cached BranchProfile error) throws InvalidArrayIndexException, UnsupportedTypeException {
+                        @Bind Node node,
+                        @Shared @Cached(value = "receiver.getHostClassCache()", allowUncached = true) HostClassCache hostClassCache,
+                        @Shared @Cached(inline = true) HostToTypeNode toHost,
+                        @Shared @Cached InlinedBranchProfile error) throws InvalidArrayIndexException, UnsupportedTypeException {
             if (index < 0 || Integer.MAX_VALUE < index) {
-                error.enter();
+                error.enter(node);
                 throw InvalidArrayIndexException.create(index);
             }
             Object javaValue;
             try {
-                javaValue = toHostNode.execute(receiver.context, value, Object.class, null, true);
+                javaValue = toHost.execute(node, receiver.context, value, Object.class, null, true);
             } catch (RuntimeException e) {
-                error.enter();
+                error.enter(node);
                 RuntimeException ee = unboxEngineException(receiver, e);
                 if (ee != null) {
                     throw UnsupportedTypeException.create(new Object[]{value}, getMessage(ee));
@@ -608,26 +748,26 @@ final class HostObject implements TruffleObject {
             try {
                 GuestToHostCalls.setListElement(receiver, index, javaValue);
             } catch (IndexOutOfBoundsException e) {
-                error.enter();
+                error.enter(node);
                 throw InvalidArrayIndexException.create(index);
             } catch (Throwable t) {
-                error.enter();
+                error.enter(node);
                 throw receiver.context.hostToGuestException(t);
             }
         }
 
-        @Specialization(guards = {"isMapEntry.execute(receiver)"}, limit = "1")
-        @SuppressWarnings("unchecked")
+        @Specialization(guards = {"!receiver.isNull()", "receiver.isMapEntry(hostClassCache)"})
         static void doMapEntry(HostObject receiver, long index, Object value,
-                        @Shared("isMapEntry") @Cached IsMapEntryNode isMapEntry,
-                        @Shared("toHost") @Cached HostToTypeNode toHostNode,
-                        @Shared("error") @Cached BranchProfile error) throws InvalidArrayIndexException, UnsupportedTypeException {
+                        @Bind Node node,
+                        @Shared @Cached(value = "receiver.getHostClassCache()", allowUncached = true) HostClassCache hostClassCache,
+                        @Shared @Cached(inline = true) HostToTypeNode toHost,
+                        @Shared @Cached InlinedBranchProfile error) throws InvalidArrayIndexException, UnsupportedTypeException {
             if (index == 1) {
                 Object hostValue;
                 try {
-                    hostValue = toHostNode.execute(receiver.context, value, Object.class, null, true);
+                    hostValue = toHost.execute(node, receiver.context, value, Object.class, null, true);
                 } catch (RuntimeException e) {
-                    error.enter();
+                    error.enter(node);
                     RuntimeException ee = unboxEngineException(receiver, e);
                     if (ee != null) {
                         throw UnsupportedTypeException.create(new Object[]{value}, getMessage(ee));
@@ -637,7 +777,7 @@ final class HostObject implements TruffleObject {
                 try {
                     GuestToHostCalls.setMapEntryValue(receiver, hostValue);
                 } catch (Throwable t) {
-                    error.enter();
+                    error.enter(node);
                     throw receiver.context.hostToGuestException(t);
                 }
             } else {
@@ -646,11 +786,10 @@ final class HostObject implements TruffleObject {
         }
 
         @SuppressWarnings("unused")
-        @Specialization(guards = {"!isList.execute(receiver)", "!isArray.execute(receiver)", "!isMapEntry.execute(receiver)"}, limit = "1")
+        @Specialization(guards = {"!receiver.isNull()", "!receiver.isList(hostClassCache)", "!receiver.isArray(hostClassCache)",
+                        "!receiver.isMapEntry(hostClassCache)"})
         static void doNotArrayOrList(HostObject receiver, long index, Object value,
-                        @Shared("isList") @Cached IsListNode isList,
-                        @Shared("isArray") @Cached IsArrayNode isArray,
-                        @Shared("isMapEntry") @Cached IsMapEntryNode isMapEntry) throws UnsupportedMessageException {
+                        @Shared @Cached(value = "receiver.getHostClassCache()", allowUncached = true) HostClassCache hostClassCache) throws UnsupportedMessageException {
             throw UnsupportedMessageException.create();
         }
 
@@ -659,21 +798,27 @@ final class HostObject implements TruffleObject {
     @ExportMessage
     static class IsArrayElementRemovable {
 
-        @Specialization(guards = "isList.execute(receiver)", limit = "1")
+        @Specialization(guards = "receiver.isNull()")
+        static boolean doNull(HostObject receiver, long index) {
+            return false;
+        }
+
+        @Specialization(guards = {"!receiver.isNull()", "receiver.isList(hostClassCache)"})
         static boolean doList(HostObject receiver, long index,
-                        @Shared("isList") @Cached IsListNode isList,
-                        @Shared("error") @Cached BranchProfile error) {
+                        @Bind Node node,
+                        @Shared @Cached(value = "receiver.getHostClassCache()", allowUncached = true) HostClassCache hostClassCache,
+                        @Shared @Cached InlinedBranchProfile error) {
             try {
                 return index >= 0 && index < GuestToHostCalls.getListSize(receiver);
             } catch (Throwable t) {
-                error.enter();
+                error.enter(node);
                 throw receiver.context.hostToGuestException(t);
             }
         }
 
-        @Specialization(guards = "!isList.execute(receiver)", limit = "1")
+        @Specialization(guards = {"!receiver.isNull()", "!receiver.isList(hostClassCache)"})
         static boolean doOther(HostObject receiver, long index,
-                        @Shared("isList") @Cached IsListNode isList) {
+                        @Shared @Cached(value = "receiver.getHostClassCache()", allowUncached = true) HostClassCache hostClassCache) {
             return false;
         }
 
@@ -681,119 +826,141 @@ final class HostObject implements TruffleObject {
 
     @ExportMessage
     static class RemoveArrayElement {
-        @Specialization(guards = "isList.execute(receiver)", limit = "1")
+
+        @Specialization(guards = "receiver.isNull()")
+        static void doNull(HostObject receiver, long index) throws UnsupportedMessageException {
+            throw UnsupportedMessageException.create();
+        }
+
+        @Specialization(guards = {"!receiver.isNull()", "receiver.isList(hostClassCache)"})
         static void doList(HostObject receiver, long index,
-                        @Shared("isList") @Cached IsListNode isList,
-                        @Shared("error") @Cached BranchProfile error) throws InvalidArrayIndexException {
+                        @Bind Node node,
+                        @Shared @Cached(value = "receiver.getHostClassCache()", allowUncached = true) HostClassCache hostClassCache,
+                        @Shared @Cached InlinedBranchProfile error) throws InvalidArrayIndexException {
             if (index < 0 || Integer.MAX_VALUE < index) {
-                error.enter();
+                error.enter(node);
                 throw InvalidArrayIndexException.create(index);
             }
             try {
                 GuestToHostCalls.removeListElement(receiver, index);
             } catch (IndexOutOfBoundsException outOfBounds) {
-                error.enter();
+                error.enter(node);
                 throw InvalidArrayIndexException.create(index);
             } catch (Throwable t) {
-                error.enter();
+                error.enter(node);
                 throw receiver.context.hostToGuestException(t);
             }
         }
 
-        @Specialization(guards = "!isList.execute(receiver)", limit = "1")
+        @Specialization(guards = {"!receiver.isNull()", "!receiver.isList(hostClassCache)"})
         static void doOther(HostObject receiver, long index,
-                        @Shared("isList") @Cached IsListNode isList) throws UnsupportedMessageException {
+                        @Shared @Cached(value = "receiver.getHostClassCache()", allowUncached = true) HostClassCache hostClassCache) throws UnsupportedMessageException {
             throw UnsupportedMessageException.create();
         }
     }
 
     @ExportMessage
-    boolean hasArrayElements(@Shared("isList") @Cached IsListNode isList,
-                    @Shared("isArray") @Cached IsArrayNode isArray,
-                    @Shared("isMapEntry") @Cached IsMapEntryNode isMapEntry) {
-        return isList.execute(this) || isArray.execute(this) || isMapEntry.execute(this);
+    static class HasArrayElements {
+
+        @Specialization(guards = "receiver.isNull()")
+        static boolean doNull(HostObject receiver) {
+            return false;
+        }
+
+        @Specialization(guards = "!receiver.isNull()")
+        static boolean doNotNull(HostObject receiver,
+                        @Shared @Cached(value = "receiver.getHostClassCache()", allowUncached = true) HostClassCache hostClassCache) {
+            return receiver.isList(hostClassCache) || receiver.isArray(hostClassCache) || receiver.isMapEntry(hostClassCache);
+        }
     }
 
     @ExportMessage
     abstract static class ReadArrayElement {
 
-        @Specialization(guards = {"isArray.execute(receiver)"}, limit = "1")
+        @Specialization(guards = "receiver.isNull()")
+        protected static Object doNull(HostObject receiver, long index) throws UnsupportedMessageException {
+            throw UnsupportedMessageException.create();
+        }
+
+        @Specialization(guards = {"!receiver.isNull()", "receiver.isArray(hostClassCache)"})
         protected static Object doArray(HostObject receiver, long index,
-                        @Cached ArrayGet arrayGet,
-                        @Shared("isArray") @Cached IsArrayNode isArray,
-                        @Shared("toGuest") @Cached ToGuestValueNode toGuest,
-                        @Shared("error") @Cached BranchProfile error) throws InvalidArrayIndexException {
+                        @Bind Node node,
+                        @Shared @Cached ArrayGet arrayGet,
+                        @Shared @Cached(value = "receiver.getHostClassCache()", allowUncached = true) HostClassCache hostClassCache,
+                        @Shared @Cached(inline = true) ToGuestValueNode toGuest,
+                        @Shared @Cached InlinedBranchProfile error) throws InvalidArrayIndexException {
             if (index < 0 || Integer.MAX_VALUE < index) {
-                error.enter();
+                error.enter(node);
                 throw InvalidArrayIndexException.create(index);
             }
             Object obj = receiver.obj;
             Object val = null;
             try {
-                val = arrayGet.execute(obj, (int) index);
+                val = arrayGet.execute(node, obj, (int) index);
             } catch (ArrayIndexOutOfBoundsException outOfBounds) {
-                error.enter();
+                error.enter(node);
                 throw InvalidArrayIndexException.create(index);
             }
-            return toGuest.execute(receiver.context, val);
+            return toGuest.execute(node, val);
         }
 
         @TruffleBoundary
-        @Specialization(guards = {"isList.execute(receiver)"}, limit = "1")
+        @Specialization(guards = {"!receiver.isNull()", "receiver.isList(hostClassCache)"})
         protected static Object doList(HostObject receiver, long index,
-                        @Shared("isList") @Cached IsListNode isList,
-                        @Shared("toGuest") @Cached ToGuestValueNode toGuest,
-                        @Shared("error") @Cached BranchProfile error) throws InvalidArrayIndexException {
+                        @Bind Node node,
+                        @Shared @Cached(value = "receiver.getHostClassCache()", allowUncached = true) HostClassCache hostClassCache,
+                        @Shared @Cached(inline = true) ToGuestValueNode toGuest,
+                        @Shared @Cached InlinedBranchProfile error) throws InvalidArrayIndexException {
             if (index < 0 || Integer.MAX_VALUE < index) {
-                error.enter();
+                error.enter(node);
                 throw InvalidArrayIndexException.create(index);
             }
             Object hostValue;
             try {
                 hostValue = GuestToHostCalls.readListElement(receiver, index);
             } catch (IndexOutOfBoundsException e) {
-                error.enter();
+                error.enter(node);
                 throw InvalidArrayIndexException.create(index);
             } catch (Throwable t) {
-                error.enter();
+                error.enter(node);
                 throw receiver.context.hostToGuestException(t);
             }
-            return toGuest.execute(receiver.context, hostValue);
+            return toGuest.execute(node, hostValue);
         }
 
-        @Specialization(guards = "isMapEntry.execute(receiver)", limit = "1")
+        @Specialization(guards = {"!receiver.isNull()", "receiver.isMapEntry(hostClassCache)"})
         protected static Object doMapEntry(HostObject receiver, long index,
-                        @Shared("isMapEntry") @Cached IsMapEntryNode isMapEntry,
-                        @Shared("toGuest") @Cached ToGuestValueNode toGuest,
-                        @Shared("error") @Cached BranchProfile error) throws InvalidArrayIndexException {
+                        @Bind Node node,
+                        @Shared @Cached(value = "receiver.getHostClassCache()", allowUncached = true) HostClassCache hostClassCache,
+                        @Shared @Cached(inline = true) ToGuestValueNode toGuest,
+                        @Shared @Cached InlinedBranchProfile error) throws InvalidArrayIndexException {
             Object hostResult;
             if (index == 0L) {
                 try {
                     hostResult = GuestToHostCalls.getMapEntryKey(receiver);
                 } catch (Throwable t) {
-                    error.enter();
+                    error.enter(node);
                     throw receiver.context.hostToGuestException(t);
                 }
             } else if (index == 1L) {
                 try {
                     hostResult = GuestToHostCalls.getMapEntryValue(receiver);
                 } catch (Throwable t) {
-                    error.enter();
+                    error.enter(node);
                     throw receiver.context.hostToGuestException(t);
                 }
             } else {
-                error.enter();
+                error.enter(node);
                 throw InvalidArrayIndexException.create(index);
             }
-            return toGuest.execute(receiver.context, hostResult);
+            return toGuest.execute(node, hostResult);
         }
 
         @SuppressWarnings("unused")
-        @Specialization(guards = {"!isArray.execute(receiver)", "!isList.execute(receiver)", "!isMapEntry.execute(receiver)"}, limit = "1")
+        @Specialization(guards = {"!receiver.isNull()", "!receiver.isArray(hostClassCache)", "!receiver.isList(hostClassCache)",
+                        "!receiver.isMapEntry(hostClassCache)"})
         protected static Object doNotArrayOrList(HostObject receiver, long index,
-                        @Shared("isArray") @Cached IsArrayNode isArray,
-                        @Shared("isList") @Cached IsListNode isList,
-                        @Shared("isMapEntry") @Cached IsMapEntryNode isMapEntry) throws UnsupportedMessageException {
+                        @Shared @Cached(value = "receiver.getHostClassCache()", allowUncached = true) HostClassCache hostClassCache) throws UnsupportedMessageException {
             throw UnsupportedMessageException.create();
         }
 
@@ -802,35 +969,40 @@ final class HostObject implements TruffleObject {
     @ExportMessage
     abstract static class GetArraySize {
 
-        @Specialization(guards = {"isArray.execute(receiver)"}, limit = "1")
+        @Specialization(guards = "receiver.isNull()")
+        protected static long doNull(HostObject receiver) throws UnsupportedMessageException {
+            throw UnsupportedMessageException.create();
+        }
+
+        @Specialization(guards = {"!receiver.isNull()", "receiver.isArray(hostClassCache)"})
         protected static long doArray(HostObject receiver,
-                        @Shared("isArray") @Cached IsArrayNode isArray) {
+                        @Shared @Cached(value = "receiver.getHostClassCache()", allowUncached = true) HostClassCache hostClassCache) {
             return Array.getLength(receiver.obj);
         }
 
-        @Specialization(guards = {"isList.execute(receiver)"}, limit = "1")
+        @Specialization(guards = {"!receiver.isNull()", "receiver.isList(hostClassCache)"})
         protected static long doList(HostObject receiver,
-                        @Shared("isList") @Cached IsListNode isList,
-                        @Shared("error") @Cached BranchProfile error) {
+                        @Bind Node node,
+                        @Shared @Cached(value = "receiver.getHostClassCache()", allowUncached = true) HostClassCache hostClassCache,
+                        @Shared @Cached InlinedBranchProfile error) {
             try {
                 return GuestToHostCalls.getListSize(receiver);
             } catch (Throwable t) {
-                error.enter();
+                error.enter(node);
                 throw receiver.context.hostToGuestException(t);
             }
         }
 
-        @Specialization(guards = "isMapEntry.execute(receiver)", limit = "1")
+        @Specialization(guards = {"!receiver.isNull()", "receiver.isMapEntry(hostClassCache)"})
         protected static long doMapEntry(HostObject receiver,
-                        @Shared("isMapEntry") @Cached IsMapEntryNode isMapEntry) {
+                        @Shared @Cached(value = "receiver.getHostClassCache()", allowUncached = true) HostClassCache hostClassCache) {
             return 2;
         }
 
-        @Specialization(guards = {"!isArray.execute(receiver)", "!isList.execute(receiver)", "!isMapEntry.execute(receiver)"}, limit = "1")
+        @Specialization(guards = {"!receiver.isNull()", "!receiver.isArray(hostClassCache)", "!receiver.isList(hostClassCache)",
+                        "!receiver.isMapEntry(hostClassCache)"})
         protected static long doNotArrayOrList(HostObject receiver,
-                        @Shared("isArray") @Cached IsArrayNode isArray,
-                        @Shared("isList") @Cached IsListNode isList,
-                        @Shared("isMapEntry") @Cached IsMapEntryNode isMapEntry) throws UnsupportedMessageException {
+                        @Shared @Cached(value = "receiver.getHostClassCache()", allowUncached = true) HostClassCache hostClassCache) throws UnsupportedMessageException {
             throw UnsupportedMessageException.create();
         }
 
@@ -838,19 +1010,56 @@ final class HostObject implements TruffleObject {
 
     // region Buffer Messages
 
-    @ExportMessage
-    boolean hasBufferElements(@Shared("isBuffer") @Cached IsBufferNode isBuffer) {
-        return isBuffer.execute(this);
+    boolean isByteSequence() {
+        return context.language.api.isByteSequence(obj);
     }
 
     @ExportMessage
-    boolean isBufferWritable(@Shared("isBuffer") @Cached IsBufferNode isBuffer, @Shared("error") @Cached BranchProfile error) throws UnsupportedMessageException {
-        if (isBuffer.execute(this)) {
-            final ByteBuffer buffer = (ByteBuffer) obj;
-            return isPEFriendlyBuffer(buffer) ? !buffer.isReadOnly() : isBufferWritableBoundary(buffer);
+    static class HasBufferElements {
+
+        @Specialization(guards = "receiver.isNull()")
+        static boolean doNull(HostObject receiver) {
+            return false;
         }
-        error.enter();
-        throw UnsupportedMessageException.create();
+
+        @Specialization(guards = {"receiver.isByteSequence()"})
+        static boolean doByteSequence(HostObject receiver,
+                        @Shared @Cached(value = "receiver.getHostClassCache()", allowUncached = true) HostClassCache hostClassCache) {
+            return hostClassCache.isBufferAccess();
+        }
+
+        @Specialization(guards = {"!receiver.isNull()", "!receiver.isByteSequence()"})
+        static boolean doOther(HostObject receiver,
+                        @Shared @Cached(value = "receiver.getHostClassCache()", allowUncached = true) HostClassCache hostClassCache) {
+            return receiver.isBuffer(hostClassCache);
+        }
+    }
+
+    @ExportMessage
+    static class IsBufferWritable {
+
+        @Specialization(guards = "receiver.isNull()")
+        static boolean doNull(HostObject receiver) throws UnsupportedMessageException {
+            throw UnsupportedMessageException.create();
+        }
+
+        @Specialization(guards = {"receiver.isByteSequence()"})
+        static boolean doByteSequence(HostObject receiver) {
+            return false;
+        }
+
+        @Specialization(guards = {"!receiver.isNull()", "!receiver.isByteSequence()"})
+        static boolean doOther(HostObject receiver,
+                        @Bind Node node,
+                        @Shared @Cached(value = "receiver.getHostClassCache()", allowUncached = true) HostClassCache hostClassCache,
+                        @Shared @Cached InlinedBranchProfile error) throws UnsupportedMessageException {
+            if (receiver.isBuffer(hostClassCache)) {
+                final ByteBuffer buffer = (ByteBuffer) receiver.obj;
+                return isPEFriendlyBuffer(buffer) ? !buffer.isReadOnly() : isBufferWritableBoundary(buffer);
+            }
+            error.enter(node);
+            throw UnsupportedMessageException.create();
+        }
     }
 
     @TruffleBoundary
@@ -859,13 +1068,42 @@ final class HostObject implements TruffleObject {
     }
 
     @ExportMessage
-    long getBufferSize(@Shared("isBuffer") @Cached IsBufferNode isBuffer, @Shared("error") @Cached BranchProfile error) throws UnsupportedMessageException {
-        if (isBuffer.execute(this)) {
-            final ByteBuffer buffer = (ByteBuffer) obj;
-            return isPEFriendlyBuffer(buffer) ? buffer.limit() : getBufferSizeBoundary(buffer);
+    static class GetBufferSize {
+
+        @Specialization(guards = "receiver.isNull()")
+        static long doNull(HostObject receiver) throws UnsupportedMessageException {
+            throw UnsupportedMessageException.create();
         }
-        error.enter();
-        throw UnsupportedMessageException.create();
+
+        @Specialization(guards = {"receiver.isByteSequence()"})
+        static long doByteSequence(HostObject receiver,
+                        @Bind Node node,
+                        @Shared @Cached(value = "receiver.getHostClassCache()", allowUncached = true) HostClassCache hostClassCache,
+                        @Shared @Cached InlinedBranchProfile error) throws UnsupportedMessageException {
+            if (hostClassCache.isBufferAccess()) {
+                return getByteSequenceLengthBoundary(receiver.context.language.api, receiver.obj);
+            }
+            error.enter(node);
+            throw UnsupportedMessageException.create();
+        }
+
+        @Specialization(guards = {"!receiver.isNull()", "!receiver.isByteSequence()"})
+        static long doOther(HostObject receiver,
+                        @Bind Node node,
+                        @Shared @Cached(value = "receiver.getHostClassCache()", allowUncached = true) HostClassCache hostClassCache,
+                        @Shared @Cached InlinedBranchProfile error) throws UnsupportedMessageException {
+            if (receiver.isBuffer(hostClassCache)) {
+                final ByteBuffer buffer = (ByteBuffer) receiver.obj;
+                return isPEFriendlyBuffer(buffer) ? buffer.limit() : getBufferSizeBoundary(buffer);
+            }
+            error.enter(node);
+            throw UnsupportedMessageException.create();
+        }
+    }
+
+    @TruffleBoundary
+    private static long getByteSequenceLengthBoundary(APIAccess apiAccess, Object byteSequence) {
+        return apiAccess.byteSequenceLength(byteSequence);
     }
 
     @TruffleBoundary
@@ -882,25 +1120,63 @@ final class HostObject implements TruffleObject {
     }
 
     @ExportMessage
-    public byte readBufferByte(long index,
-                    @Shared("isBuffer") @Cached IsBufferNode isBuffer,
-                    @Shared("error") @Cached BranchProfile error,
-                    @Shared("classProfile") @Cached("createClassProfile()") ValueProfile classProfile) throws UnsupportedMessageException, InvalidBufferOffsetException {
-        if (!isBuffer.execute(this)) {
-            error.enter();
+    static class ReadBufferByte {
+
+        @Specialization(guards = "receiver.isNull()")
+        static byte doNull(HostObject receiver, long index) throws UnsupportedMessageException {
             throw UnsupportedMessageException.create();
         }
-        if (index < 0 || Integer.MAX_VALUE < index) {
-            error.enter();
-            throw InvalidBufferOffsetException.create(index, Byte.BYTES);
+
+        @Specialization(guards = {"receiver.isByteSequence()"})
+        static byte doByteSequence(HostObject receiver,
+                        long index,
+                        @Bind Node node,
+                        @Shared @Cached(value = "receiver.getHostClassCache()", allowUncached = true) HostClassCache hostClassCache,
+                        @Shared @Cached InlinedBranchProfile error) throws UnsupportedMessageException, InvalidBufferOffsetException {
+            if (!hostClassCache.isBufferAccess()) {
+                error.enter(node);
+                throw UnsupportedMessageException.create();
+            }
+            if (index < 0 || Integer.MAX_VALUE < index) {
+                error.enter(node);
+                throw InvalidBufferOffsetException.create(index, Byte.BYTES);
+            }
+            try {
+                return getByteSequenceByteBoundary(receiver.context.language.api, receiver.obj, (int) index);
+            } catch (IndexOutOfBoundsException e) {
+                error.enter(node);
+                throw InvalidBufferOffsetException.create(index, Byte.BYTES);
+            }
         }
-        try {
-            final ByteBuffer buffer = (ByteBuffer) classProfile.profile(obj);
-            return isPEFriendlyBuffer(buffer) ? buffer.get((int) index) : getBufferByteBoundary(buffer, (int) index);
-        } catch (IndexOutOfBoundsException e) {
-            error.enter();
-            throw InvalidBufferOffsetException.create(index, Byte.BYTES);
+
+        @Specialization(guards = {"!receiver.isNull()", "!receiver.isByteSequence()"})
+        static byte doOther(HostObject receiver,
+                        long index,
+                        @Bind Node node,
+                        @Shared @Cached(value = "receiver.getHostClassCache()", allowUncached = true) HostClassCache hostClassCache,
+                        @Shared @Cached InlinedBranchProfile error,
+                        @Shared @Cached InlinedExactClassProfile classProfile) throws UnsupportedMessageException, InvalidBufferOffsetException {
+            if (!receiver.isBuffer(hostClassCache)) {
+                error.enter(node);
+                throw UnsupportedMessageException.create();
+            }
+            if (index < 0 || Integer.MAX_VALUE < index) {
+                error.enter(node);
+                throw InvalidBufferOffsetException.create(index, Byte.BYTES);
+            }
+            try {
+                final ByteBuffer buffer = (ByteBuffer) classProfile.profile(node, receiver.obj);
+                return isPEFriendlyBuffer(buffer) ? buffer.get((int) index) : getBufferByteBoundary(buffer, (int) index);
+            } catch (IndexOutOfBoundsException e) {
+                error.enter(node);
+                throw InvalidBufferOffsetException.create(index, Byte.BYTES);
+            }
         }
+    }
+
+    @TruffleBoundary
+    private static byte getByteSequenceByteBoundary(APIAccess apiAccess, Object byteSequence, int index) {
+        return apiAccess.byteSequenceByteAt(byteSequence, index);
     }
 
     @TruffleBoundary
@@ -909,31 +1185,41 @@ final class HostObject implements TruffleObject {
     }
 
     @ExportMessage
-    public void writeBufferByte(long index, byte value,
-                    @Shared("isBuffer") @Cached IsBufferNode isBuffer,
-                    @Shared("error") @Cached BranchProfile error,
-                    @Shared("classProfile") @Cached("createClassProfile()") ValueProfile classProfile) throws InvalidBufferOffsetException, UnsupportedMessageException {
-        if (!isBuffer.execute(this)) {
-            error.enter();
+    static class WriteBufferByte {
+
+        @Specialization(guards = "receiver.isNull()")
+        static void doNull(HostObject receiver, long index, byte value) throws UnsupportedMessageException {
             throw UnsupportedMessageException.create();
         }
-        if (index < 0 || Integer.MAX_VALUE < index) {
-            error.enter();
-            throw InvalidBufferOffsetException.create(index, Byte.BYTES);
-        }
-        try {
-            final ByteBuffer buffer = (ByteBuffer) classProfile.profile(obj);
-            if (isPEFriendlyBuffer(buffer)) {
-                buffer.put((int) index, value);
-            } else {
-                putBufferByteBoundary(buffer, (int) index, value);
+
+        @Specialization(guards = "!receiver.isNull()")
+        static void doNonNull(HostObject receiver, long index, byte value,
+                        @Bind Node node,
+                        @Shared @Cached(value = "receiver.getHostClassCache()", allowUncached = true) HostClassCache hostClassCache,
+                        @Shared @Cached InlinedBranchProfile error,
+                        @Shared @Cached InlinedExactClassProfile classProfile) throws InvalidBufferOffsetException, UnsupportedMessageException {
+            if (!receiver.isBuffer(hostClassCache)) {
+                error.enter(node);
+                throw UnsupportedMessageException.create();
             }
-        } catch (IndexOutOfBoundsException e) {
-            error.enter();
-            throw InvalidBufferOffsetException.create(index, Byte.BYTES);
-        } catch (ReadOnlyBufferException e) {
-            error.enter();
-            throw UnsupportedMessageException.create();
+            if (index < 0 || Integer.MAX_VALUE < index) {
+                error.enter(node);
+                throw InvalidBufferOffsetException.create(index, Byte.BYTES);
+            }
+            try {
+                final ByteBuffer buffer = (ByteBuffer) classProfile.profile(node, receiver.obj);
+                if (isPEFriendlyBuffer(buffer)) {
+                    buffer.put((int) index, value);
+                } else {
+                    putBufferByteBoundary(buffer, (int) index, value);
+                }
+            } catch (IndexOutOfBoundsException e) {
+                error.enter(node);
+                throw InvalidBufferOffsetException.create(index, Byte.BYTES);
+            } catch (ReadOnlyBufferException e) {
+                error.enter(node);
+                throw UnsupportedMessageException.create();
+            }
         }
     }
 
@@ -943,28 +1229,72 @@ final class HostObject implements TruffleObject {
     }
 
     @ExportMessage
-    public short readBufferShort(ByteOrder order, long index,
-                    @Shared("isBuffer") @Cached IsBufferNode isBuffer,
-                    @Shared("error") @Cached BranchProfile error,
-                    @Shared("classProfile") @Cached("createClassProfile()") ValueProfile classProfile) throws UnsupportedMessageException, InvalidBufferOffsetException {
-        if (!isBuffer.execute(this)) {
-            error.enter();
+    static class ReadBufferShort {
+
+        @Specialization(guards = "receiver.isNull()")
+        static short doNull(HostObject receiver, ByteOrder order, long index) throws UnsupportedMessageException {
             throw UnsupportedMessageException.create();
         }
-        if (index < 0 || Integer.MAX_VALUE < index) {
-            error.enter();
-            throw InvalidBufferOffsetException.create(index, Short.BYTES);
+
+        @Specialization(guards = {"receiver.isByteSequence()"})
+        static short doByteSequence(HostObject receiver,
+                        ByteOrder order,
+                        long index,
+                        @Bind Node node,
+                        @Shared @Cached(value = "receiver.getHostClassCache()", allowUncached = true) HostClassCache hostClassCache,
+                        @Shared @Cached InlinedBranchProfile error) throws UnsupportedMessageException, InvalidBufferOffsetException {
+            if (!hostClassCache.isBufferAccess()) {
+                error.enter(node);
+                throw UnsupportedMessageException.create();
+            }
+            if (index < 0 || Integer.MAX_VALUE < index) {
+                error.enter(node);
+                throw InvalidBufferOffsetException.create(index, Short.BYTES);
+            }
+            try {
+                return getByteSequenceShortBoundary(receiver.context.language.api, receiver.obj, (int) index, order);
+            } catch (IndexOutOfBoundsException e) {
+                error.enter(node);
+                throw InvalidBufferOffsetException.create(index, Short.BYTES);
+            }
         }
-        try {
-            final ByteBuffer buffer = (ByteBuffer) classProfile.profile(obj);
-            final ByteOrder originalOrder = buffer.order();
-            buffer.order(order);
-            final short result = isPEFriendlyBuffer(buffer) ? buffer.getShort((int) index) : getBufferShortBoundary(buffer, (int) index);
-            buffer.order(originalOrder);
-            return result;
-        } catch (IndexOutOfBoundsException e) {
-            error.enter();
-            throw InvalidBufferOffsetException.create(index, Short.BYTES);
+
+        @Specialization(guards = {"!receiver.isNull()", "!receiver.isByteSequence()"})
+        static short doOther(HostObject receiver, ByteOrder order, long index,
+                        @Bind Node node,
+                        @Shared @Cached(value = "receiver.getHostClassCache()", allowUncached = true) HostClassCache hostClassCache,
+                        @Shared @Cached InlinedBranchProfile error,
+                        @Shared @Cached InlinedExactClassProfile classProfile) throws UnsupportedMessageException, InvalidBufferOffsetException {
+            if (!receiver.isBuffer(hostClassCache)) {
+                error.enter(node);
+                throw UnsupportedMessageException.create();
+            }
+            if (index < 0 || Integer.MAX_VALUE < index) {
+                error.enter(node);
+                throw InvalidBufferOffsetException.create(index, Short.BYTES);
+            }
+            try {
+                final ByteBuffer buffer = (ByteBuffer) classProfile.profile(node, receiver.obj);
+                final ByteOrder originalOrder = buffer.order();
+                buffer.order(order);
+                final short result = isPEFriendlyBuffer(buffer) ? buffer.getShort((int) index) : getBufferShortBoundary(buffer, (int) index);
+                buffer.order(originalOrder);
+                return result;
+            } catch (IndexOutOfBoundsException e) {
+                error.enter(node);
+                throw InvalidBufferOffsetException.create(index, Short.BYTES);
+            }
+        }
+    }
+
+    @TruffleBoundary
+    private static short getByteSequenceShortBoundary(APIAccess apiAccess, Object byteSequence, int index, ByteOrder order) {
+        int b1 = apiAccess.byteSequenceByteAt(byteSequence, index) & 0xFF;
+        int b2 = apiAccess.byteSequenceByteAt(byteSequence, index + 1) & 0xFF;
+        if (order == ByteOrder.BIG_ENDIAN) {
+            return (short) ((b1 << 8) | b2);
+        } else {
+            return (short) ((b2 << 8) | b1);
         }
     }
 
@@ -974,34 +1304,44 @@ final class HostObject implements TruffleObject {
     }
 
     @ExportMessage
-    public void writeBufferShort(ByteOrder order, long index, short value,
-                    @Shared("isBuffer") @Cached IsBufferNode isBuffer,
-                    @Shared("error") @Cached BranchProfile error,
-                    @Shared("classProfile") @Cached("createClassProfile()") ValueProfile classProfile) throws InvalidBufferOffsetException, UnsupportedMessageException {
-        if (!isBuffer.execute(this)) {
-            error.enter();
+    static class WriteBufferShort {
+
+        @Specialization(guards = "receiver.isNull()")
+        static void doNull(HostObject receiver, ByteOrder order, long index, short value) throws UnsupportedMessageException {
             throw UnsupportedMessageException.create();
         }
-        if (index < 0 || Integer.MAX_VALUE < index) {
-            error.enter();
-            throw InvalidBufferOffsetException.create(index, Short.BYTES);
-        }
-        try {
-            final ByteBuffer buffer = (ByteBuffer) classProfile.profile(obj);
-            final ByteOrder originalOrder = buffer.order();
-            buffer.order(order);
-            if (isPEFriendlyBuffer(buffer)) {
-                buffer.putShort((int) index, value);
-            } else {
-                putBufferShortBoundary(buffer, (int) index, value);
+
+        @Specialization(guards = "!receiver.isNull()")
+        static void doNonNull(HostObject receiver, ByteOrder order, long index, short value,
+                        @Bind Node node,
+                        @Shared @Cached(value = "receiver.getHostClassCache()", allowUncached = true) HostClassCache hostClassCache,
+                        @Shared @Cached InlinedBranchProfile error,
+                        @Shared @Cached InlinedExactClassProfile classProfile) throws InvalidBufferOffsetException, UnsupportedMessageException {
+            if (!receiver.isBuffer(hostClassCache)) {
+                error.enter(node);
+                throw UnsupportedMessageException.create();
             }
-            buffer.order(originalOrder);
-        } catch (IndexOutOfBoundsException e) {
-            error.enter();
-            throw InvalidBufferOffsetException.create(index, Short.BYTES);
-        } catch (ReadOnlyBufferException e) {
-            error.enter();
-            throw UnsupportedMessageException.create();
+            if (index < 0 || Integer.MAX_VALUE < index) {
+                error.enter(node);
+                throw InvalidBufferOffsetException.create(index, Short.BYTES);
+            }
+            try {
+                final ByteBuffer buffer = (ByteBuffer) classProfile.profile(node, receiver.obj);
+                final ByteOrder originalOrder = buffer.order();
+                buffer.order(order);
+                if (isPEFriendlyBuffer(buffer)) {
+                    buffer.putShort((int) index, value);
+                } else {
+                    putBufferShortBoundary(buffer, (int) index, value);
+                }
+                buffer.order(originalOrder);
+            } catch (IndexOutOfBoundsException e) {
+                error.enter(node);
+                throw InvalidBufferOffsetException.create(index, Short.BYTES);
+            } catch (ReadOnlyBufferException e) {
+                error.enter(node);
+                throw UnsupportedMessageException.create();
+            }
         }
     }
 
@@ -1011,28 +1351,61 @@ final class HostObject implements TruffleObject {
     }
 
     @ExportMessage
-    public int readBufferInt(ByteOrder order, long index,
-                    @Shared("isBuffer") @Cached IsBufferNode isBuffer,
-                    @Shared("error") @Cached BranchProfile error,
-                    @Shared("classProfile") @Cached("createClassProfile()") ValueProfile classProfile) throws UnsupportedMessageException, InvalidBufferOffsetException {
-        if (!isBuffer.execute(this)) {
-            error.enter();
+    static class ReadBufferInt {
+
+        @Specialization(guards = "receiver.isNull()")
+        static int doNull(HostObject receiver, ByteOrder order, long index) throws UnsupportedMessageException {
             throw UnsupportedMessageException.create();
         }
-        if (index < 0 || Integer.MAX_VALUE < index) {
-            error.enter();
-            throw InvalidBufferOffsetException.create(index, Integer.BYTES);
+
+        @Specialization(guards = {"receiver.isByteSequence()"})
+        static int doByteSequence(HostObject receiver,
+                        ByteOrder order,
+                        long index,
+                        @Bind Node node,
+                        @Shared @Cached(value = "receiver.getHostClassCache()", allowUncached = true) HostClassCache hostClassCache,
+                        @Shared @Cached InlinedBranchProfile error) throws UnsupportedMessageException, InvalidBufferOffsetException {
+            if (!hostClassCache.isBufferAccess()) {
+                error.enter(node);
+                throw UnsupportedMessageException.create();
+            }
+            if (index < 0 || Integer.MAX_VALUE < index) {
+                error.enter(node);
+                throw InvalidBufferOffsetException.create(index, Integer.BYTES);
+            }
+            try {
+                return getByteSequenceIntBoundary(receiver.context.language.api, receiver.obj, (int) index, order);
+            } catch (IndexOutOfBoundsException e) {
+                error.enter(node);
+                throw InvalidBufferOffsetException.create(index, Integer.BYTES);
+            }
         }
-        try {
-            final ByteBuffer buffer = (ByteBuffer) classProfile.profile(obj);
-            final ByteOrder originalOrder = buffer.order();
-            buffer.order(order);
-            final int result = isPEFriendlyBuffer(buffer) ? buffer.getInt((int) index) : getBufferIntBoundary(buffer, (int) index);
-            buffer.order(originalOrder);
-            return result;
-        } catch (IndexOutOfBoundsException e) {
-            error.enter();
-            throw InvalidBufferOffsetException.create(index, Integer.BYTES);
+
+        @Specialization(guards = {"!receiver.isNull()", "!receiver.isByteSequence()"})
+        static int doOther(HostObject receiver, ByteOrder order, long index,
+                        @Bind Node node,
+                        @Shared @Cached(value = "receiver.getHostClassCache()", allowUncached = true) HostClassCache hostClassCache,
+                        @Shared @Cached InlinedBranchProfile error,
+                        @Shared @Cached InlinedExactClassProfile classProfile) throws UnsupportedMessageException, InvalidBufferOffsetException {
+            if (!receiver.isBuffer(hostClassCache)) {
+                error.enter(node);
+                throw UnsupportedMessageException.create();
+            }
+            if (index < 0 || Integer.MAX_VALUE < index) {
+                error.enter(node);
+                throw InvalidBufferOffsetException.create(index, Integer.BYTES);
+            }
+            try {
+                final ByteBuffer buffer = (ByteBuffer) classProfile.profile(node, receiver.obj);
+                final ByteOrder originalOrder = buffer.order();
+                buffer.order(order);
+                final int result = isPEFriendlyBuffer(buffer) ? buffer.getInt((int) index) : getBufferIntBoundary(buffer, (int) index);
+                buffer.order(originalOrder);
+                return result;
+            } catch (IndexOutOfBoundsException e) {
+                error.enter(node);
+                throw InvalidBufferOffsetException.create(index, Integer.BYTES);
+            }
         }
     }
 
@@ -1041,35 +1414,58 @@ final class HostObject implements TruffleObject {
         return buffer.getInt(index);
     }
 
+    @TruffleBoundary
+    private static int getByteSequenceIntBoundary(APIAccess apiAccess, Object byteSequence, int index, ByteOrder order) {
+        int b1 = apiAccess.byteSequenceByteAt(byteSequence, index) & 0xFF;
+        int b2 = apiAccess.byteSequenceByteAt(byteSequence, index + 1) & 0xFF;
+        int b3 = apiAccess.byteSequenceByteAt(byteSequence, index + 2) & 0xFF;
+        int b4 = apiAccess.byteSequenceByteAt(byteSequence, index + 3) & 0xFF;
+        if (order == ByteOrder.BIG_ENDIAN) {
+            return (b1 << 24) | (b2 << 16) | (b3 << 8) | b4;
+        } else {
+            return (b4 << 24) | (b3 << 16) | (b2 << 8) | b1;
+        }
+    }
+
     @ExportMessage
-    public void writeBufferInt(ByteOrder order, long index, int value,
-                    @Shared("isBuffer") @Cached IsBufferNode isBuffer,
-                    @Shared("error") @Cached BranchProfile error,
-                    @Shared("classProfile") @Cached("createClassProfile()") ValueProfile classProfile) throws InvalidBufferOffsetException, UnsupportedMessageException {
-        if (!isBuffer.execute(this)) {
-            error.enter();
+    static class WriteBufferInt {
+
+        @Specialization(guards = "receiver.isNull()")
+        static void doNull(HostObject receiver, ByteOrder order, long index, int value) throws UnsupportedMessageException {
             throw UnsupportedMessageException.create();
         }
-        if (index < 0 || Integer.MAX_VALUE < index) {
-            error.enter();
-            throw InvalidBufferOffsetException.create(index, Integer.BYTES);
-        }
-        try {
-            final ByteBuffer buffer = (ByteBuffer) classProfile.profile(obj);
-            final ByteOrder originalOrder = buffer.order();
-            buffer.order(order);
-            if (isPEFriendlyBuffer(buffer)) {
-                buffer.putInt((int) index, value);
-            } else {
-                putBufferIntBoundary(buffer, (int) index, value);
+
+        @Specialization(guards = "!receiver.isNull()")
+        static void doNonNull(HostObject receiver, ByteOrder order, long index, int value,
+                        @Bind Node node,
+                        @Shared @Cached(value = "receiver.getHostClassCache()", allowUncached = true) HostClassCache hostClassCache,
+                        @Shared @Cached InlinedBranchProfile error,
+                        @Shared @Cached InlinedExactClassProfile classProfile) throws InvalidBufferOffsetException, UnsupportedMessageException {
+            if (!receiver.isBuffer(hostClassCache)) {
+                error.enter(node);
+                throw UnsupportedMessageException.create();
             }
-            buffer.order(originalOrder);
-        } catch (IndexOutOfBoundsException e) {
-            error.enter();
-            throw InvalidBufferOffsetException.create(index, Integer.BYTES);
-        } catch (ReadOnlyBufferException e) {
-            error.enter();
-            throw UnsupportedMessageException.create();
+            if (index < 0 || Integer.MAX_VALUE < index) {
+                error.enter(node);
+                throw InvalidBufferOffsetException.create(index, Integer.BYTES);
+            }
+            try {
+                final ByteBuffer buffer = (ByteBuffer) classProfile.profile(node, receiver.obj);
+                final ByteOrder originalOrder = buffer.order();
+                buffer.order(order);
+                if (isPEFriendlyBuffer(buffer)) {
+                    buffer.putInt((int) index, value);
+                } else {
+                    putBufferIntBoundary(buffer, (int) index, value);
+                }
+                buffer.order(originalOrder);
+            } catch (IndexOutOfBoundsException e) {
+                error.enter(node);
+                throw InvalidBufferOffsetException.create(index, Integer.BYTES);
+            } catch (ReadOnlyBufferException e) {
+                error.enter(node);
+                throw UnsupportedMessageException.create();
+            }
         }
     }
 
@@ -1079,28 +1475,61 @@ final class HostObject implements TruffleObject {
     }
 
     @ExportMessage
-    public long readBufferLong(ByteOrder order, long index,
-                    @Shared("isBuffer") @Cached IsBufferNode isBuffer,
-                    @Shared("error") @Cached BranchProfile error,
-                    @Shared("classProfile") @Cached("createClassProfile()") ValueProfile classProfile) throws UnsupportedMessageException, InvalidBufferOffsetException {
-        if (!isBuffer.execute(this)) {
-            error.enter();
+    static class ReadBufferLong {
+
+        @Specialization(guards = "receiver.isNull()")
+        static long doNull(HostObject receiver, ByteOrder order, long index) throws UnsupportedMessageException {
             throw UnsupportedMessageException.create();
         }
-        if (index < 0 || Integer.MAX_VALUE < index) {
-            error.enter();
-            throw InvalidBufferOffsetException.create(index, Long.BYTES);
+
+        @Specialization(guards = {"receiver.isByteSequence()"})
+        static long doByteSequence(HostObject receiver,
+                        ByteOrder order,
+                        long index,
+                        @Bind Node node,
+                        @Shared @Cached(value = "receiver.getHostClassCache()", allowUncached = true) HostClassCache hostClassCache,
+                        @Shared @Cached InlinedBranchProfile error) throws UnsupportedMessageException, InvalidBufferOffsetException {
+            if (!hostClassCache.isBufferAccess()) {
+                error.enter(node);
+                throw UnsupportedMessageException.create();
+            }
+            if (index < 0 || Integer.MAX_VALUE < index) {
+                error.enter(node);
+                throw InvalidBufferOffsetException.create(index, Long.BYTES);
+            }
+            try {
+                return getByteSequenceLongBoundary(receiver.context.language.api, receiver.obj, (int) index, order);
+            } catch (IndexOutOfBoundsException e) {
+                error.enter(node);
+                throw InvalidBufferOffsetException.create(index, Long.BYTES);
+            }
         }
-        try {
-            final ByteBuffer buffer = (ByteBuffer) classProfile.profile(obj);
-            final ByteOrder originalOrder = buffer.order();
-            buffer.order(order);
-            final long result = isPEFriendlyBuffer(buffer) ? buffer.getLong((int) index) : getBufferLongBoundary(buffer, (int) index);
-            buffer.order(originalOrder);
-            return result;
-        } catch (IndexOutOfBoundsException e) {
-            error.enter();
-            throw InvalidBufferOffsetException.create(index, Long.BYTES);
+
+        @Specialization(guards = {"!receiver.isNull()", "!receiver.isByteSequence()"})
+        static long doOther(HostObject receiver, ByteOrder order, long index,
+                        @Bind Node node,
+                        @Shared @Cached(value = "receiver.getHostClassCache()", allowUncached = true) HostClassCache hostClassCache,
+                        @Shared @Cached InlinedBranchProfile error,
+                        @Shared @Cached InlinedExactClassProfile classProfile) throws UnsupportedMessageException, InvalidBufferOffsetException {
+            if (!receiver.isBuffer(hostClassCache)) {
+                error.enter(node);
+                throw UnsupportedMessageException.create();
+            }
+            if (index < 0 || Integer.MAX_VALUE < index) {
+                error.enter(node);
+                throw InvalidBufferOffsetException.create(index, Long.BYTES);
+            }
+            try {
+                final ByteBuffer buffer = (ByteBuffer) classProfile.profile(node, receiver.obj);
+                final ByteOrder originalOrder = buffer.order();
+                buffer.order(order);
+                final long result = isPEFriendlyBuffer(buffer) ? buffer.getLong((int) index) : getBufferLongBoundary(buffer, (int) index);
+                buffer.order(originalOrder);
+                return result;
+            } catch (IndexOutOfBoundsException e) {
+                error.enter(node);
+                throw InvalidBufferOffsetException.create(index, Long.BYTES);
+            }
         }
     }
 
@@ -1109,35 +1538,62 @@ final class HostObject implements TruffleObject {
         return buffer.getLong(index);
     }
 
+    @TruffleBoundary
+    private static long getByteSequenceLongBoundary(APIAccess apiAccess, Object byteSequence, int index, ByteOrder order) {
+        long b1 = apiAccess.byteSequenceByteAt(byteSequence, index) & 0xFF;
+        long b2 = apiAccess.byteSequenceByteAt(byteSequence, index + 1) & 0xFF;
+        long b3 = apiAccess.byteSequenceByteAt(byteSequence, index + 2) & 0xFF;
+        long b4 = apiAccess.byteSequenceByteAt(byteSequence, index + 3) & 0xFF;
+        long b5 = apiAccess.byteSequenceByteAt(byteSequence, index + 4) & 0xFF;
+        long b6 = apiAccess.byteSequenceByteAt(byteSequence, index + 5) & 0xFF;
+        long b7 = apiAccess.byteSequenceByteAt(byteSequence, index + 6) & 0xFF;
+        long b8 = apiAccess.byteSequenceByteAt(byteSequence, index + 7) & 0xFF;
+        if (order == ByteOrder.BIG_ENDIAN) {
+            return (b1 << 56) | (b2 << 48) | (b3 << 40) | (b4 << 32) | (b5 << 24) | (b6 << 16) | (b7 << 8) | b8;
+        } else {
+            return (b8 << 56) | (b7 << 48) | (b6 << 40) | (b5 << 32) | (b4 << 24) | (b3 << 16) | (b2 << 8) | b1;
+        }
+    }
+
     @ExportMessage
-    public void writeBufferLong(ByteOrder order, long index, long value,
-                    @Shared("isBuffer") @Cached IsBufferNode isBuffer,
-                    @Shared("error") @Cached BranchProfile error,
-                    @Shared("classProfile") @Cached("createClassProfile()") ValueProfile classProfile) throws InvalidBufferOffsetException, UnsupportedMessageException {
-        if (!isBuffer.execute(this)) {
-            error.enter();
+    static class WriteBufferLong {
+
+        @Specialization(guards = "receiver.isNull()")
+        static void doNull(HostObject receiver, ByteOrder order, long index, long value) throws UnsupportedMessageException {
             throw UnsupportedMessageException.create();
         }
-        if (index < 0 || Integer.MAX_VALUE < index) {
-            error.enter();
-            throw InvalidBufferOffsetException.create(index, Long.BYTES);
-        }
-        try {
-            final ByteBuffer buffer = (ByteBuffer) classProfile.profile(obj);
-            final ByteOrder originalOrder = buffer.order();
-            buffer.order(order);
-            if (isPEFriendlyBuffer(buffer)) {
-                buffer.putLong((int) index, value);
-            } else {
-                putBufferLongBoundary(buffer, (int) index, value);
+
+        @Specialization(guards = "!receiver.isNull()")
+        static void doNonNull(HostObject receiver, ByteOrder order, long index, long value,
+                        @Bind Node node,
+                        @Shared @Cached(value = "receiver.getHostClassCache()", allowUncached = true) HostClassCache hostClassCache,
+                        @Shared @Cached InlinedBranchProfile error,
+                        @Shared @Cached InlinedExactClassProfile classProfile) throws InvalidBufferOffsetException, UnsupportedMessageException {
+            if (!receiver.isBuffer(hostClassCache)) {
+                error.enter(node);
+                throw UnsupportedMessageException.create();
             }
-            buffer.order(originalOrder);
-        } catch (IndexOutOfBoundsException e) {
-            error.enter();
-            throw InvalidBufferOffsetException.create(index, Long.BYTES);
-        } catch (ReadOnlyBufferException e) {
-            error.enter();
-            throw UnsupportedMessageException.create();
+            if (index < 0 || Integer.MAX_VALUE < index) {
+                error.enter(node);
+                throw InvalidBufferOffsetException.create(index, Long.BYTES);
+            }
+            try {
+                final ByteBuffer buffer = (ByteBuffer) classProfile.profile(node, receiver.obj);
+                final ByteOrder originalOrder = buffer.order();
+                buffer.order(order);
+                if (isPEFriendlyBuffer(buffer)) {
+                    buffer.putLong((int) index, value);
+                } else {
+                    putBufferLongBoundary(buffer, (int) index, value);
+                }
+                buffer.order(originalOrder);
+            } catch (IndexOutOfBoundsException e) {
+                error.enter(node);
+                throw InvalidBufferOffsetException.create(index, Long.BYTES);
+            } catch (ReadOnlyBufferException e) {
+                error.enter(node);
+                throw UnsupportedMessageException.create();
+            }
         }
     }
 
@@ -1147,139 +1603,306 @@ final class HostObject implements TruffleObject {
     }
 
     @ExportMessage
-    public float readBufferFloat(ByteOrder order, long index,
-                    @Shared("isBuffer") @Cached IsBufferNode isBuffer,
-                    @Shared("error") @Cached BranchProfile error,
-                    @Shared("classProfile") @Cached("createClassProfile()") ValueProfile classProfile) throws UnsupportedMessageException, InvalidBufferOffsetException {
-        if (!isBuffer.execute(this)) {
-            error.enter();
+    static class ReadBufferFloat {
+
+        @Specialization(guards = "receiver.isNull()")
+        static float doNull(HostObject receiver, ByteOrder order, long index) throws UnsupportedMessageException {
             throw UnsupportedMessageException.create();
         }
-        if (index < 0 || Integer.MAX_VALUE < index) {
-            error.enter();
-            throw InvalidBufferOffsetException.create(index, Float.BYTES);
+
+        @Specialization(guards = {"receiver.isByteSequence()"})
+        static float doByteSequence(HostObject receiver,
+                        ByteOrder order,
+                        long index,
+                        @Bind Node node,
+                        @Shared @Cached(value = "receiver.getHostClassCache()", allowUncached = true) HostClassCache hostClassCache,
+                        @Shared @Cached InlinedBranchProfile error) throws UnsupportedMessageException, InvalidBufferOffsetException {
+            if (!hostClassCache.isBufferAccess()) {
+                error.enter(node);
+                throw UnsupportedMessageException.create();
+            }
+            if (index < 0 || Integer.MAX_VALUE < index) {
+                error.enter(node);
+                throw InvalidBufferOffsetException.create(index, Float.BYTES);
+            }
+            try {
+                return getByteSequenceFloatBoundary(receiver.context.language.api, receiver.obj, (int) index, order);
+            } catch (IndexOutOfBoundsException e) {
+                error.enter(node);
+                throw InvalidBufferOffsetException.create(index, Float.BYTES);
+            }
         }
-        try {
-            final ByteBuffer buffer = (ByteBuffer) classProfile.profile(obj);
-            final ByteOrder originalOrder = buffer.order();
-            buffer.order(order);
-            final float result = isPEFriendlyBuffer(buffer) ? buffer.getFloat((int) index) : getBufferFloatBoundary(buffer, (int) index);
-            buffer.order(originalOrder);
-            return result;
-        } catch (IndexOutOfBoundsException e) {
-            error.enter();
-            throw InvalidBufferOffsetException.create(index, Float.BYTES);
+
+        @Specialization(guards = {"!receiver.isNull()", "!receiver.isByteSequence()"})
+        static float doOther(HostObject receiver, ByteOrder order, long index,
+                        @Bind Node node,
+                        @Shared @Cached(value = "receiver.getHostClassCache()", allowUncached = true) HostClassCache hostClassCache,
+                        @Shared @Cached InlinedBranchProfile error,
+                        @Shared @Cached InlinedExactClassProfile classProfile) throws UnsupportedMessageException, InvalidBufferOffsetException {
+            if (!receiver.isBuffer(hostClassCache)) {
+                error.enter(node);
+                throw UnsupportedMessageException.create();
+            }
+            if (index < 0 || Integer.MAX_VALUE < index) {
+                error.enter(node);
+                throw InvalidBufferOffsetException.create(index, Float.BYTES);
+            }
+            try {
+                final ByteBuffer buffer = (ByteBuffer) classProfile.profile(node, receiver.obj);
+                final ByteOrder originalOrder = buffer.order();
+                buffer.order(order);
+                final float result = isPEFriendlyBuffer(buffer) ? buffer.getFloat((int) index) : getBufferFloatBoundary(buffer, (int) index);
+                buffer.order(originalOrder);
+                return result;
+            } catch (IndexOutOfBoundsException e) {
+                error.enter(node);
+                throw InvalidBufferOffsetException.create(index, Float.BYTES);
+            }
         }
     }
 
-    @CompilerDirectives.TruffleBoundary
+    @TruffleBoundary
     private static float getBufferFloatBoundary(ByteBuffer buffer, int index) {
         return buffer.getFloat(index);
     }
 
+    @TruffleBoundary
+    private static float getByteSequenceFloatBoundary(APIAccess apiAccess, Object byteSequence, int index, ByteOrder order) {
+        return Float.intBitsToFloat(getByteSequenceIntBoundary(apiAccess, byteSequence, index, order));
+    }
+
     @ExportMessage
-    public void writeBufferFloat(ByteOrder order, long index, float value,
-                    @Shared("isBuffer") @Cached IsBufferNode isBuffer,
-                    @Shared("error") @Cached BranchProfile error,
-                    @Shared("classProfile") @Cached("createClassProfile()") ValueProfile classProfile) throws InvalidBufferOffsetException, UnsupportedMessageException {
-        if (!isBuffer.execute(this)) {
-            error.enter();
+    static class WriteBufferFloat {
+
+        @Specialization(guards = "receiver.isNull()")
+        static void doNull(HostObject receiver, ByteOrder order, long index, float value) throws UnsupportedMessageException {
             throw UnsupportedMessageException.create();
         }
-        if (index < 0 || Integer.MAX_VALUE < index) {
-            error.enter();
-            throw InvalidBufferOffsetException.create(index, Float.BYTES);
-        }
-        try {
-            final ByteBuffer buffer = (ByteBuffer) classProfile.profile(obj);
-            final ByteOrder originalOrder = buffer.order();
-            buffer.order(order);
-            if (isPEFriendlyBuffer(buffer)) {
-                buffer.putFloat((int) index, value);
-            } else {
-                putBufferFloatBoundary(buffer, (int) index, value);
+
+        @Specialization(guards = "!receiver.isNull()")
+        static void doNonNull(HostObject receiver, ByteOrder order, long index, float value,
+                        @Bind Node node,
+                        @Shared @Cached(value = "receiver.getHostClassCache()", allowUncached = true) HostClassCache hostClassCache,
+                        @Shared @Cached InlinedBranchProfile error,
+                        @Shared @Cached InlinedExactClassProfile classProfile) throws InvalidBufferOffsetException, UnsupportedMessageException {
+            if (!receiver.isBuffer(hostClassCache)) {
+                error.enter(node);
+                throw UnsupportedMessageException.create();
             }
-            buffer.order(originalOrder);
-        } catch (IndexOutOfBoundsException e) {
-            error.enter();
-            throw InvalidBufferOffsetException.create(index, Float.BYTES);
-        } catch (ReadOnlyBufferException e) {
-            error.enter();
-            throw UnsupportedMessageException.create();
+            if (index < 0 || Integer.MAX_VALUE < index) {
+                error.enter(node);
+                throw InvalidBufferOffsetException.create(index, Float.BYTES);
+            }
+            try {
+                final ByteBuffer buffer = (ByteBuffer) classProfile.profile(node, receiver.obj);
+                final ByteOrder originalOrder = buffer.order();
+                buffer.order(order);
+                if (isPEFriendlyBuffer(buffer)) {
+                    buffer.putFloat((int) index, value);
+                } else {
+                    putBufferFloatBoundary(buffer, (int) index, value);
+                }
+                buffer.order(originalOrder);
+            } catch (IndexOutOfBoundsException e) {
+                error.enter(node);
+                throw InvalidBufferOffsetException.create(index, Float.BYTES);
+            } catch (ReadOnlyBufferException e) {
+                error.enter(node);
+                throw UnsupportedMessageException.create();
+            }
         }
     }
 
-    @CompilerDirectives.TruffleBoundary
+    @TruffleBoundary
     private static void putBufferFloatBoundary(ByteBuffer buffer, int index, float value) {
         buffer.putFloat(index, value);
     }
 
     @ExportMessage
-    public double readBufferDouble(ByteOrder order, long index,
-                    @Shared("isBuffer") @Cached IsBufferNode isBuffer,
-                    @Shared("error") @Cached BranchProfile error,
-                    @Shared("classProfile") @Cached("createClassProfile()") ValueProfile classProfile) throws UnsupportedMessageException, InvalidBufferOffsetException {
-        if (!isBuffer.execute(this)) {
-            error.enter();
+    static class ReadBufferDouble {
+
+        @Specialization(guards = "receiver.isNull()")
+        static double doNull(HostObject receiver, ByteOrder order, long index) throws UnsupportedMessageException {
             throw UnsupportedMessageException.create();
         }
-        if (index < 0 || Integer.MAX_VALUE < index) {
-            error.enter();
-            throw InvalidBufferOffsetException.create(index, Double.BYTES);
+
+        @Specialization(guards = {"receiver.isByteSequence()"})
+        static double doByteSequence(HostObject receiver,
+                        ByteOrder order,
+                        long index,
+                        @Bind Node node,
+                        @Shared @Cached(value = "receiver.getHostClassCache()", allowUncached = true) HostClassCache hostClassCache,
+                        @Shared @Cached InlinedBranchProfile error) throws UnsupportedMessageException, InvalidBufferOffsetException {
+            if (!hostClassCache.isBufferAccess()) {
+                error.enter(node);
+                throw UnsupportedMessageException.create();
+            }
+            if (index < 0 || Integer.MAX_VALUE < index) {
+                error.enter(node);
+                throw InvalidBufferOffsetException.create(index, Double.BYTES);
+            }
+            try {
+                return getByteSequenceDoubleBoundary(receiver.context.language.api, receiver.obj, (int) index, order);
+            } catch (IndexOutOfBoundsException e) {
+                error.enter(node);
+                throw InvalidBufferOffsetException.create(index, Double.BYTES);
+            }
         }
-        try {
-            final ByteBuffer buffer = (ByteBuffer) classProfile.profile(obj);
-            final ByteOrder originalOrder = buffer.order();
-            buffer.order(order);
-            final double result = isPEFriendlyBuffer(buffer) ? buffer.getDouble((int) index) : getBufferDoubleBoundary(buffer, (int) index);
-            buffer.order(originalOrder);
-            return result;
-        } catch (IndexOutOfBoundsException e) {
-            error.enter();
-            throw InvalidBufferOffsetException.create(index, Double.BYTES);
+
+        @Specialization(guards = {"!receiver.isNull()", "!receiver.isByteSequence()"})
+        static double doOther(HostObject receiver, ByteOrder order, long index,
+                        @Bind Node node,
+                        @Shared @Cached(value = "receiver.getHostClassCache()", allowUncached = true) HostClassCache hostClassCache,
+                        @Shared @Cached InlinedBranchProfile error,
+                        @Shared @Cached InlinedExactClassProfile classProfile) throws UnsupportedMessageException, InvalidBufferOffsetException {
+            if (!receiver.isBuffer(hostClassCache)) {
+                error.enter(node);
+                throw UnsupportedMessageException.create();
+            }
+            if (index < 0 || Integer.MAX_VALUE < index) {
+                error.enter(node);
+                throw InvalidBufferOffsetException.create(index, Double.BYTES);
+            }
+            try {
+                final ByteBuffer buffer = (ByteBuffer) classProfile.profile(node, receiver.obj);
+                final ByteOrder originalOrder = buffer.order();
+                buffer.order(order);
+                final double result = isPEFriendlyBuffer(buffer) ? buffer.getDouble((int) index) : getBufferDoubleBoundary(buffer, (int) index);
+                buffer.order(originalOrder);
+                return result;
+            } catch (IndexOutOfBoundsException e) {
+                error.enter(node);
+                throw InvalidBufferOffsetException.create(index, Double.BYTES);
+            }
         }
     }
 
-    @CompilerDirectives.TruffleBoundary
+    @TruffleBoundary
     private static double getBufferDoubleBoundary(ByteBuffer buffer, int index) {
         return buffer.getDouble(index);
     }
 
+    @TruffleBoundary
+    private static double getByteSequenceDoubleBoundary(APIAccess apiAccess, Object byteSequence, int index, ByteOrder order) {
+        return Double.longBitsToDouble(getByteSequenceLongBoundary(apiAccess, byteSequence, index, order));
+    }
+
     @ExportMessage
-    public void writeBufferDouble(ByteOrder order, long index, double value,
-                    @Shared("isBuffer") @Cached IsBufferNode isBuffer,
-                    @Shared("error") @Cached BranchProfile error,
-                    @Shared("classProfile") @Cached("createClassProfile()") ValueProfile classProfile) throws InvalidBufferOffsetException, UnsupportedMessageException {
-        if (!isBuffer.execute(this)) {
-            error.enter();
+    static class WriteBufferDouble {
+
+        @Specialization(guards = "receiver.isNull()")
+        static void doNull(HostObject receiver, ByteOrder order, long index, double value) throws UnsupportedMessageException {
             throw UnsupportedMessageException.create();
         }
-        if (index < 0 || Integer.MAX_VALUE < index) {
-            error.enter();
-            throw InvalidBufferOffsetException.create(index, Double.BYTES);
-        }
-        try {
-            final ByteBuffer buffer = (ByteBuffer) classProfile.profile(obj);
-            final ByteOrder originalOrder = buffer.order();
-            buffer.order(order);
-            if (isPEFriendlyBuffer(buffer)) {
-                buffer.putDouble((int) index, value);
-            } else {
-                putBufferDoubleBoundary(buffer, (int) index, value);
+
+        @Specialization(guards = "!receiver.isNull()")
+        static void doNonNull(HostObject receiver, ByteOrder order, long index, double value,
+                        @Bind Node node,
+                        @Shared @Cached(value = "receiver.getHostClassCache()", allowUncached = true) HostClassCache hostClassCache,
+                        @Shared @Cached InlinedBranchProfile error,
+                        @Shared @Cached InlinedExactClassProfile classProfile) throws InvalidBufferOffsetException, UnsupportedMessageException {
+            if (!receiver.isBuffer(hostClassCache)) {
+                error.enter(node);
+                throw UnsupportedMessageException.create();
             }
-            buffer.order(originalOrder);
-        } catch (IndexOutOfBoundsException e) {
-            error.enter();
-            throw InvalidBufferOffsetException.create(index, Double.BYTES);
-        } catch (ReadOnlyBufferException e) {
-            error.enter();
-            throw UnsupportedMessageException.create();
+            if (index < 0 || Integer.MAX_VALUE < index) {
+                error.enter(node);
+                throw InvalidBufferOffsetException.create(index, Double.BYTES);
+            }
+            try {
+                final ByteBuffer buffer = (ByteBuffer) classProfile.profile(node, receiver.obj);
+                final ByteOrder originalOrder = buffer.order();
+                buffer.order(order);
+                if (isPEFriendlyBuffer(buffer)) {
+                    buffer.putDouble((int) index, value);
+                } else {
+                    putBufferDoubleBoundary(buffer, (int) index, value);
+                }
+                buffer.order(originalOrder);
+            } catch (IndexOutOfBoundsException e) {
+                error.enter(node);
+                throw InvalidBufferOffsetException.create(index, Double.BYTES);
+            } catch (ReadOnlyBufferException e) {
+                error.enter(node);
+                throw UnsupportedMessageException.create();
+            }
         }
     }
 
-    @CompilerDirectives.TruffleBoundary
+    @TruffleBoundary
     private static void putBufferDoubleBoundary(ByteBuffer buffer, int index, double value) {
         buffer.putDouble(index, value);
+    }
+
+    @ExportMessage
+    static class ReadBuffer {
+
+        @Specialization(guards = "receiver.isNull()")
+        static void doNull(HostObject receiver, long bufferByteOffset, byte[] destination, int destinationOffset, int byteLength) throws UnsupportedMessageException {
+            throw UnsupportedMessageException.create();
+        }
+
+        @Specialization(guards = {"receiver.isByteSequence()"})
+        static void doByteSequence(HostObject receiver,
+                        long bufferByteOffset,
+                        byte[] destination,
+                        int destinationOffset,
+                        int byteLength,
+                        @Bind Node node,
+                        @Shared @Cached(value = "receiver.getHostClassCache()", allowUncached = true) HostClassCache hostClassCache,
+                        @Shared @Cached InlinedBranchProfile error) throws UnsupportedMessageException, InvalidBufferOffsetException {
+            if (!hostClassCache.isBufferAccess()) {
+                error.enter(node);
+                throw UnsupportedMessageException.create();
+            }
+            if (bufferByteOffset < 0 || Integer.MAX_VALUE < bufferByteOffset + byteLength) {
+                error.enter(node);
+                throw InvalidBufferOffsetException.create(bufferByteOffset, byteLength);
+            }
+            try {
+                getByteSequenceBytesBoundary(receiver.context.language.api, receiver.obj, (int) bufferByteOffset, destination, destinationOffset, byteLength);
+            } catch (IndexOutOfBoundsException e) {
+                error.enter(node);
+                throw InvalidBufferOffsetException.create(bufferByteOffset, byteLength);
+            }
+        }
+
+        @Specialization(guards = {"!receiver.isNull()", "!receiver.isByteSequence()"})
+        static void doOther(HostObject receiver,
+                        long bufferByteOffset,
+                        byte[] destination,
+                        int destinationOffset,
+                        int byteLength,
+                        @Bind Node node,
+                        @Shared @Cached(value = "receiver.getHostClassCache()", allowUncached = true) HostClassCache hostClassCache,
+                        @Shared @Cached InlinedBranchProfile error,
+                        @Shared @Cached InlinedExactClassProfile classProfile) throws UnsupportedMessageException, InvalidBufferOffsetException {
+            if (!receiver.isBuffer(hostClassCache)) {
+                error.enter(node);
+                throw UnsupportedMessageException.create();
+            }
+            if (bufferByteOffset < 0 || Integer.MAX_VALUE < bufferByteOffset + byteLength) {
+                error.enter(node);
+                throw InvalidBufferOffsetException.create(bufferByteOffset, byteLength);
+            }
+            try {
+                final ByteBuffer buffer = (ByteBuffer) classProfile.profile(node, receiver.obj);
+                getBufferBytesBoundary(buffer, (int) bufferByteOffset, destination, destinationOffset, byteLength);
+            } catch (IndexOutOfBoundsException e) {
+                error.enter(node);
+                throw InvalidBufferOffsetException.create(bufferByteOffset, byteLength);
+            }
+        }
+    }
+
+    @TruffleBoundary
+    private static void getByteSequenceBytesBoundary(APIAccess apiAccess, Object byteSequence, int index, byte[] destination, int destinationOffset, int byteLength) {
+        System.arraycopy(apiAccess.byteSequenceToByteArray(apiAccess.byteSequenceSubSequence(byteSequence, index, byteLength)), 0, destination, destinationOffset, byteLength);
+    }
+
+    @TruffleBoundary
+    private static void getBufferBytesBoundary(ByteBuffer buffer, int index, byte[] destination, int destinationOffset, int byteLength) {
+        buffer.get(index, destination, destinationOffset, byteLength);
     }
 
     // endregion
@@ -1305,28 +1928,32 @@ final class HostObject implements TruffleObject {
 
         @Specialization(guards = "receiver.isDefaultClass()")
         static boolean doObjectCached(HostObject receiver,
-                        @Shared("lookupConstructor") @Cached LookupConstructorNode lookupConstructor) {
-            return lookupConstructor.execute(receiver, receiver.asClass()) != null;
+                        @Bind Node node,
+                        @Shared @Cached LookupConstructorNode lookupConstructor) {
+            return lookupConstructor.execute(node, receiver, receiver.asClass()) != null;
         }
     }
 
     @ExportMessage
-    boolean isExecutable(@Shared("lookupFunctionalMethod") @Cached LookupFunctionalMethodNode lookupMethod) {
-        return !isNull() && !isClass() && lookupMethod.execute(this, getLookupClass()) != null;
+    boolean isExecutable(
+                    @Bind Node node,
+                    @Shared("lookupFunctionalMethod") @Cached LookupFunctionalMethodNode lookupMethod) {
+        return !isNull() && !isClass() && lookupMethod.execute(node, this, getLookupClass()) != null;
     }
 
     @ExportMessage
     Object execute(Object[] args,
-                    @Shared("hostExecute") @Cached HostExecuteNode doExecute,
+                    @Bind Node node,
+                    @Shared @Cached HostExecuteNode hostExecute,
                     @Shared("lookupFunctionalMethod") @Cached LookupFunctionalMethodNode lookupMethod,
-                    @Shared("error") @Cached BranchProfile error) throws UnsupportedMessageException, UnsupportedTypeException, ArityException {
+                    @Shared @Cached InlinedBranchProfile error) throws UnsupportedMessageException, UnsupportedTypeException, ArityException {
         if (!isNull() && !isClass()) {
-            HostMethodDesc method = lookupMethod.execute(this, getLookupClass());
+            HostMethodDesc method = lookupMethod.execute(node, this, getLookupClass());
             if (method != null) {
-                return doExecute.execute(method, obj, args, context);
+                return hostExecute.execute(node, method, obj, args, context);
             }
         }
-        error.enter();
+        error.enter(node);
         throw UnsupportedMessageException.create();
     }
 
@@ -1341,10 +1968,11 @@ final class HostObject implements TruffleObject {
 
         @Specialization(guards = "receiver.isArrayClass()")
         static Object doArrayCached(HostObject receiver, Object[] args,
+                        @Bind Node node,
                         @CachedLibrary(limit = "1") InteropLibrary indexes,
-                        @Shared("error") @Cached BranchProfile error) throws UnsupportedMessageException, UnsupportedTypeException, ArityException {
+                        @Shared @Cached InlinedBranchProfile error) throws UnsupportedMessageException, UnsupportedTypeException, ArityException {
             if (args.length != 1) {
-                error.enter();
+                error.enter(node);
                 throw ArityException.create(1, 1, args.length);
             }
             Object arg0 = args[0];
@@ -1352,7 +1980,7 @@ final class HostObject implements TruffleObject {
             if (indexes.fitsInInt(arg0)) {
                 length = indexes.asInt(arg0);
             } else {
-                error.enter();
+                error.enter(node);
                 throw UnsupportedTypeException.create(args);
             }
             Object array = Array.newInstance(receiver.asClass().getComponentType(), length);
@@ -1361,178 +1989,659 @@ final class HostObject implements TruffleObject {
 
         @Specialization(guards = "receiver.isDefaultClass()")
         static Object doObjectCached(HostObject receiver, Object[] arguments,
-                        @Shared("lookupConstructor") @Cached LookupConstructorNode lookupConstructor,
-                        @Shared("hostExecute") @Cached HostExecuteNode executeMethod,
-                        @Shared("error") @Cached BranchProfile error) throws UnsupportedMessageException, UnsupportedTypeException, ArityException {
+                        @Bind Node node,
+                        @Shared @Cached LookupConstructorNode lookupConstructor,
+                        @Shared @Cached HostExecuteNode hostExecute,
+                        @Shared @Cached InlinedBranchProfile error) throws UnsupportedMessageException, UnsupportedTypeException, ArityException {
             assert !receiver.isArrayClass();
-            HostMethodDesc constructor = lookupConstructor.execute(receiver, receiver.asClass());
+            HostMethodDesc constructor = lookupConstructor.execute(node, receiver, receiver.asClass());
             if (constructor != null) {
-                return executeMethod.execute(constructor, null, arguments, receiver.context);
+                return hostExecute.execute(node, constructor, null, arguments, receiver.context);
             }
-            error.enter();
+            error.enter(node);
             throw UnsupportedMessageException.create();
         }
     }
 
     @ExportMessage
-    boolean isNumber(@Shared("classProfile") @Cached("createClassProfile()") ValueProfile classProfile) {
+    static class IsNumber {
+
+        @Specialization(guards = "receiver.isNull()")
+        static boolean doNull(HostObject receiver) {
+            return false;
+        }
+
+        @Specialization(guards = {"receiver.isBigInteger()"})
+        static boolean doBigInteger(HostObject receiver,
+                        @Shared @Cached(value = "receiver.getHostClassCache()", allowUncached = true) HostClassCache hostClassCache) {
+            return hostClassCache.isBigIntegerNumberAccess();
+        }
+
+        @Specialization(guards = {"!receiver.isNull()", "!receiver.isBigInteger()"})
+        static boolean doOther(HostObject receiver,
+                        @Bind Node node,
+                        @Shared @Cached InlinedExactClassProfile classProfile) {
+            Class<?> c = classProfile.profile(node, receiver.obj).getClass();
+            return c == Byte.class || c == Short.class || c == Integer.class || c == Long.class || c == Float.class || c == Double.class;
+        }
+    }
+
+    private static boolean isJavaSupportedNumber(Object value) {
+        return value instanceof Byte || value instanceof Short || value instanceof Integer || value instanceof Long || value instanceof Float || value instanceof Double || value instanceof BigInteger;
+    }
+
+    boolean isBigInteger() {
+        return CompilerDirectives.isExact(obj, BigInteger.class);
+    }
+
+    @ExportMessage
+    static class FitsInByte {
+
+        @Specialization(guards = "receiver.isNull()")
+        static boolean doNull(HostObject receiver) {
+            return false;
+        }
+
+        @Specialization(guards = {"receiver.isBigInteger()"})
+        static boolean doBigInteger(HostObject receiver,
+                        @Shared @Cached(value = "receiver.getHostClassCache()", allowUncached = true) HostClassCache hostClassCache) {
+            if (hostClassCache.isBigIntegerNumberAccess()) {
+                return receiver.bigIntegerFitsInByte();
+            } else {
+                return false;
+            }
+        }
+
+        @Specialization(guards = {"!receiver.isNull()", "!receiver.isBigInteger()"})
+        static boolean doOther(HostObject receiver,
+                        @CachedLibrary("receiver") InteropLibrary receiverLibrary,
+                        @Shared("numbers") @CachedLibrary(limit = "LIMIT") InteropLibrary numbers) {
+            if (receiverLibrary.isNumber(receiver)) {
+                return numbers.fitsInByte(receiver.obj);
+            } else {
+                return false;
+            }
+        }
+    }
+
+    @TruffleBoundary
+    boolean bigIntegerFitsInByte() {
+        return ((BigInteger) obj).bitLength() < Byte.SIZE;
+    }
+
+    @ExportMessage
+    static class FitsInShort {
+
+        @Specialization(guards = "receiver.isNull()")
+        static boolean doNull(HostObject receiver) {
+            return false;
+        }
+
+        @Specialization(guards = {"receiver.isBigInteger()"})
+        static boolean doBigInteger(HostObject receiver,
+                        @Shared @Cached(value = "receiver.getHostClassCache()", allowUncached = true) HostClassCache hostClassCache) {
+            if (hostClassCache.isBigIntegerNumberAccess()) {
+                return receiver.bigIntegerFitsInShort();
+            } else {
+                return false;
+            }
+        }
+
+        @Specialization(guards = {"!receiver.isNull()", "!receiver.isBigInteger()"})
+        static boolean doOther(HostObject receiver,
+                        @CachedLibrary("receiver") InteropLibrary receiverLibrary,
+                        @Shared("numbers") @CachedLibrary(limit = "LIMIT") InteropLibrary numbers) {
+            if (receiverLibrary.isNumber(receiver)) {
+                return numbers.fitsInShort(receiver.obj);
+            } else {
+                return false;
+            }
+        }
+    }
+
+    @TruffleBoundary
+    boolean bigIntegerFitsInShort() {
+        return ((BigInteger) obj).bitLength() < Short.SIZE;
+    }
+
+    @ExportMessage
+    static class FitsInInt {
+
+        @Specialization(guards = "receiver.isNull()")
+        static boolean doNull(HostObject receiver) {
+            return false;
+        }
+
+        @Specialization(guards = {"receiver.isBigInteger()"})
+        static boolean doBigInteger(HostObject receiver,
+                        @Shared @Cached(value = "receiver.getHostClassCache()", allowUncached = true) HostClassCache hostClassCache) {
+            if (hostClassCache.isBigIntegerNumberAccess()) {
+                return receiver.bigIntegerFitsInInt();
+            } else {
+                return false;
+            }
+        }
+
+        @Specialization(guards = {"!receiver.isNull()", "!receiver.isBigInteger()"})
+        static boolean doOther(HostObject receiver,
+                        @CachedLibrary("receiver") InteropLibrary receiverLibrary,
+                        @Shared("numbers") @CachedLibrary(limit = "LIMIT") InteropLibrary numbers) {
+            if (receiverLibrary.isNumber(receiver)) {
+                return numbers.fitsInInt(receiver.obj);
+            } else {
+                return false;
+            }
+        }
+    }
+
+    @TruffleBoundary
+    boolean bigIntegerFitsInInt() {
+        return ((BigInteger) obj).bitLength() < Integer.SIZE;
+    }
+
+    @ExportMessage
+    static class FitsInLong {
+
+        @Specialization(guards = "receiver.isNull()")
+        static boolean doNull(HostObject receiver) {
+            return false;
+        }
+
+        @Specialization(guards = {"receiver.isBigInteger()"})
+        static boolean doBigInteger(HostObject receiver,
+                        @Shared @Cached(value = "receiver.getHostClassCache()", allowUncached = true) HostClassCache hostClassCache) {
+            if (hostClassCache.isBigIntegerNumberAccess()) {
+                return receiver.bigIntegerFitsInLong();
+            } else {
+                return false;
+            }
+        }
+
+        @Specialization(guards = {"!receiver.isNull()", "!receiver.isBigInteger()"})
+        static boolean doOther(HostObject receiver,
+                        @CachedLibrary("receiver") InteropLibrary receiverLibrary,
+                        @Shared("numbers") @CachedLibrary(limit = "LIMIT") InteropLibrary numbers) {
+            if (receiverLibrary.isNumber(receiver)) {
+                return numbers.fitsInLong(receiver.obj);
+            } else {
+                return false;
+            }
+        }
+    }
+
+    @TruffleBoundary
+    boolean bigIntegerFitsInLong() {
+        return ((BigInteger) obj).bitLength() < Long.SIZE;
+    }
+
+    @ExportMessage
+    static class FitsInBigInteger {
+
+        @Specialization(guards = "receiver.isNull()")
+        static boolean doNull(HostObject receiver) {
+            return false;
+        }
+
+        @Specialization(guards = {"receiver.isBigInteger()"})
+        static boolean doBigInteger(HostObject receiver,
+                        @Shared @Cached(value = "receiver.getHostClassCache()", allowUncached = true) HostClassCache hostClassCache) {
+            return hostClassCache.isBigIntegerNumberAccess();
+        }
+
+        @Specialization(guards = {"!receiver.isNull()", "!receiver.isBigInteger()"})
+        static boolean doOther(HostObject receiver,
+                        @CachedLibrary("receiver") InteropLibrary receiverLibrary,
+                        @Shared("numbers") @CachedLibrary(limit = "LIMIT") InteropLibrary numbers) {
+            if (receiverLibrary.isNumber(receiver)) {
+                return numbers.fitsInBigInteger(receiver.obj);
+            } else {
+                return false;
+            }
+        }
+    }
+
+    @ExportMessage
+    static class FitsInFloat {
+
+        @Specialization(guards = "receiver.isNull()")
+        static boolean doNull(HostObject receiver) {
+            return false;
+        }
+
+        @Specialization(guards = {"receiver.isBigInteger()"})
+        static boolean doBigInteger(HostObject receiver,
+                        @Shared @Cached(value = "receiver.getHostClassCache()", allowUncached = true) HostClassCache hostClassCache) {
+            if (hostClassCache.isBigIntegerNumberAccess()) {
+                return receiver.bigIntegerFitsInFloat();
+            } else {
+                return false;
+            }
+        }
+
+        @Specialization(guards = {"!receiver.isNull()", "!receiver.isBigInteger()"})
+        static boolean doOther(HostObject receiver,
+                        @CachedLibrary("receiver") InteropLibrary receiverLibrary,
+                        @Shared("numbers") @CachedLibrary(limit = "LIMIT") InteropLibrary numbers) {
+            if (receiverLibrary.isNumber(receiver)) {
+                return numbers.fitsInFloat(receiver.obj);
+            } else {
+                return false;
+            }
+        }
+    }
+
+    @TruffleBoundary
+    boolean bigIntegerFitsInFloat() {
+        BigInteger b = (BigInteger) obj;
+        return bigIntegerFitsInFloat(b);
+    }
+
+    static boolean bigIntegerFitsInFloat(BigInteger b) {
+        if (b.bitLength() <= 24) { // 24 = size of float mantissa + 1
+            return true;
+        } else {
+            float floatValue = b.floatValue();
+            if (!Float.isFinite(floatValue)) {
+                return false;
+            }
+            /*
+             * The floatValue is an integer (no fractional part), because it came from a BigInteger
+             * that isn't so big to be converted to negative or positive infinity, but it might not
+             * be the same integer that was represented by the original BigInteger. We might have
+             * lost precision.
+             */
+            try {
+                return new BigDecimal(floatValue).toBigIntegerExact().equals(b);
+            } catch (ArithmeticException e) {
+                throw CompilerDirectives.shouldNotReachHere(e);
+            }
+        }
+    }
+
+    @ExportMessage
+    static class FitsInDouble {
+
+        @Specialization(guards = "receiver.isNull()")
+        static boolean doNull(HostObject receiver) {
+            return false;
+        }
+
+        @Specialization(guards = {"receiver.isBigInteger()"})
+        static boolean doBigInteger(HostObject receiver,
+                        @Shared @Cached(value = "receiver.getHostClassCache()", allowUncached = true) HostClassCache hostClassCache) {
+            if (hostClassCache.isBigIntegerNumberAccess()) {
+                return receiver.bigIntegerFitsInDouble();
+            } else {
+                return false;
+            }
+        }
+
+        @Specialization(guards = {"!receiver.isNull()", "!receiver.isBigInteger()"})
+        static boolean doOther(HostObject receiver,
+                        @CachedLibrary("receiver") InteropLibrary receiverLibrary,
+                        @Shared("numbers") @CachedLibrary(limit = "LIMIT") InteropLibrary numbers) {
+            if (receiverLibrary.isNumber(receiver)) {
+                return numbers.fitsInDouble(receiver.obj);
+            } else {
+                return false;
+            }
+        }
+    }
+
+    @TruffleBoundary
+    boolean bigIntegerFitsInDouble() {
+        BigInteger b = (BigInteger) obj;
+        return bigIntegerFitsInDouble(b);
+    }
+
+    static boolean bigIntegerFitsInDouble(BigInteger b) {
+        if (b.bitLength() <= 53) { // 53 = size of double mantissa + 1
+            return true;
+        } else {
+            double doubleValue = b.doubleValue();
+            if (!Double.isFinite(doubleValue)) {
+                return false;
+            }
+            /*
+             * The doubleValue is an integer (no fractional part), because it came from a BigInteger
+             * that isn't so big to be converted to negative or positive infinity, but it might not
+             * be the same integer that was represented by the original BigInteger. We might have
+             * lost precision.
+             */
+            try {
+                return new BigDecimal(doubleValue).toBigIntegerExact().equals(b);
+            } catch (ArithmeticException e) {
+                throw CompilerDirectives.shouldNotReachHere(e);
+            }
+        }
+    }
+
+    @ExportMessage
+    static class AsByte {
+
+        @Specialization(guards = "receiver.isNull()")
+        static byte doNull(HostObject receiver) throws UnsupportedMessageException {
+            throw UnsupportedMessageException.create();
+        }
+
+        @Specialization(guards = {"receiver.isBigInteger()"})
+        static byte doBigInteger(HostObject receiver,
+                        @Bind Node node,
+                        @Shared @Cached(value = "receiver.getHostClassCache()", allowUncached = true) HostClassCache hostClassCache,
+                        @Shared @Cached InlinedBranchProfile error) throws UnsupportedMessageException {
+            if (hostClassCache.isBigIntegerNumberAccess()) {
+                return receiver.bigIntegerAsByte();
+            } else {
+                error.enter(node);
+                throw UnsupportedMessageException.create();
+            }
+        }
+
+        @Specialization(guards = {"!receiver.isNull()", "!receiver.isBigInteger()"})
+        static byte doOther(HostObject receiver,
+                        @Bind Node node,
+                        @CachedLibrary("receiver") InteropLibrary receiverLibrary,
+                        @Shared("numbers") @CachedLibrary(limit = "LIMIT") InteropLibrary numbers,
+                        @Shared @Cached InlinedBranchProfile error) throws UnsupportedMessageException {
+            if (receiverLibrary.isNumber(receiver)) {
+                return numbers.asByte(receiver.obj);
+            } else {
+                error.enter(node);
+                throw UnsupportedMessageException.create();
+            }
+        }
+    }
+
+    @TruffleBoundary
+    byte bigIntegerAsByte() throws UnsupportedMessageException {
+        try {
+            return ((BigInteger) obj).byteValueExact();
+        } catch (ArithmeticException e) {
+            throw UnsupportedMessageException.create();
+        }
+    }
+
+    @ExportMessage
+    static class AsShort {
+
+        @Specialization(guards = "receiver.isNull()")
+        static short doNull(HostObject receiver) throws UnsupportedMessageException {
+            throw UnsupportedMessageException.create();
+        }
+
+        @Specialization(guards = {"receiver.isBigInteger()"})
+        static short doBigInteger(HostObject receiver,
+                        @Bind Node node,
+                        @Shared @Cached(value = "receiver.getHostClassCache()", allowUncached = true) HostClassCache hostClassCache,
+                        @Shared @Cached InlinedBranchProfile error) throws UnsupportedMessageException {
+            if (hostClassCache.isBigIntegerNumberAccess()) {
+                return receiver.bigIntegerAsShort();
+            } else {
+                error.enter(node);
+                throw UnsupportedMessageException.create();
+            }
+        }
+
+        @Specialization(guards = {"!receiver.isNull()", "!receiver.isBigInteger()"})
+        static short doOther(HostObject receiver,
+                        @Bind Node node,
+                        @CachedLibrary("receiver") InteropLibrary receiverLibrary,
+                        @Shared("numbers") @CachedLibrary(limit = "LIMIT") InteropLibrary numbers,
+                        @Shared @Cached InlinedBranchProfile error) throws UnsupportedMessageException {
+            if (receiverLibrary.isNumber(receiver)) {
+                return numbers.asShort(receiver.obj);
+            } else {
+                error.enter(node);
+                throw UnsupportedMessageException.create();
+            }
+        }
+    }
+
+    @TruffleBoundary
+    short bigIntegerAsShort() throws UnsupportedMessageException {
+        try {
+            return ((BigInteger) obj).shortValueExact();
+        } catch (ArithmeticException e) {
+            throw UnsupportedMessageException.create();
+        }
+    }
+
+    @ExportMessage
+    static class AsInt {
+
+        @Specialization(guards = "receiver.isNull()")
+        static int doNull(HostObject receiver) throws UnsupportedMessageException {
+            throw UnsupportedMessageException.create();
+        }
+
+        @Specialization(guards = {"receiver.isBigInteger()"})
+        static int doBigInteger(HostObject receiver,
+                        @Bind Node node,
+                        @Shared @Cached(value = "receiver.getHostClassCache()", allowUncached = true) HostClassCache hostClassCache,
+                        @Shared @Cached InlinedBranchProfile error) throws UnsupportedMessageException {
+            if (hostClassCache.isBigIntegerNumberAccess()) {
+                return receiver.bigIntegerAsInt();
+            } else {
+                error.enter(node);
+                throw UnsupportedMessageException.create();
+            }
+        }
+
+        @Specialization(guards = {"!receiver.isNull()", "!receiver.isBigInteger()"})
+        static int doOther(HostObject receiver,
+                        @Bind Node node,
+                        @CachedLibrary("receiver") InteropLibrary receiverLibrary,
+                        @Shared("numbers") @CachedLibrary(limit = "LIMIT") InteropLibrary numbers,
+                        @Shared @Cached InlinedBranchProfile error) throws UnsupportedMessageException {
+            if (receiverLibrary.isNumber(receiver)) {
+                return numbers.asInt(receiver.obj);
+            } else {
+                error.enter(node);
+                throw UnsupportedMessageException.create();
+            }
+        }
+    }
+
+    @TruffleBoundary
+    int bigIntegerAsInt() throws UnsupportedMessageException {
+        try {
+            return ((BigInteger) obj).intValueExact();
+        } catch (ArithmeticException e) {
+            throw UnsupportedMessageException.create();
+        }
+    }
+
+    @ExportMessage
+    static class AsLong {
+
+        @Specialization(guards = "receiver.isNull()")
+        static long doNull(HostObject receiver) throws UnsupportedMessageException {
+            throw UnsupportedMessageException.create();
+        }
+
+        @Specialization(guards = {"receiver.isBigInteger()"})
+        static long doBigInteger(HostObject receiver,
+                        @Bind Node node,
+                        @Shared @Cached(value = "receiver.getHostClassCache()", allowUncached = true) HostClassCache hostClassCache,
+                        @Shared @Cached InlinedBranchProfile error) throws UnsupportedMessageException {
+            if (hostClassCache.isBigIntegerNumberAccess()) {
+                return receiver.bigIntegerAsLong();
+            } else {
+                error.enter(node);
+                throw UnsupportedMessageException.create();
+            }
+        }
+
+        @Specialization(guards = {"!receiver.isNull()", "!receiver.isBigInteger()"})
+        static long doOther(HostObject receiver,
+                        @Bind Node node,
+                        @CachedLibrary("receiver") InteropLibrary receiverLibrary,
+                        @Shared("numbers") @CachedLibrary(limit = "LIMIT") InteropLibrary numbers,
+                        @Shared @Cached InlinedBranchProfile error) throws UnsupportedMessageException {
+            if (receiverLibrary.isNumber(receiver)) {
+                return numbers.asLong(receiver.obj);
+            } else {
+                error.enter(node);
+                throw UnsupportedMessageException.create();
+            }
+        }
+    }
+
+    @TruffleBoundary
+    long bigIntegerAsLong() throws UnsupportedMessageException {
+        try {
+            return ((BigInteger) obj).longValueExact();
+        } catch (ArithmeticException e) {
+            throw UnsupportedMessageException.create();
+        }
+    }
+
+    @ExportMessage
+    static class AsBigInteger {
+
+        @Specialization(guards = "receiver.isNull()")
+        static BigInteger doNull(HostObject receiver) throws UnsupportedMessageException {
+            throw UnsupportedMessageException.create();
+        }
+
+        @Specialization(guards = {"receiver.isBigInteger()"})
+        static BigInteger doBigInteger(HostObject receiver,
+                        @Bind Node node,
+                        @Shared @Cached(value = "receiver.getHostClassCache()", allowUncached = true) HostClassCache hostClassCache,
+                        @Shared @Cached InlinedBranchProfile error) throws UnsupportedMessageException {
+            if (hostClassCache.isBigIntegerNumberAccess()) {
+                return (BigInteger) receiver.obj;
+            } else {
+                error.enter(node);
+                throw UnsupportedMessageException.create();
+            }
+        }
+
+        @Specialization(guards = {"!receiver.isNull()", "!receiver.isBigInteger()"})
+        static BigInteger doOther(HostObject receiver,
+                        @Bind Node node,
+                        @CachedLibrary("receiver") InteropLibrary receiverLibrary,
+                        @Shared("numbers") @CachedLibrary(limit = "LIMIT") InteropLibrary numbers,
+                        @Shared @Cached InlinedBranchProfile error) throws UnsupportedMessageException {
+            if (receiverLibrary.isNumber(receiver)) {
+                return numbers.asBigInteger(receiver.obj);
+            } else {
+                error.enter(node);
+                throw UnsupportedMessageException.create();
+            }
+        }
+    }
+
+    @ExportMessage
+    static class AsFloat {
+
+        @Specialization(guards = "receiver.isNull()")
+        static float doNull(HostObject receiver) throws UnsupportedMessageException {
+            throw UnsupportedMessageException.create();
+        }
+
+        @Specialization(guards = {"receiver.isBigInteger()"})
+        static float doBigInteger(HostObject receiver,
+                        @Bind Node node,
+                        @Shared @Cached(value = "receiver.getHostClassCache()", allowUncached = true) HostClassCache hostClassCache,
+                        @Shared @Cached InlinedBranchProfile error) throws UnsupportedMessageException {
+            if (hostClassCache.isBigIntegerNumberAccess()) {
+                return receiver.bigIntegerAsFloat();
+            } else {
+                error.enter(node);
+                throw UnsupportedMessageException.create();
+            }
+        }
+
+        @Specialization(guards = {"!receiver.isNull()", "!receiver.isBigInteger()"})
+        static float doOther(HostObject receiver,
+                        @Bind Node node,
+                        @CachedLibrary("receiver") InteropLibrary receiverLibrary,
+                        @Shared("numbers") @CachedLibrary(limit = "LIMIT") InteropLibrary numbers,
+                        @Shared @Cached InlinedBranchProfile error) throws UnsupportedMessageException {
+            if (receiverLibrary.isNumber(receiver)) {
+                return numbers.asFloat(receiver.obj);
+            } else {
+                error.enter(node);
+                throw UnsupportedMessageException.create();
+            }
+        }
+    }
+
+    @TruffleBoundary
+    float bigIntegerAsFloat() throws UnsupportedMessageException {
+        if (bigIntegerFitsInFloat()) {
+            return ((BigInteger) obj).floatValue();
+        } else {
+            throw UnsupportedMessageException.create();
+        }
+    }
+
+    @ExportMessage
+    static class AsDouble {
+
+        @Specialization(guards = "receiver.isNull()")
+        static double doNull(HostObject receiver) throws UnsupportedMessageException {
+            throw UnsupportedMessageException.create();
+        }
+
+        @Specialization(guards = {"receiver.isBigInteger()"})
+        static double doBigInteger(HostObject receiver,
+                        @Bind Node node,
+                        @Shared @Cached(value = "receiver.getHostClassCache()", allowUncached = true) HostClassCache hostClassCache,
+                        @Shared @Cached InlinedBranchProfile error) throws UnsupportedMessageException {
+            if (hostClassCache.isBigIntegerNumberAccess()) {
+                return receiver.bigIntegerAsDouble();
+            } else {
+                error.enter(node);
+                throw UnsupportedMessageException.create();
+            }
+        }
+
+        @Specialization(guards = {"!receiver.isNull()", "!receiver.isBigInteger()"})
+        static double doOther(HostObject receiver,
+                        @Bind Node node,
+                        @CachedLibrary("receiver") InteropLibrary receiverLibrary,
+                        @Shared("numbers") @CachedLibrary(limit = "LIMIT") InteropLibrary numbers,
+                        @Shared @Cached InlinedBranchProfile error) throws UnsupportedMessageException {
+            if (receiverLibrary.isNumber(receiver)) {
+                return numbers.asDouble(receiver.obj);
+            } else {
+                error.enter(node);
+                throw UnsupportedMessageException.create();
+            }
+        }
+    }
+
+    @TruffleBoundary
+    double bigIntegerAsDouble() throws UnsupportedMessageException {
+        if (bigIntegerFitsInDouble()) {
+            return ((BigInteger) obj).doubleValue();
+        } else {
+            throw UnsupportedMessageException.create();
+        }
+    }
+
+    @ExportMessage
+    boolean isString(
+                    @Bind Node node,
+                    @Shared @Cached InlinedExactClassProfile classProfile) {
         if (isNull()) {
             return false;
         }
-
-        Class<?> c = classProfile.profile(obj).getClass();
-        return c == Byte.class || c == Short.class || c == Integer.class || c == Long.class || c == Float.class || c == Double.class;
-    }
-
-    @ExportMessage
-    boolean fitsInByte(@CachedLibrary("this") InteropLibrary thisLibrary,
-                    @Shared("numbers") @CachedLibrary(limit = "LIMIT") InteropLibrary numbers) {
-        if (thisLibrary.isNumber(this)) {
-            return numbers.fitsInByte(obj);
-        } else {
-            return false;
-        }
-    }
-
-    @ExportMessage
-    boolean fitsInShort(@CachedLibrary("this") InteropLibrary thisLibrary,
-                    @Shared("numbers") @CachedLibrary(limit = "LIMIT") InteropLibrary numbers) {
-        if (thisLibrary.isNumber(this)) {
-            return numbers.fitsInShort(obj);
-        } else {
-            return false;
-        }
-    }
-
-    @ExportMessage
-    boolean fitsInInt(@CachedLibrary("this") InteropLibrary thisLibrary,
-                    @Shared("numbers") @CachedLibrary(limit = "LIMIT") InteropLibrary numbers) {
-        if (thisLibrary.isNumber(this)) {
-            return numbers.fitsInInt(obj);
-        } else {
-            return false;
-        }
-    }
-
-    @ExportMessage
-    boolean fitsInLong(@CachedLibrary("this") InteropLibrary thisLibrary,
-                    @Shared("numbers") @CachedLibrary(limit = "LIMIT") InteropLibrary numbers) {
-        if (thisLibrary.isNumber(this)) {
-            return numbers.fitsInLong(obj);
-        } else {
-            return false;
-        }
-    }
-
-    @ExportMessage
-    boolean fitsInFloat(@CachedLibrary("this") InteropLibrary thisLibrary,
-                    @Shared("numbers") @CachedLibrary(limit = "LIMIT") InteropLibrary numbers) {
-        if (thisLibrary.isNumber(this)) {
-            return numbers.fitsInFloat(obj);
-        } else {
-            return false;
-        }
-    }
-
-    @ExportMessage
-    boolean fitsInDouble(@CachedLibrary("this") InteropLibrary thisLibrary,
-                    @Shared("numbers") @CachedLibrary(limit = "LIMIT") InteropLibrary numbers) {
-        if (thisLibrary.isNumber(this)) {
-            return numbers.fitsInDouble(obj);
-        } else {
-            return false;
-        }
-    }
-
-    @ExportMessage
-    byte asByte(@CachedLibrary("this") InteropLibrary thisLibrary,
-                    @Shared("numbers") @CachedLibrary(limit = "LIMIT") InteropLibrary numbers,
-                    @Shared("error") @Cached BranchProfile error) throws UnsupportedMessageException {
-        if (thisLibrary.isNumber(this)) {
-            return numbers.asByte(obj);
-        } else {
-            error.enter();
-            throw UnsupportedMessageException.create();
-        }
-    }
-
-    @ExportMessage
-    short asShort(@CachedLibrary("this") InteropLibrary thisLibrary,
-                    @Shared("numbers") @CachedLibrary(limit = "LIMIT") InteropLibrary numbers,
-                    @Shared("error") @Cached BranchProfile error) throws UnsupportedMessageException {
-        if (thisLibrary.isNumber(this)) {
-            return numbers.asShort(obj);
-        } else {
-            error.enter();
-            throw UnsupportedMessageException.create();
-        }
-    }
-
-    @ExportMessage
-    int asInt(@CachedLibrary("this") InteropLibrary thisLibrary,
-                    @Shared("numbers") @CachedLibrary(limit = "LIMIT") InteropLibrary numbers,
-                    @Shared("error") @Cached BranchProfile error) throws UnsupportedMessageException {
-        if (thisLibrary.isNumber(this)) {
-            return numbers.asInt(obj);
-        } else {
-            error.enter();
-            throw UnsupportedMessageException.create();
-        }
-    }
-
-    @ExportMessage
-    long asLong(@CachedLibrary("this") InteropLibrary thisLibrary,
-                    @Shared("numbers") @CachedLibrary(limit = "LIMIT") InteropLibrary numbers,
-                    @Shared("error") @Cached BranchProfile error) throws UnsupportedMessageException {
-        if (thisLibrary.isNumber(this)) {
-            return numbers.asLong(obj);
-        } else {
-            error.enter();
-            throw UnsupportedMessageException.create();
-        }
-    }
-
-    @ExportMessage
-    float asFloat(@CachedLibrary("this") InteropLibrary thisLibrary,
-                    @Shared("numbers") @CachedLibrary(limit = "LIMIT") InteropLibrary numbers,
-                    @Shared("error") @Cached BranchProfile error) throws UnsupportedMessageException {
-        if (thisLibrary.isNumber(this)) {
-            return numbers.asFloat(obj);
-        } else {
-            error.enter();
-            throw UnsupportedMessageException.create();
-        }
-    }
-
-    @ExportMessage
-    double asDouble(@CachedLibrary("this") InteropLibrary thisLibrary,
-                    @Shared("numbers") @CachedLibrary(limit = "LIMIT") InteropLibrary numbers,
-                    @Shared("error") @Cached BranchProfile error) throws UnsupportedMessageException {
-        if (thisLibrary.isNumber(this)) {
-            return numbers.asDouble(obj);
-        } else {
-            error.enter();
-            throw UnsupportedMessageException.create();
-        }
-    }
-
-    @ExportMessage
-    boolean isString(@Shared("classProfile") @Cached("createClassProfile()") ValueProfile classProfile) {
-        if (isNull()) {
-            return false;
-        }
-        Class<?> c = classProfile.profile(obj).getClass();
+        Class<?> c = classProfile.profile(node, obj).getClass();
         return c == String.class || c == Character.class;
     }
 
     @ExportMessage
-    String asString(@CachedLibrary("this") InteropLibrary thisLibrary,
+    String asString(@Bind Node node,
+                    @CachedLibrary("this") InteropLibrary thisLibrary,
                     @Shared("numbers") @CachedLibrary(limit = "LIMIT") InteropLibrary strings,
-                    @Shared("error") @Cached BranchProfile error) throws UnsupportedMessageException {
+                    @Shared @Cached InlinedBranchProfile error) throws UnsupportedMessageException {
         if (thisLibrary.isString(this)) {
             return strings.asString(obj);
         } else {
-            error.enter();
+            error.enter(node);
             throw UnsupportedMessageException.create();
         }
     }
@@ -1546,18 +2655,21 @@ final class HostObject implements TruffleObject {
     }
 
     @ExportMessage
-    boolean asBoolean(@Shared("error") @Cached BranchProfile error) throws UnsupportedMessageException {
+    boolean asBoolean(
+                    @Bind Node node,
+                    @Shared @Cached InlinedBranchProfile error) throws UnsupportedMessageException {
         if (isBoolean()) {
             return (boolean) obj;
         } else {
-            error.enter();
+            error.enter(node);
             throw UnsupportedMessageException.create();
         }
     }
 
     @ExportMessage
     boolean isDate() {
-        return obj instanceof LocalDate || obj instanceof LocalDateTime || obj instanceof Instant || obj instanceof ZonedDateTime || obj instanceof java.sql.Date || isInstantDate(obj);
+        return obj instanceof LocalDate || obj instanceof LocalDateTime || obj instanceof Instant || obj instanceof ZonedDateTime || obj instanceof OffsetDateTime || HostSqlTypes.isDate(obj) ||
+                        isInstantDate(obj);
     }
 
     @ExportMessage
@@ -1571,8 +2683,10 @@ final class HostObject implements TruffleObject {
             return ((Instant) obj).atZone(UTC).toLocalDate();
         } else if (obj instanceof ZonedDateTime) {
             return ((ZonedDateTime) obj).toLocalDate();
-        } else if (obj instanceof java.sql.Date) {
-            return ((java.sql.Date) obj).toLocalDate();
+        } else if (obj instanceof OffsetDateTime) {
+            return ((OffsetDateTime) obj).toLocalDate();
+        } else if (HostSqlTypes.isDate(obj)) {
+            return HostSqlTypes.toLocalDate(obj);
         } else if (isInstantDate(obj)) {
             return ((Date) obj).toInstant().atZone(UTC).toLocalDate();
         }
@@ -1581,7 +2695,8 @@ final class HostObject implements TruffleObject {
 
     @ExportMessage
     boolean isTime() {
-        return obj instanceof LocalTime || obj instanceof LocalDateTime || obj instanceof Instant || obj instanceof ZonedDateTime || obj instanceof java.sql.Time || isInstantDate(obj);
+        return obj instanceof LocalTime || obj instanceof LocalDateTime || obj instanceof Instant || obj instanceof ZonedDateTime || obj instanceof OffsetDateTime || obj instanceof OffsetTime ||
+                        HostSqlTypes.isTime(obj) || isInstantDate(obj);
     }
 
     @ExportMessage
@@ -1593,10 +2708,14 @@ final class HostObject implements TruffleObject {
             return ((LocalDateTime) obj).toLocalTime();
         } else if (obj instanceof ZonedDateTime) {
             return ((ZonedDateTime) obj).toLocalTime();
+        } else if (obj instanceof OffsetDateTime) {
+            return ((OffsetDateTime) obj).toLocalTime();
+        } else if (obj instanceof OffsetTime) {
+            return ((OffsetTime) obj).toLocalTime();
         } else if (obj instanceof Instant) {
             return ((Instant) obj).atZone(UTC).toLocalTime();
-        } else if (obj instanceof java.sql.Time) {
-            return ((java.sql.Time) obj).toLocalTime();
+        } else if (HostSqlTypes.isTime(obj)) {
+            return HostSqlTypes.toLocalTime(obj);
         } else if (isInstantDate(obj)) {
             return ((Date) obj).toInstant().atZone(UTC).toLocalTime();
         }
@@ -1605,16 +2724,16 @@ final class HostObject implements TruffleObject {
 
     /**
      * Returns <code>true</code> if this date object can be reliably converted to an instant.
-     * Weirdly, despite the contract of the base class the two subclasses {@link Time} and
+     * Weirdly, despite the contract of the base class the two subclasses {@link java.sql.Time} and
      * {@link java.sql.Date} are not supported to be convertable to an instant.
      */
     private static boolean isInstantDate(Object v) {
-        return v instanceof Date && !(v instanceof Time) && !(v instanceof java.sql.Date);
+        return v instanceof Date && !HostSqlTypes.isTime(v) && !HostSqlTypes.isDate(v);
     }
 
     @ExportMessage
     boolean isTimeZone() {
-        return obj instanceof ZoneId || obj instanceof Instant || obj instanceof ZonedDateTime || isInstantDate(obj);
+        return obj instanceof ZoneId || obj instanceof Instant || obj instanceof ZonedDateTime || obj instanceof OffsetDateTime || obj instanceof OffsetTime || isInstantDate(obj);
     }
 
     @ExportMessage
@@ -1623,6 +2742,10 @@ final class HostObject implements TruffleObject {
             return (ZoneId) obj;
         } else if (obj instanceof ZonedDateTime) {
             return ((ZonedDateTime) obj).getZone();
+        } else if (obj instanceof OffsetDateTime) {
+            return ((OffsetDateTime) obj).getOffset();
+        } else if (obj instanceof OffsetTime) {
+            return ((OffsetTime) obj).getOffset();
         } else if (obj instanceof Instant) {
             return UTC;
         } else if (isInstantDate(obj)) {
@@ -1636,6 +2759,8 @@ final class HostObject implements TruffleObject {
     Instant asInstant() throws UnsupportedMessageException {
         if (obj instanceof ZonedDateTime) {
             return ((ZonedDateTime) obj).toInstant();
+        } else if (obj instanceof OffsetDateTime) {
+            return ((OffsetDateTime) obj).toInstant();
         } else if (obj instanceof Instant) {
             return (Instant) obj;
         } else if (isInstantDate(obj)) {
@@ -1663,27 +2788,33 @@ final class HostObject implements TruffleObject {
     }
 
     @ExportMessage
-    ExceptionType getExceptionType(@Shared("error") @Cached BranchProfile error) throws UnsupportedMessageException {
+    ExceptionType getExceptionType(
+                    @Bind Node node,
+                    @Shared @Cached InlinedBranchProfile error) throws UnsupportedMessageException {
         if (isException()) {
             return obj instanceof InterruptedException ? ExceptionType.INTERRUPT : ExceptionType.RUNTIME_ERROR;
         }
-        error.enter();
+        error.enter(node);
         throw UnsupportedMessageException.create();
     }
 
     @ExportMessage
-    boolean isExceptionIncompleteSource(@Shared("error") @Cached BranchProfile error) throws UnsupportedMessageException {
+    boolean isExceptionIncompleteSource(
+                    @Bind Node node,
+                    @Shared @Cached InlinedBranchProfile error) throws UnsupportedMessageException {
         if (isException()) {
             return false;
         }
-        error.enter();
+        error.enter(node);
         throw UnsupportedMessageException.create();
     }
 
     @ExportMessage
     @SuppressWarnings("static-method")
-    int getExceptionExitStatus(@Shared("error") @Cached BranchProfile error) throws UnsupportedMessageException {
-        error.enter();
+    int getExceptionExitStatus(
+                    @Bind Node node,
+                    @Shared @Cached InlinedBranchProfile error) throws UnsupportedMessageException {
+        error.enter(node);
         throw UnsupportedMessageException.create();
     }
 
@@ -1695,30 +2826,40 @@ final class HostObject implements TruffleObject {
 
     @ExportMessage
     @TruffleBoundary
-    Object getExceptionMessage(@Shared("error") @Cached BranchProfile error) throws UnsupportedMessageException {
+    Object getExceptionMessage(
+                    @Bind Node node,
+                    @Shared @Cached InlinedBranchProfile error) throws UnsupportedMessageException {
         String message = isException() ? ((Throwable) obj).getMessage() : null;
         if (message != null) {
             return message;
         }
-        error.enter();
+        error.enter(node);
         throw UnsupportedMessageException.create();
     }
 
     @ExportMessage
     @TruffleBoundary
-    @SuppressWarnings("deprecation")
     boolean hasExceptionCause() {
-        return isException() && ((Throwable) obj).getCause() instanceof com.oracle.truffle.api.TruffleException;
+        if (isException()) {
+            Throwable cause = ((Throwable) obj).getCause();
+            if (cause != null) {
+                return true;
+            }
+        }
+        return false;
     }
 
     @ExportMessage
     @TruffleBoundary
-    @SuppressWarnings("deprecation")
     Object getExceptionCause() throws UnsupportedMessageException {
         if (isException()) {
             Throwable cause = ((Throwable) obj).getCause();
-            if (cause instanceof com.oracle.truffle.api.TruffleException) {
-                return cause;
+            if (cause != null) {
+                if (cause instanceof AbstractTruffleException) {
+                    return cause;
+                } else {
+                    return HostException.wrap(cause, context);
+                }
             }
         }
         throw UnsupportedMessageException.create();
@@ -1727,41 +2868,50 @@ final class HostObject implements TruffleObject {
     @ExportMessage
     @TruffleBoundary
     boolean hasExceptionStackTrace() {
-        return isException() && TruffleStackTrace.fillIn((Throwable) obj) != null;
+        if (isException()) {
+            Object hostExceptionOrOriginal = extraInfo != null ? extraInfo : obj;
+            return TruffleStackTrace.fillIn((Throwable) hostExceptionOrOriginal) != null;
+        }
+        return false;
     }
 
     @ExportMessage
     @TruffleBoundary
     Object getExceptionStackTrace() throws UnsupportedMessageException {
         if (isException()) {
-            return HostAccessor.EXCEPTION.getExceptionStackTrace(obj);
+            // Using HostException here allows us to make use of its getLocation(), if available.
+            Object hostExceptionOrOriginal = extraInfo != null ? extraInfo : obj;
+            return HostAccessor.EXCEPTION.getExceptionStackTrace((Throwable) hostExceptionOrOriginal, context.internalContext);
         }
         throw UnsupportedMessageException.create();
     }
 
     @ExportMessage
-    RuntimeException throwException(@Shared("error") @Cached BranchProfile error) throws UnsupportedMessageException {
+    RuntimeException throwException(
+                    @Bind Node node,
+                    @Shared @Cached InlinedBranchProfile error) throws UnsupportedMessageException {
         if (isException()) {
-            HostException ex = (HostException) extraInfo;
+            RuntimeException ex = (HostException) extraInfo;
             if (ex == null) {
-                ex = new HostException((Throwable) obj, context);
+                Node location = node.isAdoptable() ? node : EncapsulatingNodeReference.getCurrent().get();
+                ex = context.hostToGuestException((Throwable) obj, location);
             }
             throw ex;
         }
-        error.enter();
+        error.enter(node);
         throw UnsupportedMessageException.create();
     }
 
     @SuppressWarnings("static-method")
     @ExportMessage
-    boolean hasLanguage() {
+    boolean hasLanguageId() {
         return true;
     }
 
     @SuppressWarnings("static-method")
     @ExportMessage
-    Class<? extends TruffleLanguage<?>> getLanguage() {
-        return HostLanguage.class;
+    String getLanguageId() {
+        return HostLanguage.ID;
     }
 
     @ExportMessage
@@ -1770,27 +2920,57 @@ final class HostObject implements TruffleObject {
     }
 
     @TruffleBoundary
-    static String toStringImpl(HostContext context, Object javaObject, int level, boolean allowSideEffects) {
+    private static String toStringImpl(HostContext context, Object javaObject, int level, boolean allowSideEffects) {
         try {
             if (javaObject == null) {
                 return "null";
             } else if (javaObject.getClass().isArray()) {
                 return arrayToString(context, javaObject, level, allowSideEffects);
             } else if (javaObject instanceof Class) {
-                return ((Class<?>) javaObject).getTypeName();
+                return getTypeNameSafe((Class<?>) javaObject);
             } else {
-                if (allowSideEffects) {
-                    return Objects.toString(javaObject);
-                } else {
-                    return javaObject.getClass().getTypeName() + "@" + Integer.toHexString(System.identityHashCode(javaObject));
+                if (allowSideEffects && context != null) {
+                    Object hostObject = HostObject.forObject(javaObject, context);
+                    try {
+                        InteropLibrary thisLib = InteropLibrary.getUncached(hostObject);
+                        if (thisLib.isBoolean(hostObject)) {
+                            return Boolean.toString(thisLib.asBoolean(hostObject));
+                        } else if (thisLib.isString(hostObject)) {
+                            return thisLib.asString(hostObject);
+                        } else if (thisLib.isNumber(hostObject)) {
+                            assert isJavaSupportedNumber(javaObject) : javaObject;
+                            return javaObject.toString();
+                        } else if (thisLib.isMemberInvocable(hostObject, "toString")) {
+                            Object result = thisLib.invokeMember(hostObject, "toString");
+                            return InteropLibrary.getUncached().asString(result);
+                        }
+                    } catch (InteropException e) {
+                        // ignore exception and fall back to the !allowSideEffects version
+                    }
                 }
+                return getTypeNameSafe(javaObject.getClass());
             }
         } catch (Throwable t) {
             throw context.hostToGuestException(t);
         }
     }
 
+    /**
+     * Safe version of {@link Class#getTypeName()} that strips any hidden class suffix from the
+     * class name.
+     */
+    @TruffleBoundary
+    private static String getTypeNameSafe(Class<?> type) {
+        String typeName = type.getTypeName();
+        int slash = typeName.indexOf('/');
+        if (slash != -1) {
+            return typeName.substring(0, slash);
+        }
+        return typeName;
+    }
+
     private static String arrayToString(HostContext context, Object array, int level, boolean allowSideEffects) {
+        CompilerAsserts.neverPartOfCompilation();
         if (array == null) {
             return "null";
         }
@@ -1816,19 +2996,34 @@ final class HostObject implements TruffleObject {
     }
 
     @ExportMessage
-    boolean hasIterator(@Shared("isIterable") @Cached IsIterableNode isIterable,
-                    @Shared("isArray") @Cached IsArrayNode isArray) {
-        return isIterable.execute(this) || isArray.execute(this);
+    static class HasIterator {
+
+        @Specialization(guards = "receiver.isNull()")
+        static boolean doNull(HostObject receiver) {
+            return false;
+        }
+
+        @Specialization(guards = "!receiver.isNull()")
+        static boolean doNonNull(HostObject receiver,
+                        @Shared @Cached(value = "receiver.getHostClassCache()", allowUncached = true) HostClassCache hostClassCache) {
+            return receiver.isIterable(hostClassCache) || receiver.isArray(hostClassCache);
+        }
     }
 
     @ExportMessage
     abstract static class GetIterator {
 
-        @Specialization(guards = {"isArray.execute(receiver)"}, limit = "1")
+        @Specialization(guards = "receiver.isNull()")
+        protected static boolean doNull(HostObject receiver) throws UnsupportedMessageException {
+            throw UnsupportedMessageException.create();
+        }
+
+        @Specialization(guards = {"!receiver.isNull()", "receiver.isArray(hostClassCache)"})
         protected static Object doArray(HostObject receiver,
-                        @Shared("isArray") @Cached IsArrayNode isArray,
-                        @Shared("toGuest") @Cached ToGuestValueNode toGuest) {
-            return toGuest.execute(receiver.context, arrayIteratorImpl(receiver));
+                        @Bind Node node,
+                        @Shared @Cached(value = "receiver.getHostClassCache()", allowUncached = true) HostClassCache hostClassCache,
+                        @Shared @Cached(inline = true) ToGuestValueNode toGuest) {
+            return toGuest.execute(node, arrayIteratorImpl(receiver));
         }
 
         @TruffleBoundary
@@ -1836,54 +3031,71 @@ final class HostObject implements TruffleObject {
             return HostAccessor.INTEROP.createDefaultIterator(receiver);
         }
 
-        @Specialization(guards = {"isIterable.execute(receiver)"}, limit = "1")
+        @Specialization(guards = {"!receiver.isNull()", "receiver.isIterable(hostClassCache)"})
         protected static Object doIterable(HostObject receiver,
-                        @Shared("isIterable") @Cached IsIterableNode isIterable,
-                        @Shared("toGuest") @Cached ToGuestValueNode toGuest,
-                        @Shared("error") @Cached BranchProfile error) {
+                        @Bind Node node,
+                        @Shared @Cached(value = "receiver.getHostClassCache()", allowUncached = true) HostClassCache hostClassCache,
+                        @Shared @Cached(inline = true) ToGuestValueNode toGuest,
+                        @Shared @Cached InlinedBranchProfile error) {
             Object hostValue;
             try {
                 hostValue = GuestToHostCalls.getIterator(receiver);
             } catch (Throwable t) {
-                error.enter();
+                error.enter(node);
                 throw receiver.context.hostToGuestException(t);
             }
-            return toGuest.execute(receiver.context, hostValue);
+            return toGuest.execute(node, hostValue);
         }
 
         @SuppressWarnings("unused")
-        @Specialization(guards = {"!isArray.execute(receiver)", "!isIterable.execute(receiver)"}, limit = "1")
+        @Specialization(guards = {"!receiver.isNull()", "!receiver.isArray(hostClassCache)", "!receiver.isIterable(hostClassCache)"})
         protected static Object doNotArrayOrIterable(HostObject receiver,
-                        @Shared("isArray") @Cached IsArrayNode isArray,
-                        @Shared("isIterable") @Cached IsIterableNode isIterable) throws UnsupportedMessageException {
+                        @Shared @Cached(value = "receiver.getHostClassCache()", allowUncached = true) HostClassCache hostClassCache) throws UnsupportedMessageException {
             throw UnsupportedMessageException.create();
         }
     }
 
     @ExportMessage
-    boolean isIterator(@Shared("isIterator") @Cached IsIteratorNode isIterator) {
-        return isIterator.execute(this);
+    static class IsIterator {
+
+        @Specialization(guards = "receiver.isNull()")
+        static boolean doNull(HostObject receiver) {
+            return false;
+        }
+
+        @Specialization(guards = "!receiver.isNull()")
+        static boolean doNonNull(
+                        HostObject receiver,
+                        @Shared @Cached(value = "receiver.getHostClassCache()", allowUncached = true) HostClassCache hostClassCache) {
+            return receiver.isIteratorLocal(hostClassCache);
+        }
     }
 
     @ExportMessage
     abstract static class HasIteratorNextElement {
 
-        @Specialization(guards = {"isIterator.execute(receiver)"}, limit = "1")
+        @Specialization(guards = "receiver.isNull()")
+        protected static boolean doNull(HostObject receiver) throws UnsupportedMessageException {
+            throw UnsupportedMessageException.create();
+        }
+
+        @Specialization(guards = {"!receiver.isNull()", "receiver.isIteratorLocal(hostClassCache)"})
         protected static boolean doIterator(HostObject receiver,
-                        @Shared("isIterator") @Cached IsIteratorNode isIterator,
-                        @Shared("error") @Cached BranchProfile error) {
+                        @Bind Node node,
+                        @Shared @Cached(value = "receiver.getHostClassCache()", allowUncached = true) HostClassCache hostClassCache,
+                        @Shared @Cached InlinedBranchProfile error) {
             try {
                 return GuestToHostCalls.hasIteratorNext(receiver);
             } catch (Throwable t) {
-                error.enter();
+                error.enter(node);
                 throw receiver.context.hostToGuestException(t);
             }
         }
 
         @SuppressWarnings("unused")
-        @Specialization(guards = {"!isIterator.execute(receiver)"}, limit = "1")
+        @Specialization(guards = {"!receiver.isNull()", "!receiver.isIteratorLocal(hostClassCache)"})
         protected static boolean doNotIterator(HostObject receiver,
-                        @Shared("isIterator") @Cached IsIteratorNode isIterator) throws UnsupportedMessageException {
+                        @Shared @Cached(value = "receiver.getHostClassCache()", allowUncached = true) HostClassCache hostClassCache) throws UnsupportedMessageException {
             throw UnsupportedMessageException.create();
         }
     }
@@ -1891,56 +3103,80 @@ final class HostObject implements TruffleObject {
     @ExportMessage
     abstract static class GetIteratorNextElement {
 
-        @Specialization(guards = {"isIterator.execute(receiver)"}, limit = "1")
+        @Specialization(guards = "receiver.isNull()")
+        protected static boolean doNull(HostObject receiver) throws UnsupportedMessageException {
+            throw UnsupportedMessageException.create();
+        }
+
+        @Specialization(guards = {"!receiver.isNull()", "receiver.isIteratorLocal(hostClassCache)"})
         protected static Object doIterator(HostObject receiver,
-                        @Shared("isIterator") @Cached IsIteratorNode isIterator,
-                        @Shared("toGuest") @Cached ToGuestValueNode toGuest,
-                        @Shared("error") @Cached BranchProfile error,
-                        @Exclusive @Cached BranchProfile stopIteration) throws StopIterationException {
+                        @Bind Node node,
+                        @Shared @Cached(value = "receiver.getHostClassCache()", allowUncached = true) HostClassCache hostClassCache,
+                        @Shared @Cached(inline = true) ToGuestValueNode toGuest,
+                        @Shared @Cached InlinedBranchProfile error,
+                        @Shared @Cached InlinedBranchProfile stopIteration) throws StopIterationException {
             Object next;
             try {
                 next = GuestToHostCalls.getIteratorNext(receiver);
             } catch (NoSuchElementException e) {
-                stopIteration.enter();
+                stopIteration.enter(node);
                 throw StopIterationException.create();
             } catch (Throwable t) {
-                error.enter();
+                error.enter(node);
                 throw receiver.context.hostToGuestException(t);
             }
-            return toGuest.execute(receiver.context, next);
+            return toGuest.execute(node, next);
         }
 
         @SuppressWarnings("unused")
-        @Specialization(guards = {"!isIterator.execute(receiver)"}, limit = "1")
+        @Specialization(guards = {"!receiver.isNull()", "!receiver.isIteratorLocal(hostClassCache)"})
         protected static Object doNotIterator(HostObject receiver,
-                        @Shared("isIterator") @Cached IsIteratorNode isIterator) throws UnsupportedMessageException {
+                        @Shared @Cached(value = "receiver.getHostClassCache()", allowUncached = true) HostClassCache hostClassCache) throws UnsupportedMessageException {
             throw UnsupportedMessageException.create();
         }
     }
 
     @ExportMessage
-    boolean hasHashEntries(@Shared("isMap") @Cached IsMapNode isMap) {
-        return isMap.execute(this);
+    static class HasHashEntries {
+
+        @Specialization(guards = "receiver.isNull()")
+        static boolean doNull(HostObject receiver) {
+            return false;
+        }
+
+        @Specialization(guards = "!receiver.isNull()")
+        static boolean doNonNull(
+                        HostObject receiver,
+                        @Shared @Cached(value = "receiver.getHostClassCache()", allowUncached = true) HostClassCache hostClassCache) {
+            return receiver.isMap(hostClassCache);
+        }
     }
 
     @ExportMessage
     abstract static class GetHashSize {
 
-        @Specialization(guards = "isMap.execute(receiver)", limit = "1")
+        @Specialization(guards = "receiver.isNull()")
+        protected static long doNull(HostObject receiver) throws UnsupportedMessageException {
+            throw UnsupportedMessageException.create();
+        }
+
+        @Specialization(guards = {"!receiver.isNull()", "receiver.isMap(hostClassCache)"})
         protected static long doMap(HostObject receiver,
-                        @Shared("isMap") @Cached IsMapNode isMap,
-                        @Shared("error") @Cached BranchProfile error) {
+                        @Bind Node node,
+                        @Shared @Cached(value = "receiver.getHostClassCache()", allowUncached = true) HostClassCache hostClassCache,
+                        @Shared @Cached InlinedBranchProfile error) {
             try {
                 return GuestToHostCalls.getMapSize(receiver);
             } catch (Throwable t) {
-                error.enter();
+                error.enter(node);
                 throw receiver.context.hostToGuestException(t);
             }
         }
 
         @SuppressWarnings("unused")
-        @Specialization(guards = "!isMap.execute(receiver)", limit = "1")
-        protected static long doNotMap(HostObject receiver, @Shared("isMap") @Cached IsMapNode isMap) throws UnsupportedMessageException {
+        @Specialization(guards = {"!receiver.isNull()", "!receiver.isMap(hostClassCache)"})
+        protected static long doNotMap(HostObject receiver,
+                        @Shared @Cached(value = "receiver.getHostClassCache()", allowUncached = true) HostClassCache hostClassCache) throws UnsupportedMessageException {
             throw UnsupportedMessageException.create();
         }
     }
@@ -1948,10 +3184,21 @@ final class HostObject implements TruffleObject {
     @ExportMessage(name = "isHashEntryReadable")
     @ExportMessage(name = "isHashEntryModifiable")
     @ExportMessage(name = "isHashEntryRemovable")
-    boolean isHashEntryReadable(Object key,
-                    @Shared("isMap") @Cached IsMapNode isMap,
-                    @Shared("containsKey") @Cached ContainsKeyNode containsKey) {
-        return isMap.execute(this) && containsKey.execute(this, key);
+    static class IsHashEntryReadable {
+
+        @Specialization(guards = "receiver.isNull()")
+        static boolean doNull(HostObject receiver, Object key) {
+            return false;
+        }
+
+        @Specialization(guards = "!receiver.isNull()")
+        static boolean doNonNull(HostObject receiver,
+                        Object key,
+                        @Bind Node node,
+                        @Shared("containsKey") @Cached ContainsKeyNode containsKey,
+                        @Shared @Cached(value = "receiver.getHostClassCache()", allowUncached = true) HostClassCache hostClassCache) {
+            return receiver.isMap(hostClassCache) && containsKey.execute(node, receiver, key, hostClassCache);
+        }
     }
 
     @ExportMessage
@@ -1959,18 +3206,23 @@ final class HostObject implements TruffleObject {
 
         private static final Object UNDEFINED = new Object();
 
-        @SuppressWarnings("unchecked")
-        @Specialization(guards = "isMap.execute(receiver)", limit = "1")
+        @Specialization(guards = "receiver.isNull()")
+        protected static Object doNull(HostObject receiver, Object key) throws UnsupportedMessageException {
+            throw UnsupportedMessageException.create();
+        }
+
+        @Specialization(guards = {"!receiver.isNull()", "receiver.isMap(hostClassCache)"})
         protected static Object doMap(HostObject receiver, Object key,
-                        @Shared("isMap") @Cached IsMapNode isMap,
-                        @Shared("toHost") @Cached HostToTypeNode toHost,
-                        @Shared("toGuest") @Cached ToGuestValueNode toGuest,
-                        @Shared("error") @Cached BranchProfile error) throws UnknownKeyException {
+                        @Bind Node node,
+                        @Shared @Cached(value = "receiver.getHostClassCache()", allowUncached = true) HostClassCache hostClassCache,
+                        @Shared @Cached(inline = true) HostToTypeNode toHost,
+                        @Shared @Cached(inline = true) ToGuestValueNode toGuest,
+                        @Shared @Cached InlinedBranchProfile error) throws UnknownKeyException {
             Object hostKey;
             try {
-                hostKey = toHost.execute(receiver.context, key, Object.class, null, true);
+                hostKey = toHost.execute(node, receiver.context, key, Object.class, null, true);
             } catch (RuntimeException e) {
-                error.enter();
+                error.enter(node);
                 RuntimeException ee = unboxEngineException(receiver, e);
                 if (ee != null) {
                     throw UnknownKeyException.create(key);
@@ -1981,46 +3233,64 @@ final class HostObject implements TruffleObject {
             try {
                 hostResult = GuestToHostCalls.getMapValue(receiver, hostKey, UNDEFINED);
             } catch (Throwable t) {
-                error.enter();
+                error.enter(node);
                 throw receiver.context.hostToGuestException(t);
             }
             if (hostResult == UNDEFINED) {
-                error.enter();
+                error.enter(node);
                 throw UnknownKeyException.create(key);
             }
-            return toGuest.execute(receiver.context, hostResult);
+            return toGuest.execute(node, hostResult);
         }
 
         @SuppressWarnings("unused")
-        @Specialization(guards = "!isMap.execute(receiver)", limit = "1")
-        protected static Object doNotMap(HostObject receiver, Object key, @Shared("isMap") @Cached IsMapNode isMap) throws UnsupportedMessageException {
+        @Specialization(guards = {"!receiver.isNull()", "!receiver.isMap(hostClassCache)"})
+        protected static Object doNotMap(HostObject receiver, Object key,
+                        @Shared @Cached(value = "receiver.getHostClassCache()", allowUncached = true) HostClassCache hostClassCache) throws UnsupportedMessageException {
             throw UnsupportedMessageException.create();
         }
     }
 
     @ExportMessage
-    boolean isHashEntryInsertable(Object key,
-                    @Shared("isMap") @Cached IsMapNode isMap,
-                    @Shared("containsKey") @Cached ContainsKeyNode containsKey) {
-        return isMap.execute(this) && !containsKey.execute(this, key);
+    static class IsHashEntryInsertable {
+
+        @Specialization(guards = "receiver.isNull()")
+        static boolean doNull(HostObject receiver, Object key) {
+            return false;
+        }
+
+        @Specialization(guards = "!receiver.isNull()")
+        static boolean doNonNull(
+                        HostObject receiver,
+                        Object key,
+                        @Bind Node node,
+                        @Shared("containsKey") @Cached ContainsKeyNode containsKey,
+                        @Shared @Cached(value = "receiver.getHostClassCache()", allowUncached = true) HostClassCache hostClassCache) {
+            return receiver.isMap(hostClassCache) && !containsKey.execute(node, receiver, key, hostClassCache);
+        }
     }
 
     @ExportMessage
     abstract static class WriteHashEntry {
 
-        @SuppressWarnings("unchecked")
-        @Specialization(guards = "isMap.execute(receiver)", limit = "1")
+        @Specialization(guards = "receiver.isNull()")
+        protected static void doNull(HostObject receiver, Object key, Object value) throws UnsupportedMessageException {
+            throw UnsupportedMessageException.create();
+        }
+
+        @Specialization(guards = {"!receiver.isNull()", "receiver.isMap(hostClassCache)"})
         protected static void doMap(HostObject receiver, Object key, Object value,
-                        @Shared("isMap") @Cached IsMapNode isMap,
-                        @Shared("toHost") @Cached HostToTypeNode toHost,
-                        @Shared("error") @Cached BranchProfile error) throws UnsupportedTypeException {
+                        @Bind Node node,
+                        @Shared @Cached(value = "receiver.getHostClassCache()", allowUncached = true) HostClassCache hostClassCache,
+                        @Shared @Cached(inline = true) HostToTypeNode toHost,
+                        @Shared @Cached InlinedBranchProfile error) throws UnsupportedTypeException {
 
             Object hostKey;
             Object hostValue;
             try {
-                hostKey = toHost.execute(receiver.context, key, Object.class, null, true);
+                hostKey = toHost.execute(node, receiver.context, key, Object.class, null, true);
             } catch (RuntimeException e) {
-                error.enter();
+                error.enter(node);
                 RuntimeException ee = unboxEngineException(receiver, e);
                 if (ee != null) {
                     throw UnsupportedTypeException.create(new Object[]{key}, getMessage(ee));
@@ -2029,9 +3299,9 @@ final class HostObject implements TruffleObject {
             }
 
             try {
-                hostValue = toHost.execute(receiver.context, value, Object.class, null, true);
+                hostValue = toHost.execute(node, receiver.context, value, Object.class, null, true);
             } catch (RuntimeException e) {
-                error.enter();
+                error.enter(node);
                 RuntimeException ee = unboxEngineException(receiver, e);
                 if (ee != null) {
                     throw UnsupportedTypeException.create(new Object[]{value}, getMessage(ee));
@@ -2041,14 +3311,15 @@ final class HostObject implements TruffleObject {
             try {
                 GuestToHostCalls.putMapValue(receiver, hostKey, hostValue);
             } catch (Throwable t) {
-                error.enter();
+                error.enter(node);
                 throw receiver.context.hostToGuestException(t);
             }
         }
 
         @SuppressWarnings("unused")
-        @Specialization(guards = "!isMap.execute(receiver)", limit = "1")
-        protected static void doNotMap(HostObject receiver, Object key, Object value, @Shared("isMap") @Cached IsMapNode isMap) throws UnsupportedMessageException {
+        @Specialization(guards = {"!receiver.isNull()", "!receiver.isMap(hostClassCache)"})
+        protected static void doNotMap(HostObject receiver, Object key, Object value,
+                        @Shared @Cached(value = "receiver.getHostClassCache()", allowUncached = true) HostClassCache hostClassCache) throws UnsupportedMessageException {
             throw UnsupportedMessageException.create();
         }
     }
@@ -2056,17 +3327,22 @@ final class HostObject implements TruffleObject {
     @ExportMessage
     abstract static class RemoveHashEntry {
 
-        @SuppressWarnings("unchecked")
-        @Specialization(guards = "isMap.execute(receiver)", limit = "1")
+        @Specialization(guards = "receiver.isNull()")
+        protected static void doNull(HostObject receiver, Object key) throws UnsupportedMessageException {
+            throw UnsupportedMessageException.create();
+        }
+
+        @Specialization(guards = {"!receiver.isNull()", "receiver.isMap(hostClassCache)"})
         protected static void doMap(HostObject receiver, Object key,
-                        @Shared("isMap") @Cached IsMapNode isMap,
-                        @Shared("toHost") @Cached HostToTypeNode toHost,
-                        @Shared("error") @Cached BranchProfile error) throws UnknownKeyException {
+                        @Bind Node node,
+                        @Shared @Cached(value = "receiver.getHostClassCache()", allowUncached = true) HostClassCache hostClassCache,
+                        @Shared @Cached(inline = true) HostToTypeNode toHost,
+                        @Shared @Cached InlinedBranchProfile error) throws UnknownKeyException {
             Object hostKey;
             try {
-                hostKey = toHost.execute(receiver.context, key, Object.class, null, true);
+                hostKey = toHost.execute(node, receiver.context, key, Object.class, null, true);
             } catch (RuntimeException e) {
-                error.enter();
+                error.enter(node);
                 RuntimeException ee = unboxEngineException(receiver, e);
                 if (ee != null) {
                     throw UnknownKeyException.create(key);
@@ -2077,18 +3353,19 @@ final class HostObject implements TruffleObject {
             try {
                 removed = GuestToHostCalls.removeMapValue(receiver, hostKey);
             } catch (Throwable t) {
-                error.enter();
+                error.enter(node);
                 throw receiver.context.hostToGuestException(t);
             }
             if (!removed) {
-                error.enter();
+                error.enter(node);
                 throw UnknownKeyException.create(key);
             }
         }
 
         @SuppressWarnings("unused")
-        @Specialization(guards = "!isMap.execute(receiver)", limit = "1")
-        protected static void doNotMap(HostObject receiver, Object key, @Shared("isMap") @Cached IsMapNode isMap) throws UnsupportedMessageException {
+        @Specialization(guards = {"!receiver.isNull()", "!receiver.isMap(hostClassCache)"})
+        protected static void doNotMap(HostObject receiver, Object key,
+                        @Shared @Cached(value = "receiver.getHostClassCache()", allowUncached = true) HostClassCache hostClassCache) throws UnsupportedMessageException {
             throw UnsupportedMessageException.create();
         }
     }
@@ -2096,25 +3373,31 @@ final class HostObject implements TruffleObject {
     @ExportMessage
     abstract static class GetHashEntriesIterator {
 
-        @SuppressWarnings("unchecked")
-        @Specialization(guards = "isMap.execute(receiver)", limit = "1")
+        @Specialization(guards = "receiver.isNull()")
+        protected static Object doNull(HostObject receiver) throws UnsupportedMessageException {
+            throw UnsupportedMessageException.create();
+        }
+
+        @Specialization(guards = {"!receiver.isNull()", "receiver.isMap(hostClassCache)"})
         protected static Object doMap(HostObject receiver,
-                        @Shared("isMap") @Cached IsMapNode isMap,
-                        @Shared("toGuest") @Cached ToGuestValueNode toGuest,
-                        @Shared("error") @Cached BranchProfile error) {
+                        @Bind Node node,
+                        @Shared @Cached(value = "receiver.getHostClassCache()", allowUncached = true) HostClassCache hostClassCache,
+                        @Shared @Cached(inline = true) ToGuestValueNode toGuest,
+                        @Shared @Cached InlinedBranchProfile error) {
             Object hostValue;
             try {
                 hostValue = GuestToHostCalls.getEntriesIterator(receiver);
             } catch (Throwable t) {
-                error.enter();
+                error.enter(node);
                 throw receiver.context.hostToGuestException(t);
             }
-            return toGuest.execute(receiver.context, hostValue);
+            return toGuest.execute(node, hostValue);
         }
 
         @SuppressWarnings("unused")
-        @Specialization(guards = "!isMap.execute(receiver)", limit = "1")
-        protected static Object doNotMap(HostObject receiver, @Shared("isMap") @Cached IsMapNode isMap) throws UnsupportedMessageException {
+        @Specialization(guards = {"!receiver.isNull()", "!receiver.isMap(hostClassCache)"})
+        protected static Object doNotMap(HostObject receiver,
+                        @Shared @Cached(value = "receiver.getHostClassCache()", allowUncached = true) HostClassCache hostClassCache) throws UnsupportedMessageException {
             throw UnsupportedMessageException.create();
         }
     }
@@ -2136,20 +3419,33 @@ final class HostObject implements TruffleObject {
         }
     }
 
-    @SuppressWarnings("static-method")
     @ExportMessage
     boolean isMetaObject() {
         return isClass();
     }
 
     @ExportMessage
-    @TruffleBoundary
+    boolean isScope() {
+        return isStaticClass();
+    }
+
+    @ExportMessage
     Object getMetaQualifiedName() throws UnsupportedMessageException {
         if (isClass()) {
-            return asClass().getTypeName();
+            Class<?> theClass = asClass();
+            if (theClass.isArray()) {
+                return getArrayName(theClass);
+            } else {
+                return theClass.getName();
+            }
         } else {
             throw UnsupportedMessageException.create();
         }
+    }
+
+    @TruffleBoundary
+    private static Object getArrayName(Class<?> theClass) {
+        return theClass.getTypeName();
     }
 
     @ExportMessage
@@ -2165,23 +3461,30 @@ final class HostObject implements TruffleObject {
     @ExportMessage
     @TruffleBoundary
     boolean isMetaInstance(Object other,
-                    @CachedLibrary("this") InteropLibrary library,
-                    @Shared("error") @Cached BranchProfile error) throws UnsupportedMessageException {
+                    @Bind Node node,
+                    @Shared @Cached InlinedBranchProfile error) throws UnsupportedMessageException {
         if (isClass()) {
             Class<?> c = asClass();
-            HostLanguage language = context != null ? HostLanguage.get(library) : null;
-            if (HostObject.isInstance(language, other)) {
-                Object otherHostObj = HostObject.valueOf(language, other);
+            HostLanguage language = context != null ? HostLanguage.get(node) : null;
+            InteropLibrary otherInterop = InteropLibrary.getUncached(other);
+            if (otherInterop.isHostObject(other)) {
+                Object otherHostObj;
+                try {
+                    otherHostObj = otherInterop.asHostObject(other);
+                } catch (HeapIsolationException e) {
+                    error.enter(node);
+                    throw UnsupportedMessageException.create();
+                }
                 if (otherHostObj == null) {
                     return false;
                 } else {
                     return c.isInstance(otherHostObj);
                 }
             } else if (HostProxy.isProxyGuestObject(language, other)) {
-                Proxy otherHost = HostProxy.toProxyHostObject(language, other);
+                Object otherHost = HostProxy.toProxyHostObject(language, other);
                 return c.isInstance(otherHost);
             } else {
-                boolean canConvert = HostToTypeNode.canConvert(other, c, c,
+                boolean canConvert = HostToTypeNode.canConvert(null, other, c, c,
                                 HostToTypeNode.allowsImplementation(context, c),
                                 context, HostToTypeNode.LOWEST,
                                 InteropLibrary.getFactory().getUncached(other),
@@ -2189,9 +3492,88 @@ final class HostObject implements TruffleObject {
                 return canConvert;
             }
         } else {
-            error.enter();
+            error.enter(node);
             throw UnsupportedMessageException.create();
         }
+    }
+
+    @ExportMessage
+    @TruffleBoundary
+    boolean hasMetaParents() {
+        return isClass() && (asClass().getSuperclass() != null || asClass().getInterfaces().length > 0);
+    }
+
+    @ExportMessage
+    @TruffleBoundary
+    Object getMetaParents() throws UnsupportedMessageException {
+        if (!hasMetaParents()) {
+            throw UnsupportedMessageException.create();
+        }
+        Class<?> superClass = asClass().getSuperclass();
+        Class<?>[] interfaces = asClass().getInterfaces();
+        HostObject[] metaObjects = new HostObject[superClass == null ? interfaces.length : interfaces.length + 1];
+
+        int i = 0;
+        if (superClass != null) {
+            metaObjects[i++] = HostObject.forClass(superClass, context);
+        }
+        for (int j = 0; j < interfaces.length; j++) {
+            metaObjects[i++] = HostObject.forClass(interfaces[j], context);
+        }
+        return new TypesArray(metaObjects);
+    }
+
+    @ExportLibrary(InteropLibrary.class)
+    static final class TypesArray implements TruffleObject {
+
+        @CompilationFinal(dimensions = 1) private final HostObject[] types;
+
+        TypesArray(HostObject[] types) {
+            this.types = types;
+        }
+
+        @SuppressWarnings("static-method")
+        @ExportMessage
+        boolean hasArrayElements() {
+            return true;
+        }
+
+        @ExportMessage
+        long getArraySize() {
+            return types.length;
+        }
+
+        @ExportMessage
+        boolean isArrayElementReadable(long idx) {
+            return 0 <= idx && idx < types.length;
+        }
+
+        @ExportMessage
+        Object readArrayElement(long idx,
+                        @Bind Node node,
+                        @Cached InlinedBranchProfile error) throws InvalidArrayIndexException {
+            if (!isArrayElementReadable(idx)) {
+                error.enter(node);
+                throw InvalidArrayIndexException.create(idx);
+            }
+            return types[(int) idx];
+        }
+    }
+
+    @ExportMessage
+    boolean hasStaticScope() {
+        return isMetaObject();
+    }
+
+    @ExportMessage
+    Object getStaticScope(
+                    @Bind Node node,
+                    @Shared("error") @Cached InlinedBranchProfile error) throws UnsupportedMessageException {
+        if (!hasStaticScope()) {
+            error.enter(node);
+            throw UnsupportedMessageException.create();
+        }
+        return HostObject.forStaticClass((Class<?>) obj, context);
     }
 
     boolean isStaticClass() {
@@ -2225,6 +3607,7 @@ final class HostObject implements TruffleObject {
         }
     }
 
+    @NeverDefault
     HostClassCache getHostClassCache() {
         assert context != null : "host cache must not be used for null";
         return HostClassCache.forInstance(this);
@@ -2234,7 +3617,7 @@ final class HostObject implements TruffleObject {
     static final class IsIdenticalOrUndefined {
         @Specialization
         static TriState doHostObject(HostObject receiver, HostObject other) {
-            return receiver.obj == other.obj ? TriState.TRUE : TriState.FALSE;
+            return TriState.valueOf(receiver.obj == other.obj && receiver.isStaticClass() == other.isStaticClass());
         }
 
         @Fallback
@@ -2248,11 +3631,22 @@ final class HostObject implements TruffleObject {
         return System.identityHashCode(receiver.obj);
     }
 
+    @ExportMessage
+    @SuppressWarnings("static-method")
+    boolean isHostObject() {
+        return true;
+    }
+
+    @ExportMessage
+    Object asHostObject() {
+        return this.obj;
+    }
+
     @Override
     public boolean equals(Object o) {
         if (o instanceof HostObject) {
             HostObject other = (HostObject) o;
-            return this.obj == other.obj && this.context == other.context;
+            return this.obj == other.obj && this.extraInfo == other.extraInfo && this.context == other.context;
         }
         return false;
     }
@@ -2269,9 +3663,11 @@ final class HostObject implements TruffleObject {
     }
 
     @GenerateUncached
+    @GenerateInline
+    @GenerateCached(false)
     abstract static class ArraySet extends Node {
 
-        protected abstract void execute(Object array, int index, Object value);
+        protected abstract void execute(Node node, Object array, int index, Object value);
 
         @Specialization
         static void doBoolean(boolean[] array, int index, boolean value) {
@@ -2320,9 +3716,11 @@ final class HostObject implements TruffleObject {
     }
 
     @GenerateUncached
+    @GenerateInline
+    @GenerateCached(false)
     abstract static class ArrayGet extends Node {
 
-        protected abstract Object execute(Object array, int index);
+        protected abstract Object execute(Node node, Object array, int index);
 
         @Specialization
         static boolean doBoolean(boolean[] array, int index) {
@@ -2371,13 +3769,15 @@ final class HostObject implements TruffleObject {
     }
 
     @GenerateUncached
+    @GenerateInline
+    @GenerateCached(false)
     abstract static class LookupConstructorNode extends Node {
         static final int LIMIT = 3;
 
         LookupConstructorNode() {
         }
 
-        public abstract HostMethodDesc execute(HostObject receiver, Class<?> clazz);
+        public abstract HostMethodDesc execute(Node node, HostObject receiver, Class<?> clazz);
 
         @SuppressWarnings("unused")
         @Specialization(guards = {"clazz == cachedClazz"}, limit = "LIMIT")
@@ -2396,13 +3796,15 @@ final class HostObject implements TruffleObject {
     }
 
     @GenerateUncached
+    @GenerateInline
+    @GenerateCached(false)
     abstract static class LookupFieldNode extends Node {
         static final int LIMIT = 3;
 
         LookupFieldNode() {
         }
 
-        public abstract HostFieldDesc execute(HostObject receiver, Class<?> clazz, String name, boolean onlyStatic);
+        public abstract HostFieldDesc execute(Node node, HostObject receiver, Class<?> clazz, String name, boolean onlyStatic);
 
         @SuppressWarnings("unused")
         @Specialization(guards = {"onlyStatic == cachedStatic", "clazz == cachedClazz", "cachedName.equals(name)"}, limit = "LIMIT")
@@ -2423,13 +3825,55 @@ final class HostObject implements TruffleObject {
     }
 
     @GenerateUncached
+    @GenerateInline
+    @GenerateCached(false)
+    abstract static class LookupThisFieldNode extends Node {
+        static final int LIMIT = 3;
+
+        LookupThisFieldNode() {
+        }
+
+        public abstract HostFieldDesc execute(Node node, HostObject receiver, Class<?> clazz);
+
+        @SuppressWarnings("unused")
+        @Specialization(guards = {"receiver.isStaticClass() == cachedStatic", "receiver.isClass() == cachedClass", "clazz == cachedClazz"}, limit = "LIMIT")
+        HostFieldDesc doCached(HostObject receiver, Class<?> clazz,
+                        @Cached("receiver.isStaticClass()") boolean cachedStatic,
+                        @Cached("receiver.isClass()") boolean cachedClass,
+                        @Cached("clazz") Class<?> cachedClazz,
+                        @Cached("doUncached(receiver, clazz)") HostFieldDesc cachedField) {
+            assert cachedField == doUncached(receiver, clazz);
+            return cachedField;
+        }
+
+        @Specialization(replaces = "doCached")
+        @TruffleBoundary
+        HostFieldDesc doUncached(HostObject receiver, Class<?> clazz) {
+            return lookupThisField(receiver, clazz);
+        }
+
+        @TruffleBoundary
+        static HostFieldDesc lookupThisField(HostObject receiver, Class<?> clazz) {
+            if (receiver.isNull() || receiver.isClass() || receiver.isStaticClass()) {
+                return null;
+            }
+            if (!HostAdapterFactory.isAdapterInstance(receiver.obj)) {
+                return null;
+            }
+            return HostClassDesc.forClass(receiver.context, clazz).lookupField(HostInteropReflect.ADAPTER_DELEGATE_MEMBER, false);
+        }
+    }
+
+    @GenerateUncached
+    @GenerateInline
+    @GenerateCached(false)
     abstract static class LookupFunctionalMethodNode extends Node {
         static final int LIMIT = 3;
 
         LookupFunctionalMethodNode() {
         }
 
-        public abstract HostMethodDesc execute(HostObject object, Class<?> clazz);
+        public abstract HostMethodDesc execute(Node node, HostObject object, Class<?> clazz);
 
         @SuppressWarnings("unused")
         @Specialization(guards = {"clazz == cachedClazz"}, limit = "LIMIT")
@@ -2448,13 +3892,15 @@ final class HostObject implements TruffleObject {
     }
 
     @GenerateUncached
+    @GenerateInline
+    @GenerateCached(false)
     abstract static class LookupInnerClassNode extends Node {
         static final int LIMIT = 3;
 
         LookupInnerClassNode() {
         }
 
-        public abstract Class<?> execute(Class<?> outerclass, String name);
+        public abstract Class<?> execute(Node node, Class<?> outerclass, String name);
 
         @SuppressWarnings("unused")
         @Specialization(guards = {"clazz == cachedClazz", "cachedName.equals(name)"}, limit = "LIMIT")
@@ -2474,13 +3920,15 @@ final class HostObject implements TruffleObject {
     }
 
     @GenerateUncached
+    @GenerateInline
+    @GenerateCached(false)
     abstract static class LookupMethodNode extends Node {
         static final int LIMIT = 3;
 
         LookupMethodNode() {
         }
 
-        public abstract HostMethodDesc execute(HostObject receiver, Class<?> clazz, String name, boolean onlyStatic);
+        public abstract HostMethodDesc execute(Node node, HostObject receiver, Class<?> clazz, String name, boolean onlyStatic);
 
         @SuppressWarnings("unused")
         @Specialization(guards = {"onlyStatic == cachedStatic", "clazz == cachedClazz", "cachedName.equals(name)"}, limit = "LIMIT")
@@ -2501,56 +3949,59 @@ final class HostObject implements TruffleObject {
     }
 
     @GenerateUncached
+    @GenerateInline
+    @GenerateCached(false)
     abstract static class ReadFieldNode extends Node {
         static final int LIMIT = 3;
 
         ReadFieldNode() {
         }
 
-        public abstract Object execute(HostFieldDesc field, HostObject object);
+        public abstract Object execute(Node node, HostFieldDesc field, HostObject object);
 
         @SuppressWarnings("unused")
         @Specialization(guards = {"field == cachedField"}, limit = "LIMIT")
-        static Object doCached(HostFieldDesc field, HostObject object,
+        static Object doCached(Node node, HostFieldDesc field, HostObject object,
                         @Cached("field") HostFieldDesc cachedField,
                         @Cached ToGuestValueNode toGuest) {
             Object val = cachedField.get(object.obj);
-            return toGuest.execute(object.context, val);
+            return toGuest.execute(node, val);
         }
 
         @Specialization(replaces = "doCached")
         @TruffleBoundary
-        static Object doUncached(HostFieldDesc field, HostObject object,
-                        @Cached ToGuestValueNode toGuest) {
+        static Object doUncached(HostFieldDesc field, HostObject object) {
             Object val = field.get(object.obj);
-            return toGuest.execute(object.context, val);
+            return ToGuestValueNodeGen.getUncached().execute(null, val);
         }
     }
 
     @GenerateUncached
+    @GenerateInline
+    @GenerateCached(false)
     abstract static class WriteFieldNode extends Node {
         static final int LIMIT = 3;
 
         WriteFieldNode() {
         }
 
-        public abstract void execute(HostFieldDesc field, HostObject object, Object value) throws UnsupportedTypeException, UnknownIdentifierException;
+        public abstract void execute(Node node, HostFieldDesc field, HostObject object, Object value) throws UnsupportedTypeException, UnknownIdentifierException;
 
         @SuppressWarnings("unused")
         @Specialization(guards = {"field == cachedField"}, limit = "LIMIT")
-        static void doCached(HostFieldDesc field, HostObject object, Object rawValue,
+        static void doCached(Node node, HostFieldDesc field, HostObject object, Object rawValue,
                         @Cached("field") HostFieldDesc cachedField,
                         @Cached HostToTypeNode toHost,
-                        @Cached BranchProfile error) throws UnsupportedTypeException, UnknownIdentifierException {
+                        @Cached InlinedBranchProfile error) throws UnsupportedTypeException, UnknownIdentifierException {
             if (field.isFinal()) {
-                error.enter();
+                error.enter(node);
                 throw UnknownIdentifierException.create(field.getName());
             }
             try {
-                Object value = toHost.execute(object.context, rawValue, cachedField.getType(), cachedField.getGenericType(), true);
+                Object value = toHost.execute(node, object.context, rawValue, cachedField.getType(), cachedField.getGenericType(), true);
                 cachedField.set(object.obj, value);
             } catch (RuntimeException e) {
-                error.enter();
+                error.enter(node);
                 RuntimeException ee = unboxEngineException(object, e);
                 if (ee != null) {
                     throw HostInteropErrors.unsupportedTypeException(rawValue, ee);
@@ -2561,13 +4012,12 @@ final class HostObject implements TruffleObject {
 
         @Specialization(replaces = "doCached")
         @TruffleBoundary
-        static void doUncached(HostFieldDesc field, HostObject object, Object rawValue,
-                        @Cached HostToTypeNode toHost) throws UnsupportedTypeException, UnknownIdentifierException {
+        static void doUncached(HostFieldDesc field, HostObject object, Object rawValue) throws UnsupportedTypeException, UnknownIdentifierException {
             if (field.isFinal()) {
                 throw UnknownIdentifierException.create(field.getName());
             }
             try {
-                Object val = toHost.execute(object.context, rawValue, field.getType(), field.getGenericType(), true);
+                Object val = HostToTypeNodeGen.getUncached().execute(null, object.context, rawValue, field.getType(), field.getGenericType(), true);
                 field.set(object.obj, val);
             } catch (RuntimeException e) {
                 RuntimeException ee = unboxEngineException(object, e);
@@ -2579,132 +4029,54 @@ final class HostObject implements TruffleObject {
         }
     }
 
-    @GenerateUncached
-    abstract static class IsListNode extends Node {
+    boolean isList(HostClassCache hostClassCache) {
+        return hostClassCache.isListAccess() && obj instanceof List;
+    }
 
-        public abstract boolean execute(HostObject receiver);
+    boolean isArray(HostClassCache hostClassCache) {
+        return hostClassCache.isArrayAccess() && obj.getClass().isArray();
+    }
 
-        @Specialization(guards = "receiver.obj == null")
-        public boolean doNull(HostObject receiver) {
-            return false;
-        }
+    boolean isBuffer(HostClassCache hostClassCache) {
+        return hostClassCache.isBufferAccess() && ByteBuffer.class.isAssignableFrom(obj.getClass());
+    }
 
-        @Specialization(guards = "receiver.obj != null")
-        public boolean doDefault(HostObject receiver,
-                        @Cached(value = "receiver.getHostClassCache().isListAccess()", allowUncached = true) boolean isListAccess) {
-            assert receiver.getHostClassCache().isListAccess() == isListAccess;
-            return isListAccess && receiver.obj instanceof List;
-        }
+    boolean isIterable(HostClassCache hostClassCache) {
+        return hostClassCache.isIterableAccess() && obj instanceof Iterable;
+    }
 
+    /**
+     * This method cannot be called "isIterator: because it would conflict with an interop library
+     * message name.
+     */
+    boolean isIteratorLocal(HostClassCache hostClassCache) {
+        return hostClassCache.isIteratorAccess() && obj instanceof Iterator;
+    }
+
+    boolean isMap(HostClassCache hostClassCache) {
+        return hostClassCache.isMapAccess() && obj instanceof Map;
+    }
+
+    boolean isMapEntry(HostClassCache hostClassCache) {
+        return hostClassCache.isMapAccess() && obj instanceof Map.Entry;
     }
 
     @GenerateUncached
-    abstract static class IsArrayNode extends Node {
-
-        public abstract boolean execute(HostObject receiver);
-
-        @Specialization(guards = "receiver.obj == null")
-        public boolean doNull(HostObject receiver) {
-            return false;
-        }
-
-        @Specialization(guards = "receiver.obj != null")
-        public boolean doDefault(HostObject receiver,
-                        @Cached(value = "receiver.getHostClassCache().isArrayAccess()", allowUncached = true) boolean isArrayAccess) {
-            assert receiver.getHostClassCache().isArrayAccess() == isArrayAccess;
-            return isArrayAccess && receiver.obj.getClass().isArray();
-        }
-
-    }
-
-    @GenerateUncached
-    abstract static class IsBufferNode extends Node {
-
-        public abstract boolean execute(HostObject receiver);
-
-        @Specialization(guards = "receiver.obj == null")
-        public boolean doNull(HostObject receiver) {
-            return false;
-        }
-
-        @Specialization(guards = "receiver.obj != null")
-        public boolean doDefault(HostObject receiver,
-                        @Cached(value = "receiver.getHostClassCache().isBufferAccess()", allowUncached = true) boolean isBufferAccess) {
-            assert receiver.getHostClassCache().isBufferAccess() == isBufferAccess;
-            return isBufferAccess && ByteBuffer.class.isAssignableFrom(receiver.obj.getClass());
-        }
-
-    }
-
-    @GenerateUncached
-    abstract static class IsIterableNode extends Node {
-
-        public abstract boolean execute(HostObject receiver);
-
-        @Specialization(guards = "receiver.obj == null")
-        public boolean doNull(HostObject receiver) {
-            return false;
-        }
-
-        @Specialization(guards = "receiver.obj != null")
-        public boolean doDefault(HostObject receiver,
-                        @Cached(value = "receiver.getHostClassCache().isIterableAccess()", allowUncached = true) boolean isIterableAccess) {
-            assert receiver.getHostClassCache().isIterableAccess() == isIterableAccess;
-            return isIterableAccess && receiver.obj instanceof Iterable;
-        }
-    }
-
-    @GenerateUncached
-    abstract static class IsIteratorNode extends Node {
-
-        public abstract boolean execute(HostObject receiver);
-
-        @Specialization(guards = "receiver.obj == null")
-        public boolean doNull(HostObject receiver) {
-            return false;
-        }
-
-        @Specialization(guards = "receiver.obj != null")
-        public boolean doDefault(HostObject receiver,
-                        @Cached(value = "receiver.getHostClassCache().isIteratorAccess()", allowUncached = true) boolean isIteratorAccess) {
-            assert receiver.getHostClassCache().isIteratorAccess() == isIteratorAccess;
-            return isIteratorAccess && receiver.obj instanceof Iterator;
-        }
-    }
-
-    @GenerateUncached
-    abstract static class IsMapNode extends Node {
-
-        public abstract boolean execute(HostObject receiver);
-
-        @Specialization(guards = "receiver.obj == null")
-        public boolean doNull(HostObject receiver) {
-            return false;
-        }
-
-        @Specialization(guards = "receiver.obj != null")
-        public boolean doDefault(HostObject receiver,
-                        @Cached(value = "receiver.getHostClassCache().isMapAccess()", allowUncached = true) boolean isMapAccess) {
-            assert receiver.getHostClassCache().isMapAccess() == isMapAccess;
-            return isMapAccess && receiver.obj instanceof Map;
-        }
-    }
-
-    @GenerateUncached
+    @GenerateInline
+    @GenerateCached(false)
     abstract static class ContainsKeyNode extends Node {
 
-        public abstract boolean execute(HostObject receiver, Object key);
+        public abstract boolean execute(Node node, HostObject receiver, Object key, HostClassCache hostClassCache);
 
-        @Specialization(guards = "isMap.execute(receiver)", limit = "1")
-        protected static boolean doMap(HostObject receiver, Object key,
-                        @Shared("isMap") @Cached IsMapNode isMap,
+        @Specialization(guards = {"!receiver.isNull()", "receiver.isMap(hostClassCache)"})
+        protected static boolean doMap(Node node, HostObject receiver, Object key, HostClassCache hostClassCache,
                         @Cached HostToTypeNode toHost,
-                        @Cached BranchProfile error) {
+                        @Cached InlinedBranchProfile error) {
             Object hostKey;
             try {
-                hostKey = toHost.execute(receiver.context, key, Object.class, null, true);
+                hostKey = toHost.execute(node, receiver.context, key, Object.class, null, true);
             } catch (RuntimeException e) {
-                error.enter();
+                error.enter(node);
                 RuntimeException ee = unboxEngineException(receiver, e);
                 if (ee != null) {
                     return false;
@@ -2714,33 +4086,15 @@ final class HostObject implements TruffleObject {
             try {
                 return GuestToHostCalls.containsMapKey(receiver, hostKey);
             } catch (Throwable t) {
-                error.enter();
+                error.enter(node);
                 throw receiver.context.hostToGuestException(t);
             }
         }
 
         @SuppressWarnings("unused")
-        @Specialization(guards = "!isMap.execute(receiver)", limit = "1")
-        protected static boolean doNotMap(HostObject receiver, Object key, @Shared("isMap") @Cached IsMapNode isMap) {
+        @Specialization(guards = {"!receiver.isNull()", "!receiver.isMap(hostClassCache)"})
+        protected static boolean doNotMap(Node node, HostObject receiver, Object key, HostClassCache hostClassCache) {
             return false;
-        }
-    }
-
-    @GenerateUncached
-    abstract static class IsMapEntryNode extends Node {
-
-        public abstract boolean execute(HostObject receiver);
-
-        @Specialization(guards = "receiver.obj == null")
-        public boolean doNull(HostObject receiver) {
-            return false;
-        }
-
-        @Specialization(guards = "receiver.obj != null")
-        public boolean doDefault(HostObject receiver,
-                        @Cached(value = "receiver.getHostClassCache().isMapAccess()", allowUncached = true) boolean isMapAccess) {
-            assert receiver.getHostClassCache().isMapAccess() == isMapAccess;
-            return isMapAccess && receiver.obj instanceof Map.Entry;
         }
     }
 
@@ -2749,8 +4103,7 @@ final class HostObject implements TruffleObject {
      * which can throw an exception the call must be done in the {@link GuestToHostCalls} to
      * correctly merge host an guest stack frames.
      *
-     * @see PolyglotExceptionImpl.MergedHostGuestIterator#isGuestToHost(StackTraceElement,
-     *      StackTraceElement[], int)
+     * @see AbstractPolyglotImpl.AbstractHostLanguageService#isGuestToHostCallFromHostInterop(StackTraceElement)
      */
     abstract static class GuestToHostCalls {
 

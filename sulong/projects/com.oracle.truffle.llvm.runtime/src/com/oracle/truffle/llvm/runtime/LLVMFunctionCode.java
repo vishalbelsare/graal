@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2019, 2021, Oracle and/or its affiliates.
+ * Copyright (c) 2019, 2026, Oracle and/or its affiliates.
  *
  * All rights reserved.
  *
@@ -32,6 +32,8 @@ package com.oracle.truffle.llvm.runtime;
 import java.util.HashMap;
 import java.util.Map;
 
+import org.graalvm.collections.EconomicMap;
+
 import com.oracle.truffle.api.Assumption;
 import com.oracle.truffle.api.CallTarget;
 import com.oracle.truffle.api.CompilerAsserts;
@@ -42,6 +44,7 @@ import com.oracle.truffle.api.RootCallTarget;
 import com.oracle.truffle.api.Truffle;
 import com.oracle.truffle.api.dsl.Fallback;
 import com.oracle.truffle.api.dsl.GenerateUncached;
+import com.oracle.truffle.api.dsl.Idempotent;
 import com.oracle.truffle.api.dsl.Specialization;
 import com.oracle.truffle.api.frame.VirtualFrame;
 import com.oracle.truffle.api.interop.InteropLibrary;
@@ -83,6 +86,7 @@ public final class LLVMFunctionCode {
     private final LLVMFunction llvmFunction;
 
     private volatile CallTarget cachedNativeWrapperFactory;
+    private volatile EconomicMap<String, CallTarget> cachedAltBackendNativeWrapperFactory;
 
     public LLVMFunctionCode(LLVMFunction llvmFunction) {
         this.llvmFunction = llvmFunction;
@@ -102,7 +106,9 @@ public final class LLVMFunctionCode {
         }
 
         private static long tagSulongFunctionPointer(int id) {
-            return id | SULONG_FUNCTION_POINTER_TAG;
+            // Keep synthetic function pointers aligned. The Itanium C++ ABI uses bit 0 of a
+            // member function pointer to distinguish virtual functions from direct addresses.
+            return (Integer.toUnsignedLong(id) << 1) | SULONG_FUNCTION_POINTER_TAG;
         }
 
         @Override
@@ -112,10 +118,10 @@ public final class LLVMFunctionCode {
         }
     }
 
-    private CallTarget createNativeWrapperFactory(NativeContextExtension nativeExt) {
+    private CallTarget createNativeWrapperFactory(NativeContextExtension nativeExt, String backend) {
         CallTarget ret = null;
         if (nativeExt != null) {
-            ret = nativeExt.createNativeWrapperFactory(this);
+            ret = nativeExt.createNativeWrapperFactory(this, backend);
         }
         if (ret == null) {
             // either no native access, or signature is unsupported
@@ -125,19 +131,60 @@ public final class LLVMFunctionCode {
         return ret;
     }
 
-    private synchronized void initNativeWrapperFactory(NativeContextExtension nativeExt) {
-        if (cachedNativeWrapperFactory == null) {
-            cachedNativeWrapperFactory = createNativeWrapperFactory(nativeExt);
+    private synchronized void initNativeWrapperFactory(NativeContextExtension nativeExt, String backend) {
+        if (backend == null) {
+            if (cachedNativeWrapperFactory == null) {
+                cachedNativeWrapperFactory = createNativeWrapperFactory(nativeExt, null);
+            }
+        } else {
+            if (cachedAltBackendNativeWrapperFactory == null) {
+                cachedAltBackendNativeWrapperFactory = EconomicMap.create();
+            }
+            if (!cachedAltBackendNativeWrapperFactory.containsKey(backend)) {
+                cachedAltBackendNativeWrapperFactory.put(backend, createNativeWrapperFactory(nativeExt, backend));
+            }
         }
     }
 
     CallTarget getNativeWrapperFactory(NativeContextExtension nativeExt) {
         CompilerAsserts.neverPartOfCompilation();
         if (cachedNativeWrapperFactory == null) {
-            initNativeWrapperFactory(nativeExt);
+            initNativeWrapperFactory(nativeExt, null);
         }
         assert cachedNativeWrapperFactory != null;
         return cachedNativeWrapperFactory;
+    }
+
+    CallTarget getAltBackendNativeWrapperFactory(NativeContextExtension nativeExt, String backend) {
+        CompilerAsserts.neverPartOfCompilation();
+        if (cachedAltBackendNativeWrapperFactory == null || !cachedAltBackendNativeWrapperFactory.containsKey(backend)) {
+            initNativeWrapperFactory(nativeExt, backend);
+        }
+        assert cachedAltBackendNativeWrapperFactory.containsKey(backend);
+        return cachedAltBackendNativeWrapperFactory.get(backend);
+    }
+
+    private volatile boolean nativeSignatureInitialized;
+    private String nativeSignature;
+
+    @TruffleBoundary
+    private synchronized void initNativeSignature() {
+        if (!nativeSignatureInitialized) {
+            NativeContextExtension nativeContextExtension = LLVMLanguage.getContext().getContextExtensionOrNull(NativeContextExtension.class);
+            if (nativeContextExtension == null) {
+                nativeSignature = null;
+            } else {
+                nativeSignature = nativeContextExtension.getNativeSignature(llvmFunction.getType());
+            }
+            nativeSignatureInitialized = true;
+        }
+    }
+
+    public String getNativeSignature() {
+        if (!nativeSignatureInitialized) {
+            initNativeSignature();
+        }
+        return nativeSignature;
     }
 
     public static final class Intrinsic {
@@ -159,6 +206,11 @@ public final class LLVMFunctionCode {
             } else {
                 return generateTarget(type);
             }
+        }
+
+        @TruffleBoundary
+        public RootCallTarget cachedCallTargetSlowPath(FunctionType type) {
+            return cachedCallTarget(type);
         }
 
         public LLVMExpressionNode createIntrinsicNode(LLVMExpressionNode[] arguments, Type[] argTypes) {
@@ -361,11 +413,13 @@ public final class LLVMFunctionCode {
         }
     }
 
+    @Idempotent
     public boolean isLLVMIRFunction() {
         final LLVMFunctionCode.Function currentFunction = getFunction();
         return currentFunction instanceof LLVMFunctionCode.LLVMIRFunction || currentFunction instanceof LLVMFunctionCode.LazyLLVMIRFunction;
     }
 
+    @Idempotent
     public boolean isIntrinsicFunctionSlowPath() {
         CompilerAsserts.neverPartOfCompilation();
         return isIntrinsicFunction(ResolveFunctionNodeGen.getUncached());
@@ -375,6 +429,7 @@ public final class LLVMFunctionCode {
         return resolve.execute(getFunction(), this) instanceof LLVMFunctionCode.IntrinsicFunction;
     }
 
+    @Idempotent
     public boolean isNativeFunctionSlowPath() {
         CompilerAsserts.neverPartOfCompilation();
         return isNativeFunction(ResolveFunctionNodeGen.getUncached());
@@ -388,6 +443,7 @@ public final class LLVMFunctionCode {
         return !(getFunction() instanceof LLVMFunctionCode.UnresolvedFunction);
     }
 
+    @TruffleBoundary
     public void define(LLVMIntrinsicProvider intrinsicProvider, NodeFactory nodeFactory) {
         Intrinsic intrinsification = new Intrinsic(intrinsicProvider, llvmFunction.getName(), nodeFactory);
         define(new IntrinsicFunction(intrinsification, getFunction().getSourceType()));
@@ -422,6 +478,16 @@ public final class LLVMFunctionCode {
         Function fn = ResolveFunctionNodeGen.getUncached().execute(getFunction(), this);
         Object nativeFunction = ((NativeFunction) fn).nativeFunction;
         if (nativeFunction == null) {
+            throw new LLVMLinkerException("Native function " + fn.toString() + " not found");
+        }
+        return nativeFunction;
+    }
+
+    public Object getNativeFunction(ResolveFunctionNode resolveFunctionNode) {
+        Function fn = resolveFunctionNode.execute(getFunction(), this);
+        Object nativeFunction = ((NativeFunction) fn).nativeFunction;
+        if (nativeFunction == null) {
+            CompilerDirectives.transferToInterpreterAndInvalidate();
             throw new LLVMLinkerException("Native function " + fn.toString() + " not found");
         }
         return nativeFunction;

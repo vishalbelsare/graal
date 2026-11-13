@@ -24,211 +24,166 @@
  */
 package com.oracle.svm.core.genscavenge;
 
-import org.graalvm.collections.EconomicMap;
-import org.graalvm.collections.UnmodifiableEconomicMap;
-import org.graalvm.compiler.api.replacements.Fold;
-import org.graalvm.compiler.options.Option;
-import org.graalvm.compiler.options.OptionKey;
-import org.graalvm.compiler.options.OptionType;
-import org.graalvm.compiler.options.OptionValues;
-import org.graalvm.compiler.word.Word;
+import static com.oracle.svm.shared.Uninterruptible.CALLED_FROM_UNINTERRUPTIBLE_CODE;
+
 import org.graalvm.nativeimage.Platform;
 import org.graalvm.nativeimage.Platforms;
 import org.graalvm.word.UnsignedWord;
-import org.graalvm.word.WordFactory;
+import org.graalvm.word.impl.Word;
 
-import com.oracle.svm.core.SubstrateGCOptions;
-import com.oracle.svm.core.SubstrateUtil;
-import com.oracle.svm.core.annotate.Uninterruptible;
-import com.oracle.svm.core.option.GCRuntimeOptionKey;
-import com.oracle.svm.core.option.HostedOptionKey;
-import com.oracle.svm.core.option.RuntimeOptionKey;
+import com.oracle.svm.guest.staging.option.RuntimeOptionValues.Origin;
+import com.oracle.svm.core.SubstrateOptions;
+import com.oracle.svm.shared.config.ObjectLayout;
 import com.oracle.svm.core.util.UserError;
-import com.oracle.svm.core.util.VMError;
+import com.oracle.svm.guest.staging.SubstrateGCOptions;
+import com.oracle.svm.shared.Uninterruptible;
+import com.oracle.svm.shared.util.SubstrateUtil;
+import com.oracle.svm.shared.util.VMError;
+
+import jdk.graal.compiler.api.replacements.Fold;
 
 /** Constants and variables for the size and layout of the heap and behavior of the collector. */
 public final class HeapParameters {
-    public static final class Options {
-        @Option(help = "The maximum heap size as percent of physical memory") //
-        public static final RuntimeOptionKey<Integer> MaximumHeapSizePercent = new GCRuntimeOptionKey<>(80);
+    /** Freshly committed but still uninitialized Java heap memory. */
+    private static final int UNINITIALIZED_JAVA_HEAP = 0xbaadbabe;
+    private static final int UNUSED_BUT_COMMITTED_JAVA_HEAP = 0xdeadbeef;
 
-        @Option(help = "The maximum size of the young generation as a percentage of the maximum heap size") //
-        public static final RuntimeOptionKey<Integer> MaximumYoungGenerationSizePercent = new GCRuntimeOptionKey<>(10);
+    private static final UnsignedWord producedHeapChunkZapInt = Word.unsigned(UNINITIALIZED_JAVA_HEAP);
+    private static final UnsignedWord producedHeapChunkZapWord = producedHeapChunkZapInt.shiftLeft(32).or(producedHeapChunkZapInt);
 
-        @Option(help = "The size of an aligned chunk.") //
-        public static final HostedOptionKey<Long> AlignedHeapChunkSize = new HostedOptionKey<Long>(1L * 1024L * 1024L) {
-            @Override
-            protected void onValueUpdate(EconomicMap<OptionKey<?>, Object> values, Long oldValue, Long newValue) {
-                int multiple = 4096;
-                UserError.guarantee(newValue > 0 && newValue % multiple == 0, "%s value must be a multiple of %d.", getName(), multiple);
-            }
-        };
-
-        /*
-         * This should be a fraction of the size of an aligned chunk, else large small arrays will
-         * not fit in an aligned chunk.
-         */
-        @Option(help = "The size at or above which an array will be allocated in its own unaligned chunk.  0 implies (AlignedHeapChunkSize / 8).") //
-        public static final HostedOptionKey<Long> LargeArrayThreshold = new HostedOptionKey<>(LARGE_ARRAY_THRESHOLD_SENTINEL_VALUE);
-
-        @Option(help = "Fill unused memory chunks with a sentinel value.") //
-        public static final HostedOptionKey<Boolean> ZapChunks = new HostedOptionKey<>(false);
-
-        @Option(help = "Before use, fill memory chunks with a sentinel value.") //
-        public static final HostedOptionKey<Boolean> ZapProducedHeapChunks = new HostedOptionKey<>(false);
-
-        @Option(help = "After use, Fill memory chunks with a sentinel value.") //
-        public static final HostedOptionKey<Boolean> ZapConsumedHeapChunks = new HostedOptionKey<>(false);
-
-        @Option(help = "Trace heap chunks during collections, if +VerboseGC and +PrintHeapShape.") //
-        public static final RuntimeOptionKey<Boolean> TraceHeapChunks = new RuntimeOptionKey<>(false);
-
-        @Option(help = "Maximum number of survivor spaces.") //
-        public static final HostedOptionKey<Integer> MaxSurvivorSpaces = new HostedOptionKey<Integer>(null) {
-            @Override
-            public Integer getValueOrDefault(UnmodifiableEconomicMap<OptionKey<?>, Object> values) {
-                Integer value = (Integer) values.get(this);
-                UserError.guarantee(value == null || value >= 0, "%s value must be greater than or equal to 0", getName());
-                return CollectionPolicy.getMaxSurvivorSpaces(value);
-            }
-
-            @Override
-            public Integer getValue(OptionValues values) {
-                assert checkDescriptorExists();
-                return getValueOrDefault(values.getMap());
-            }
-        };
-
-        @Option(help = "Determines if a full GC collects the young generation separately or together with the old generation.") //
-        public static final RuntimeOptionKey<Boolean> CollectYoungGenerationSeparately = new RuntimeOptionKey<>(null);
-
-        @Option(help = "The maximum free bytes reserved for allocations, in bytes (0 for automatic according to GC policy).", type = OptionType.User)//
-        public static final RuntimeOptionKey<Long> MaxHeapFree = new RuntimeOptionKey<>(0L);
-
-        private Options() {
-        }
-    }
-
-    private static final long LARGE_ARRAY_THRESHOLD_SENTINEL_VALUE = 0;
-    private static final int ALIGNED_HEAP_CHUNK_FRACTION_FOR_LARGE_ARRAY_THRESHOLD = 8;
+    private static final UnsignedWord consumedHeapChunkZapInt = Word.unsigned(UNUSED_BUT_COMMITTED_JAVA_HEAP);
+    private static final UnsignedWord consumedHeapChunkZapWord = consumedHeapChunkZapInt.shiftLeft(32).or(consumedHeapChunkZapInt);
 
     @Platforms(Platform.HOSTED_ONLY.class)
     static void initialize() {
-        if (!SubstrateUtil.isPowerOf2(getAlignedHeapChunkSize().rawValue())) {
-            throw UserError.abort("AlignedHeapChunkSize (%d) should be a power of 2.", getAlignedHeapChunkSize().rawValue());
+        long alignedChunkSize = getAlignedHeapChunkSize().rawValue();
+        if (!SubstrateUtil.isPowerOf2(alignedChunkSize)) {
+            throw UserError.abort("%s (%d) should be a power of 2.", SerialAndEpsilonGCOptions.AlignedHeapChunkSize.getName(), alignedChunkSize);
         }
-        if (!getLargeArrayThreshold().belowOrEqual(getAlignedHeapChunkSize())) {
-            throw UserError.abort("LargeArrayThreshold (%d) should be below or equal to AlignedHeapChunkSize (%d).",
-                            getLargeArrayThreshold().rawValue(), getAlignedHeapChunkSize().rawValue());
+
+        ObjectLayout layout = ObjectLayout.singleton();
+        long alignedChunkCapacity = AlignedHeapChunk.getUsableSizeForObjects().rawValue();
+        int maxIdentityHashGrowth = layout.isIdentityHashFieldOptional() ? layout.getAlignment() : 0;
+        long maxLargeArrayThreshold = alignedChunkCapacity - maxIdentityHashGrowth + 1;
+        if (SerialAndEpsilonGCOptions.AlignedHeapChunkSize.hasBeenSet() && !SerialAndEpsilonGCOptions.LargeArrayThreshold.hasBeenSet()) {
+            throw UserError.abort("When setting %s, explicitly set %s to a value between 1 and %d.", SerialAndEpsilonGCOptions.AlignedHeapChunkSize.getName(),
+                            SerialAndEpsilonGCOptions.LargeArrayThreshold.getName(), maxLargeArrayThreshold);
         }
-    }
 
-    @Uninterruptible(reason = "Called from uninterruptible code.", mayBeInlined = true)
-    public static Word getProducedHeapChunkZapWord() {
-        return (Word) producedHeapChunkZapWord;
-    }
+        long largeArrayThreshold = getLargeArrayThreshold().rawValue();
+        if (largeArrayThreshold <= 0 || largeArrayThreshold > maxLargeArrayThreshold) {
+            throw UserError.abort("%s (set to %d) must be between 1 and %d.", SerialAndEpsilonGCOptions.LargeArrayThreshold.getName(), largeArrayThreshold, maxLargeArrayThreshold);
+        }
 
-    @Uninterruptible(reason = "Called from uninterruptible code.", mayBeInlined = true)
-    public static int getProducedHeapChunkZapInt() {
-        return (int) producedHeapChunkZapInt.rawValue();
-    }
-
-    @Uninterruptible(reason = "Called from uninterruptible code.", mayBeInlined = true)
-    public static Word getConsumedHeapChunkZapWord() {
-        return (Word) consumedHeapChunkZapWord;
-    }
-
-    @Uninterruptible(reason = "Called from uninterruptible code.", mayBeInlined = true)
-    public static int getConsumedHeapChunkZapInt() {
-        return (int) consumedHeapChunkZapInt.rawValue();
+        SubstrateGCOptions.validateMaxMetaspaceSize(alignedChunkSize, HeapImpl.getNullRegionSize());
     }
 
     @Fold
     public static int getMaxSurvivorSpaces() {
-        return Options.MaxSurvivorSpaces.getValue();
+        if (SubstrateOptions.useEpsilonGC() || !SerialGCOptions.useRememberedSet()) {
+            return 0;
+        }
+
+        Integer value = SerialGCOptions.ConcealedOptions.MaxSurvivorSpaces.getValue();
+        UserError.guarantee(value == null || value >= 0, "%s value must be greater than or equal to 0", SerialGCOptions.ConcealedOptions.MaxSurvivorSpaces.getName());
+        return (value != null) ? value : AbstractCollectionPolicy.MAX_TENURING_THRESHOLD;
     }
 
     /*
      * Memory configuration
      */
 
+    /**
+     * Sets the {@link SubstrateGCOptions#MaxHeapSize} option value.
+     *
+     * Note that the value is used during VM initialization and stored in various places in the JDK
+     * in direct or derived form. These usages will <strong>not be updated!</strong> Thus, changing
+     * the maximum heap size at runtime is not recommended.
+     */
     public static void setMaximumHeapSize(UnsignedWord value) {
-        SubstrateGCOptions.MaxHeapSize.update(value.rawValue());
+        SubstrateGCOptions.MaxHeapSize.update(value.rawValue(), Origin.Runtime);
     }
 
     public static void setMinimumHeapSize(UnsignedWord value) {
-        SubstrateGCOptions.MinHeapSize.update(value.rawValue());
+        SubstrateGCOptions.MinHeapSize.update(value.rawValue(), Origin.Runtime);
     }
 
     public static void setMaximumHeapFree(UnsignedWord bytes) {
-        HeapParameters.Options.MaxHeapFree.update(bytes.rawValue());
+        SerialGCOptions.MaxHeapFree.update(bytes.rawValue(), Origin.Runtime);
     }
 
     public static UnsignedWord getMaximumHeapFree() {
-        return WordFactory.unsigned(HeapParameters.Options.MaxHeapFree.getValue());
+        return Word.unsigned(SerialGCOptions.MaxHeapFree.getValue());
+    }
+
+    @Fold
+    public static int getHeapChunkHeaderPadding() {
+        return SerialAndEpsilonGCOptions.HeapChunkHeaderPadding.getValue();
     }
 
     static int getMaximumYoungGenerationSizePercent() {
-        int result = Options.MaximumYoungGenerationSizePercent.getValue();
-        VMError.guarantee((result >= 0) && (result <= 100), "MaximumYoungGenerationSizePercent should be in [0 ..100]");
+        int result = SerialAndEpsilonGCOptions.MaximumYoungGenerationSizePercent.getValue();
+        VMError.guarantee(result >= 0 && result <= 100, "MaximumYoungGenerationSizePercent should be in [0..100]");
         return result;
     }
 
     static int getMaximumHeapSizePercent() {
-        int result = Options.MaximumHeapSizePercent.getValue();
-        VMError.guarantee((result >= 0) && (result <= 100), "MaximumHeapSizePercent should be in [0 ..100]");
+        int result = SerialAndEpsilonGCOptions.MaximumHeapSizePercent.getValue();
+        VMError.guarantee(result >= 0 && result <= 100, "MaximumHeapSizePercent should be in [0..100]");
         return result;
     }
 
     @Fold
     public static UnsignedWord getAlignedHeapChunkSize() {
-        return WordFactory.unsigned(Options.AlignedHeapChunkSize.getValue());
+        return Word.unsigned(SerialAndEpsilonGCOptions.AlignedHeapChunkSize.getValue());
     }
 
     @Fold
-    static UnsignedWord getAlignedHeapChunkAlignment() {
+    public static UnsignedWord getAlignedHeapChunkAlignment() {
         return getAlignedHeapChunkSize();
     }
 
     @Fold
+    public static UnsignedWord getMinUnalignedChunkSize() {
+        return UnalignedHeapChunk.getChunkSizeForObject(HeapParameters.getLargeArrayThreshold());
+    }
+
+    @Fold
     public static UnsignedWord getLargeArrayThreshold() {
-        long largeArrayThreshold = Options.LargeArrayThreshold.getValue();
-        if (LARGE_ARRAY_THRESHOLD_SENTINEL_VALUE == largeArrayThreshold) {
-            return getAlignedHeapChunkSize().unsignedDivide(ALIGNED_HEAP_CHUNK_FRACTION_FOR_LARGE_ARRAY_THRESHOLD);
-        } else {
-            return WordFactory.unsigned(Options.LargeArrayThreshold.getValue());
-        }
+        return Word.unsigned(SerialAndEpsilonGCOptions.LargeArrayThreshold.getValue());
     }
 
     /*
      * Zapping
      */
 
-    public static boolean getZapProducedHeapChunks() {
-        return Options.ZapChunks.getValue() || Options.ZapProducedHeapChunks.getValue();
+    @Uninterruptible(reason = CALLED_FROM_UNINTERRUPTIBLE_CODE, mayBeInlined = true)
+    static boolean getZapProducedHeapChunks() {
+        return SerialAndEpsilonGCOptions.ZapChunks.getValue() || SerialAndEpsilonGCOptions.ZapProducedHeapChunks.getValue();
     }
 
-    public static boolean getZapConsumedHeapChunks() {
-        return Options.ZapChunks.getValue() || Options.ZapConsumedHeapChunks.getValue();
+    @Uninterruptible(reason = CALLED_FROM_UNINTERRUPTIBLE_CODE, mayBeInlined = true)
+    static boolean getZapConsumedHeapChunks() {
+        return SerialAndEpsilonGCOptions.ZapChunks.getValue() || SerialAndEpsilonGCOptions.ZapConsumedHeapChunks.getValue();
     }
 
-    static {
-        Word.ensureInitialized();
+    @Uninterruptible(reason = CALLED_FROM_UNINTERRUPTIBLE_CODE, mayBeInlined = true)
+    static Word getProducedHeapChunkZapWord() {
+        return (Word) producedHeapChunkZapWord;
     }
 
-    private static final UnsignedWord producedHeapChunkZapInt = WordFactory.unsigned(0xbaadbabe);
-    private static final UnsignedWord producedHeapChunkZapWord = producedHeapChunkZapInt.shiftLeft(32).or(producedHeapChunkZapInt);
+    @Uninterruptible(reason = CALLED_FROM_UNINTERRUPTIBLE_CODE, mayBeInlined = true)
+    static int getProducedHeapChunkZapInt() {
+        return (int) producedHeapChunkZapInt.rawValue();
+    }
 
-    private static final UnsignedWord consumedHeapChunkZapInt = WordFactory.unsigned(0xdeadbeef);
-    private static final UnsignedWord consumedHeapChunkZapWord = consumedHeapChunkZapInt.shiftLeft(32).or(consumedHeapChunkZapInt);
+    @Uninterruptible(reason = CALLED_FROM_UNINTERRUPTIBLE_CODE, mayBeInlined = true)
+    static Word getConsumedHeapChunkZapWord() {
+        return (Word) consumedHeapChunkZapWord;
+    }
 
-    public static final class TestingBackDoor {
-        private TestingBackDoor() {
-        }
-
-        /** The size, in bytes, of what qualifies as a "large" array. */
-        public static long getUnalignedObjectSize() {
-            return HeapParameters.getLargeArrayThreshold().rawValue();
-        }
+    @Uninterruptible(reason = CALLED_FROM_UNINTERRUPTIBLE_CODE, mayBeInlined = true)
+    static int getConsumedHeapChunkZapInt() {
+        return (int) consumedHeapChunkZapInt.rawValue();
     }
 }

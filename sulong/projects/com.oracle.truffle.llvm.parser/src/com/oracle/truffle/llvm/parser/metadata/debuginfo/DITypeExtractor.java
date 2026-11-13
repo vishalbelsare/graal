@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2017, 2021, Oracle and/or its affiliates.
+ * Copyright (c) 2017, 2026, Oracle and/or its affiliates.
  *
  * All rights reserved.
  *
@@ -217,7 +217,7 @@ final class DITypeExtractor implements MetadataVisitor {
                         if (elemNode instanceof MDSubprogram) {
                             MDSubprogram mdSubprogram = (MDSubprogram) elemNode;
                             final String methodName = ((MDString) mdSubprogram.getName()).getString();
-                            if (mdSubprogram.getLinkageName() instanceof MDString) {
+                            if (mdSubprogram.getLinkageName() instanceof MDString && !methodName.equals(name)) {
                                 final String methodLinkageName = ((MDString) mdSubprogram.getLinkageName()).getString();
                                 final LLVMSourceFunctionType llvmSourceFunctionType = (LLVMSourceFunctionType) parsedTypes.get(mdSubprogram);
                                 final long virtualIndex = mdSubprogram.getVirtuality() > 0 ? mdSubprogram.getVirtualIndex() : -1L;
@@ -326,6 +326,7 @@ final class DITypeExtractor implements MetadataVisitor {
 
         switch (mdType.getTag()) {
 
+            case DW_TAG_VARIABLE:
             case DW_TAG_MEMBER: {
 
                 final String name = MDNameExtractor.getName(mdType.getName());
@@ -379,11 +380,15 @@ final class DITypeExtractor implements MetadataVisitor {
                 break;
             }
 
+            case DW_TAG_ATOMIC_TYPE:
             case DW_TAG_TYPEDEF:
             case DW_TAG_VOLATILE_TYPE:
             case DW_TAG_CONST_TYPE: {
                 final Function<String, String> decorator;
                 switch (mdType.getTag()) {
+                    case DW_TAG_ATOMIC_TYPE:
+                        decorator = s -> String.format("atomic %s", s);
+                        break;
                     case DW_TAG_VOLATILE_TYPE:
                         decorator = s -> String.format("volatile %s", s);
                         break;

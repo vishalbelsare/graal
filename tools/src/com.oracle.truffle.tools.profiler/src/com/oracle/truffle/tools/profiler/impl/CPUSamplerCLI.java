@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2017, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2017, 2025, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -28,12 +28,16 @@ import java.io.File;
 import java.io.FileNotFoundException;
 import java.io.FileOutputStream;
 import java.io.PrintStream;
+import java.time.Duration;
+import java.time.format.DateTimeParseException;
+import java.time.temporal.ChronoUnit;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collection;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
@@ -44,19 +48,20 @@ import org.graalvm.options.OptionKey;
 import org.graalvm.options.OptionStability;
 import org.graalvm.options.OptionType;
 import org.graalvm.options.OptionValues;
+import org.graalvm.shadowed.org.json.JSONArray;
+import org.graalvm.shadowed.org.json.JSONObject;
 
 import com.oracle.truffle.api.Option;
-import com.oracle.truffle.api.TruffleContext;
 import com.oracle.truffle.api.instrumentation.TruffleInstrument;
 import com.oracle.truffle.tools.profiler.CPUSampler;
 import com.oracle.truffle.tools.profiler.CPUSamplerData;
 import com.oracle.truffle.tools.profiler.ProfilerNode;
-import com.oracle.truffle.tools.utils.json.JSONArray;
-import com.oracle.truffle.tools.utils.json.JSONObject;
 
 @Option.Group(CPUSamplerInstrument.ID)
 class CPUSamplerCLI extends ProfilerCLI {
 
+    private static final String DURATION_SYNTAX = "[0, inf)ms|s|m|h|d";
+    private static final String NONZERO_DURATION_SYNTAX = "[1, inf)ms|s|m|h|d";
     public static final long MILLIS_TO_NANOS = 1_000_000L;
     public static final double MAX_OVERHEAD_WARNING_THRESHOLD = 0.2;
     public static final String DEFAULT_FLAMEGRAPH_FILE = "flamegraph.svg";
@@ -86,6 +91,10 @@ class CPUSamplerCLI extends ProfilerCLI {
             }
         }
 
+        @Override
+        public String toString() {
+            return this.name().toLowerCase();
+        }
     }
 
     static final OptionType<EnableOptionData> ENABLE_OPTION_TYPE = new OptionType<>("Enable",
@@ -132,6 +141,11 @@ class CPUSamplerCLI extends ProfilerCLI {
         public int hashCode() {
             return Objects.hash(enabled, output);
         }
+
+        @Override
+        public String toString() {
+            return enabled ? output.toString() : "false";
+        }
     }
 
     static final OptionType<Output> CLI_OUTPUT_TYPE = new OptionType<>("Output", Output::fromString);
@@ -160,58 +174,130 @@ class CPUSamplerCLI extends ProfilerCLI {
                         }
                     });
 
-    @Option(name = "", help = "Enable the CPU sampler.", category = OptionCategory.USER, stability = OptionStability.STABLE) //
+    private static OptionType<Duration> createDurationType() {
+        return new OptionType<>("time", new Function<String, Duration>() {
+
+            @SuppressWarnings("ResultOfMethodCallIgnored")
+            @Override
+            public Duration apply(String timeStr) {
+                try {
+                    ChronoUnit foundUnit = ChronoUnit.MILLIS; // If no unit is specified,
+                                                              // milliseconds are assumed.
+                    String foundUnitName = "";
+                    for (ChronoUnit unit : ChronoUnit.values()) {
+                        String unitName = getUnitName(unit);
+                        if (unitName == null) {
+                            continue;
+                        }
+                        if (timeStr.endsWith(unitName)) {
+                            foundUnit = unit;
+                            foundUnitName = unitName;
+                            break;
+                        }
+                    }
+                    String subString = timeStr.substring(0, timeStr.length() - foundUnitName.length());
+                    long value = Long.parseLong(subString);
+                    if (value < 0) {
+                        throw invalidValue(timeStr);
+                    }
+                    return Duration.of(value, foundUnit);
+                } catch (NumberFormatException | ArithmeticException | DateTimeParseException e) {
+                    throw invalidValue(timeStr);
+                }
+            }
+
+            private String getUnitName(ChronoUnit unit) {
+                return switch (unit) {
+                    case MILLIS -> "ms";
+                    case SECONDS -> "s";
+                    case MINUTES -> "m";
+                    case HOURS -> "h";
+                    case DAYS -> "d";
+                    default -> null;
+                };
+            }
+
+            private IllegalArgumentException invalidValue(String value) {
+                throw new IllegalArgumentException("Invalid duration '" + value + "' specified. " //
+                                + "A valid duration consists of an integer value >= 0 optionally followed by a chronological time unit. " //
+                                + "For example, '11', '15ms', or '6s'. Valid time units are " //
+                                + "'' or 'ms' for milliseconds, " //
+                                + "'s' for seconds, " //
+                                + "'m' for minutes, " //
+                                + "'h' for hours, and " //
+                                + "'d' for days.");
+            }
+        });
+    }
+
+    @Option(name = "", help = "Enable/Disable the CPU sampler, or enable with specific Output - as specified by the Output option (default: false). Choosing an output with this options defaults to printing the output to std out, " +
+                    "except for the flamegraph which is printed to a flamegraph.svg file.", usageSyntax = "true|false|<Output>", category = OptionCategory.USER, stability = OptionStability.STABLE) //
     static final OptionKey<EnableOptionData> ENABLED = new OptionKey<>(new EnableOptionData(false, null), ENABLE_OPTION_TYPE);
 
-    @Option(name = "Period", help = "Period in milliseconds to sample the stack.", category = OptionCategory.USER, stability = OptionStability.STABLE) //
-    static final OptionKey<Long> SAMPLE_PERIOD = new OptionKey<>(10L);
+    @Option(name = "Period", help = "Sampling period for the stack. Example: 5ms. The default unit is milliseconds, and the default value is 10, meaning the stack is sampled every 10 ms.", //
+                    usageSyntax = NONZERO_DURATION_SYNTAX, category = OptionCategory.USER, stability = OptionStability.STABLE) //
+    static final OptionKey<Duration> SAMPLE_PERIOD = new OptionKey<>(Duration.ofMillis(10), createDurationType());
 
-    @Option(name = "Delay", help = "Delay the sampling for this many milliseconds (default: 0).", category = OptionCategory.USER, stability = OptionStability.STABLE) //
-    static final OptionKey<Long> DELAY_PERIOD = new OptionKey<>(0L);
+    @Option(name = "Delay", help = "Delay sampling for the specified time. Example: 500ms. The default unit is milliseconds, and the default value is 0 (no delay), meaning sampling starts immediately.", usageSyntax = DURATION_SYNTAX, //
+                    category = OptionCategory.USER, stability = OptionStability.STABLE) //
+    static final OptionKey<Duration> DELAY_PERIOD = new OptionKey<>(Duration.ZERO, createDurationType());
 
-    @Option(name = "StackLimit", help = "Maximum number of maximum stack elements.", category = OptionCategory.USER, stability = OptionStability.STABLE) //
+    @Option(name = "StackLimit", help = "Maximum number of maximum stack elements (default: 10000).", usageSyntax = "[1, inf)", category = OptionCategory.USER, stability = OptionStability.STABLE) //
     static final OptionKey<Integer> STACK_LIMIT = new OptionKey<>(10000);
 
-    @Option(name = "Output", help = "Print a 'histogram', 'calltree', 'json', or `flamegraph` as output (default:HISTOGRAM).", category = OptionCategory.USER, stability = OptionStability.STABLE) //
+    @Option(name = "Output", help = "Specify the output format to one of: histogram, calltree, json or flamegraph (default: histogram).", //
+                    usageSyntax = "histogram|calltree|json|flamegraph", category = OptionCategory.USER, stability = OptionStability.STABLE) //
     static final OptionKey<Output> OUTPUT = new OptionKey<>(Output.HISTOGRAM, CLI_OUTPUT_TYPE);
 
     @Option(help = "Specify whether to show compilation information for entries. You can specify 'true' to show all compilation information, 'false' for none, or a comma separated list of compilation tiers. " +
-                    "Note: Interpreter is considered Tier 0. (default: false).", category = OptionCategory.EXPERT, stability = OptionStability.STABLE) //
+                    "Note: Interpreter is considered Tier 0. (default: false)", usageSyntax = "true|false|0,1,2", category = OptionCategory.EXPERT, stability = OptionStability.STABLE) //
     static final OptionKey<int[]> ShowTiers = new OptionKey<>(null, SHOW_TIERS_OUTPUT_TYPE);
 
-    @Option(name = "FilterRootName", help = "Wildcard filter for program roots. (eg. Math.*, default:*).", category = OptionCategory.USER, stability = OptionStability.STABLE) //
-    static final OptionKey<Object[]> FILTER_ROOT = new OptionKey<>(new Object[0], WILDCARD_FILTER_TYPE);
+    @Option(name = "FilterRootName", help = "Wildcard filter for program roots. (for example, Math.*) (default: no filter).", usageSyntax = "<filter>", category = OptionCategory.USER, stability = OptionStability.STABLE) //
+    static final OptionKey<WildcardFilter> FILTER_ROOT = new OptionKey<>(WildcardFilter.DEFAULT, WildcardFilter.WILDCARD_FILTER_TYPE);
 
-    @Option(name = "FilterFile", help = "Wildcard filter for source file paths. (eg. *program*.sl, default:*).", category = OptionCategory.USER, stability = OptionStability.STABLE) //
-    static final OptionKey<Object[]> FILTER_FILE = new OptionKey<>(new Object[0], WILDCARD_FILTER_TYPE);
+    @Option(name = "FilterFile", help = "Wildcard filter for source file paths. (for example, *program*.sl) (default: no filter).", usageSyntax = "<filter>", category = OptionCategory.USER, stability = OptionStability.STABLE) //
+    static final OptionKey<WildcardFilter> FILTER_FILE = new OptionKey<>(WildcardFilter.DEFAULT, WildcardFilter.WILDCARD_FILTER_TYPE);
 
-    @Option(name = "FilterMimeType", help = "Only profile languages with mime-type. (eg. +, default:no filter).", category = OptionCategory.USER, stability = OptionStability.STABLE) //
+    @Option(name = "FilterMimeType", help = "Only profile the language with given mime-type. (for example, application/javascript) (default: profile all)", //
+                    usageSyntax = "<mime-type>", category = OptionCategory.USER, stability = OptionStability.STABLE) //
     static final OptionKey<String> FILTER_MIME_TYPE = new OptionKey<>("");
 
-    @Option(name = "FilterLanguage", help = "Only profile languages with given ID. (eg. js, default:no filter).", category = OptionCategory.USER, stability = OptionStability.STABLE) //
+    @Option(name = "FilterLanguage", help = "Only profile the language with given ID. (for example, js) (default: profile all).", usageSyntax = "<languageId>", category = OptionCategory.USER, stability = OptionStability.STABLE) //
     static final OptionKey<String> FILTER_LANGUAGE = new OptionKey<>("");
 
-    @Option(name = "SampleInternal", help = "Capture internal elements (default:false).", category = OptionCategory.INTERNAL) //
+    @Option(name = "SampleInternal", help = "Capture internal elements.", category = OptionCategory.INTERNAL) //
     static final OptionKey<Boolean> SAMPLE_INTERNAL = new OptionKey<>(false);
 
-    @Option(name = "SummariseThreads", help = "Print output as a summary of all 'per thread' profiles. (default: false)", category = OptionCategory.USER, stability = OptionStability.STABLE) //
+    @Option(name = "SummariseThreads", help = "Print output as a summary of all 'per thread' profiles.", category = OptionCategory.USER, stability = OptionStability.STABLE) //
     static final OptionKey<Boolean> SUMMARISE_THREADS = new OptionKey<>(false);
 
-    @Option(name = "GatherHitTimes", help = "Save a timestamp for each taken sample (default:false).", category = OptionCategory.USER, stability = OptionStability.STABLE) //
+    @Option(name = "GatherHitTimes", help = "Save a timestamp for each taken sample.", category = OptionCategory.USER, stability = OptionStability.STABLE) //
     static final OptionKey<Boolean> GATHER_HIT_TIMES = new OptionKey<>(false);
 
-    @Option(name = "OutputFile", help = "Save output to the given file. Output is printed to output stream by default.", category = OptionCategory.USER, stability = OptionStability.STABLE) //
+    @Option(name = "OutputFile", help = "Save output to the given file. Output is printed to output stream by default.", usageSyntax = "<path>", category = OptionCategory.USER, stability = OptionStability.STABLE) //
     static final OptionKey<String> OUTPUT_FILE = new OptionKey<>("");
 
-    @Option(name = "MinSamples", help = "Remove elements from output if they have less samples than this value (default: 0).", category = OptionCategory.USER, stability = OptionStability.STABLE) //
+    @Option(name = "MinSamples", help = "Remove elements from output if they have less samples than this value (default: 0)", usageSyntax = "[0, inf)", category = OptionCategory.USER, stability = OptionStability.STABLE) //
     static final OptionKey<Integer> MIN_SAMPLES = new OptionKey<>(0);
 
-    @Option(name = "SampleContextInitialization", help = "Enables sampling of code executed during context initialization (default: false).", category = OptionCategory.EXPERT, stability = OptionStability.STABLE) //
+    @Option(name = "SampleContextInitialization", help = "Enables sampling of code executed during context initialization", category = OptionCategory.EXPERT, stability = OptionStability.STABLE) //
     static final OptionKey<Boolean> SAMPLE_CONTEXT_INITIALIZATION = new OptionKey<>(false);
 
-    static void handleOutput(TruffleInstrument.Env env, CPUSampler sampler) {
-        PrintStream out = chooseOutputStream(env);
-        Map<TruffleContext, CPUSamplerData> data = sampler.getData();
+    @Option(name = "GatherAsyncStackTrace", help = "Try to gather async stack trace elements for each sample (default: true). " +
+                    "Disabling this option may reduce sampling overhead.", category = OptionCategory.EXPERT, stability = OptionStability.STABLE) //
+    static final OptionKey<Boolean> GATHER_ASYNC_STACK_TRACE = new OptionKey<>(true);
+
+    @Option(name = "DumpInterval", category = OptionCategory.EXPERT, stability = OptionStability.STABLE, help = "Dump the sampler output at the specified interval. Example: 10s. The default unit is milliseconds, " + //
+                    "and the default value is 0 (no interval-based dumping), meaning output is only produced at the end of execution.", usageSyntax = DURATION_SYNTAX)//
+    static final OptionKey<Duration> DUMP_INTERVAL = new OptionKey<>(Duration.ZERO, createDurationType());
+
+    @Option(name = "ResetAfterIntervalDump", category = OptionCategory.EXPERT, stability = OptionStability.STABLE, help = "Specifies whether to clear the sampler data after each interval-based dump. The default value is false (do not clear).")//
+    static final OptionKey<Boolean> RESET_AFTER_INTERVAL_DUMP = new OptionKey<>(false);
+
+    static void handleOutput(TruffleInstrument.Env env, CPUSampler sampler, String absoluteOutputPath) {
+        PrintStream out = chooseOutputStream(env, absoluteOutputPath);
+        List<CPUSamplerData> data = sampler.getDataList();
         OptionValues options = env.getOptions();
         switch (chooseOutput(options)) {
             case HISTOGRAM:
@@ -230,12 +316,10 @@ class CPUSamplerCLI extends ProfilerCLI {
         }
     }
 
-    private static PrintStream chooseOutputStream(TruffleInstrument.Env env) {
-        OptionValues options = env.getOptions();
-        final String outputPath = getOutputPath(env, options);
-        if (outputPath != null) {
+    private static PrintStream chooseOutputStream(TruffleInstrument.Env env, String absoluteOutputPath) {
+        if (absoluteOutputPath != null) {
             try {
-                final File file = new File(outputPath);
+                final File file = new File(absoluteOutputPath);
                 new PrintStream(env.out()).println("Printing output to " + file.getAbsolutePath());
                 return new PrintStream(new FileOutputStream(file));
             } catch (FileNotFoundException e) {
@@ -245,9 +329,9 @@ class CPUSamplerCLI extends ProfilerCLI {
         return new PrintStream(env.out());
     }
 
-    private static String getOutputPath(TruffleInstrument.Env env, OptionValues options) {
+    static String getOutputPath(OptionValues options) {
         if (OUTPUT_FILE.hasBeenSet(options)) {
-            return OUTPUT_FILE.getValue(env.getOptions());
+            return OUTPUT_FILE.getValue(options);
         }
         if (ENABLED.getValue(options).output == Output.FLAMEGRAPH) {
             return DEFAULT_FLAMEGRAPH_FILE;
@@ -266,15 +350,15 @@ class CPUSamplerCLI extends ProfilerCLI {
         return OUTPUT.getDefaultValue();
     }
 
-    private static void printSamplingCallTree(PrintStream out, OptionValues options, Map<TruffleContext, CPUSamplerData> data) {
-        for (Map.Entry<TruffleContext, CPUSamplerData> entry : data.entrySet()) {
-            new SamplingCallTree(entry.getValue(), options).print(out);
+    private static void printSamplingCallTree(PrintStream out, OptionValues options, List<CPUSamplerData> data) {
+        for (CPUSamplerData entry : data) {
+            new SamplingCallTree(entry, options).print(out);
         }
     }
 
-    private static void printSamplingHistogram(PrintStream out, OptionValues options, Map<TruffleContext, CPUSamplerData> data) {
-        for (Map.Entry<TruffleContext, CPUSamplerData> entry : data.entrySet()) {
-            new SamplingHistogram(entry.getValue(), options).print(out);
+    private static void printSamplingHistogram(PrintStream out, OptionValues options, List<CPUSamplerData> data) {
+        for (CPUSamplerData entry : data) {
+            new SamplingHistogram(entry, options).print(out);
         }
     }
 
@@ -297,7 +381,7 @@ class CPUSamplerCLI extends ProfilerCLI {
     }
 
     private static boolean sampleDurationTooLong(CPUSampler sampler) {
-        for (CPUSamplerData value : sampler.getData().values()) {
+        for (CPUSamplerData value : sampler.getDataList()) {
             if (value.getSampleDuration().getAverage() > MAX_OVERHEAD_WARNING_THRESHOLD * sampler.getPeriod() * MILLIS_TO_NANOS) {
                 return true;
             }
@@ -309,13 +393,13 @@ class CPUSamplerCLI extends ProfilerCLI {
         out.println("-------------------------------------------------------------------------------- ");
     }
 
-    private static void printSamplingJson(PrintStream out, OptionValues options, Map<TruffleContext, CPUSamplerData> data) {
+    private static void printSamplingJson(PrintStream out, OptionValues options, List<CPUSamplerData> data) {
         boolean gatheredHitTimes = options.get(GATHER_HIT_TIMES);
         JSONObject output = new JSONObject();
         output.put("tool", CPUSamplerInstrument.ID);
         output.put("version", CPUSamplerInstrument.VERSION);
         JSONArray contexts = new JSONArray();
-        for (CPUSamplerData samplerData : data.values()) {
+        for (CPUSamplerData samplerData : data) {
             contexts.put(perContextData(samplerData, gatheredHitTimes));
         }
         output.put("contexts", contexts);
@@ -355,7 +439,7 @@ class CPUSamplerCLI extends ProfilerCLI {
             sample.put("self_tier_count", selfTierCount);
             int[] tierCount = new int[payload.getNumberOfTiers()];
             for (int i = 0; i < tierCount.length; i++) {
-                tierCount[i] = payload.getTierSelfCount(i);
+                tierCount[i] = payload.getTierTotalCount(i);
             }
             sample.put("tier_count", tierCount);
             sample.put("children", getSamplesRec(node.getChildren()));
@@ -394,7 +478,7 @@ class CPUSamplerCLI extends ProfilerCLI {
     }
 
     private static String[] makeTitleAndFormat(int nameLength, int[] showTiers, Integer[] tiers) {
-        StringBuilder titleBuilder = new StringBuilder(String.format(" %-" + nameLength + "s ||             Total Time    ", "Name"));
+        StringBuilder titleBuilder = new StringBuilder(format(" %-" + nameLength + "s ||             Total Time    ", "Name"));
         StringBuilder formatBuilder = new StringBuilder(" %-" + nameLength + "s ||       %10dms %5.1f%% ");
         maybeAddTiers(titleBuilder, formatBuilder, showTiers, tiers);
         titleBuilder.append("||              Self Time    ");
@@ -461,7 +545,7 @@ class CPUSamplerCLI extends ProfilerCLI {
             this.summariseThreads = options.get(SUMMARISE_THREADS);
             this.minSamples = options.get(MIN_SAMPLES);
             this.showTiers = options.get(ShowTiers);
-            this.samplePeriod = options.get(SAMPLE_PERIOD);
+            this.samplePeriod = options.get(SAMPLE_PERIOD).toMillis();
             this.samplesTaken = data.getSamples();
             Map<Thread, SourceLocationNodes> perThreadSourceLocationPayloads = new HashMap<>();
             this.samplesMissed = data.missedSamples();
@@ -616,7 +700,7 @@ class CPUSamplerCLI extends ProfilerCLI {
         }
 
         private static String formatIndentBreakLabel(int skippedDepth) {
-            return String.format("(\u21B3%s) ", skippedDepth);
+            return CPUSamplerCLI.format("(\u21B3%s) ", skippedDepth);
         }
 
         String format(String format, int[] showTiers, long samplePeriod, int depth, long globalTotalSamples, Integer[] tiers) {
@@ -634,7 +718,7 @@ class CPUSamplerCLI extends ProfilerCLI {
             args.add(percent(totalSelfSamples, globalTotalSamples));
             maybeAddTiers(args, tierToSelfSamples, totalSelfSamples, showTiers, tiers);
             args.add(getShortDescription(location.getSourceSection()));
-            return String.format(format, args.toArray());
+            return CPUSamplerCLI.format(format, args.toArray());
         }
 
         private static void maybeAddTiers(List<Object> args, int[] samples, int total, int[] showTiers, Integer[] tiers) {
@@ -681,7 +765,7 @@ class CPUSamplerCLI extends ProfilerCLI {
             this.summariseThreads = options.get(SUMMARISE_THREADS);
             this.minSamples = options.get(MIN_SAMPLES);
             this.showTiers = options.get(ShowTiers);
-            this.samplePeriod = options.get(SAMPLE_PERIOD);
+            this.samplePeriod = options.get(SAMPLE_PERIOD).toMillis();
             this.samplesTaken = data.getSamples();
             this.samplesMissed = data.missedSamples();
             Map<Thread, Collection<ProfilerNode<CPUSampler.Payload>>> threadData = data.getThreadData();
@@ -704,7 +788,10 @@ class CPUSamplerCLI extends ProfilerCLI {
 
         private void calculateMaxValuesRec(ProfilerNode<CPUSampler.Payload> node, int depth) {
             maxNameLength = Math.max(maxNameLength, node.getRootName().length() + OutputEntry.computeIndentSize(depth));
-            tiers.add(node.getPayload().getNumberOfTiers() - 1);
+            int numberOfTiers = node.getPayload().getNumberOfTiers();
+            for (int i = 0; i < numberOfTiers; i++) {
+                tiers.add(i);
+            }
             for (ProfilerNode<CPUSampler.Payload> child : node.getChildren()) {
                 calculateMaxValuesRec(child, depth + 1);
             }
@@ -745,7 +832,10 @@ class CPUSamplerCLI extends ProfilerCLI {
 
         private CallTreeOutputEntry makeEntry(ProfilerNode<CPUSampler.Payload> node, int depth) {
             maxNameLength = Math.max(maxNameLength, node.getRootName().length() + OutputEntry.computeIndentSize(depth));
-            tiers.add(node.getPayload().getNumberOfTiers() - 1);
+            int numberOfTiers = node.getPayload().getNumberOfTiers();
+            for (int i = 0; i < numberOfTiers; i++) {
+                tiers.add(i);
+            }
             CallTreeOutputEntry entry = new CallTreeOutputEntry(node);
             for (ProfilerNode<CPUSampler.Payload> child : node.getChildren()) {
                 entry.children.add(makeEntry(child, depth + 1));
@@ -808,6 +898,10 @@ class CPUSamplerCLI extends ProfilerCLI {
                 }
             }
         }
+    }
+
+    private static String format(String format, Object... args) {
+        return String.format(Locale.ENGLISH, format, args);
     }
 
 }

@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2017, 2017, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2017, 2024, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -27,29 +27,30 @@ package com.oracle.svm.junit;
 import java.io.BufferedReader;
 import java.io.FileReader;
 import java.util.List;
-import java.text.SimpleDateFormat;
-import java.util.Date;
-import java.util.Random;
 
-import org.graalvm.compiler.options.Option;
+import org.graalvm.collections.EconomicSet;
 import org.graalvm.nativeimage.ImageSingletons;
 import org.graalvm.nativeimage.Platform;
 import org.graalvm.nativeimage.Platforms;
 import org.graalvm.nativeimage.hosted.Feature.FeatureAccess;
 import org.junit.internal.JUnitSystem;
 import org.junit.internal.RealSystem;
+import org.junit.runner.Description;
 import org.junit.runner.JUnitCore;
 import org.junit.runner.Request;
 import org.junit.runner.Result;
+import org.junit.runner.manipulation.Filter;
 import org.junit.runner.notification.Failure;
 
 import com.oracle.mxtool.junit.MxJUnitRequest;
 import com.oracle.mxtool.junit.MxJUnitWrapper;
 import com.oracle.mxtool.junit.MxJUnitWrapper.MxJUnitConfig;
-import com.oracle.svm.core.option.HostedOptionKey;
-import com.oracle.svm.core.option.SubstrateOptionsParser;
-import com.oracle.svm.core.util.VMError;
+import com.oracle.svm.shared.option.HostedOptionKey;
+import com.oracle.svm.shared.option.SubstrateOptionsParser;
+import com.oracle.svm.shared.util.LogUtils;
+import com.oracle.svm.shared.util.VMError;
 
+import jdk.graal.compiler.options.Option;
 import junit.runner.Version;
 
 public class SVMJUnitRunner {
@@ -64,8 +65,7 @@ public class SVMJUnitRunner {
 
     @Platforms(Platform.HOSTED_ONLY.class)
     SVMJUnitRunner(FeatureAccess access) {
-        MxJUnitRequest.Builder builder = new MxJUnitRequest.Builder() {
-
+        var builder = new MxJUnitRequest.Builder() {
             @Override
             protected Class<?> resolveClass(String name) throws ClassNotFoundException {
                 Class<?> ret = access.findClassByName(name);
@@ -86,16 +86,10 @@ public class SVMJUnitRunner {
         }
 
         request = builder.build();
-
         missingClassesStr = getMissingClasses();
         if (missingClassesStr != null) {
-            String testFileOption = SubstrateOptionsParser.commandArgument(Options.TestFile, Options.TestFile.getValue());
-            StringBuilder msg = new StringBuilder("Warning: The test configuration file specified via ").append(testFileOption)
-                            .append(" contains missing classes. Test execution will fail at run time. ")
-                            .append("Missing classes in configuration file: ").append(missingClassesStr);
-            // Checkstyle: stop
-            System.out.println(msg);
-            // Checkstyle: resume
+            LogUtils.warning("The test configuration file specified via %s contains missing classes. Test execution will fail at run time. Missing classes in configuration file: %s.",
+                            SubstrateOptionsParser.commandArgument(Options.TestFile, Options.TestFile.getValue()), missingClassesStr);
         }
     }
 
@@ -118,38 +112,6 @@ public class SVMJUnitRunner {
         return null;
     }
 
-    private static String formatJsonTestResultsPattern(JUnitSystem system, String testResultsPattern) {
-        if (!testResultsPattern.contains("XXX")) {
-            system.out().println("MX_TEST_RESULTS_PATTERN doesn't contain `XXX`. " +
-                            "Results will probably be overwritten if used multiple times.");
-            return testResultsPattern;
-        }
-
-        String timeStamp = new SimpleDateFormat("yyyy-MM-dd_HH-mm-ss").format(new Date());
-        // Generate a random int of 8 digits
-        String randNum = "00000000" + Math.abs(new Random().nextInt());
-        randNum = randNum.substring(randNum.length() - 8);
-        String identifier = "unittest-" + timeStamp + "-" + randNum;
-
-        return testResultsPattern.replaceFirst("XXXX*", identifier);
-    }
-
-    /* Get current os name in a standarized form. */
-    private static String getOS() {
-        String os = System.getProperty("os.name").toLowerCase();
-
-        if (os.contains("windows")) {
-            return "windows";
-        }
-        if (os.contains("linux")) {
-            return "linux";
-        }
-        if (os.contains("mac") || os.contains("darwin")) {
-            return "darwin";
-        }
-        return os;
-    }
-
     private void run(String[] args) {
         JUnitSystem system = new RealSystem();
         JUnitCore junitCore = new JUnitCore();
@@ -157,22 +119,7 @@ public class SVMJUnitRunner {
         system.out().println("JUnit version " + Version.id());
 
         MxJUnitConfig config = new MxJUnitConfig();
-
-        // Add flags for json test reports accordingly
-        String testResultsPattern = System.getenv("MX_TEST_RESULTS_PATTERN");
-        String jsonResultTags = System.getenv("MX_TEST_RESULT_TAGS");
-        if (testResultsPattern != null && !testResultsPattern.isEmpty()) {
-            config.jsonResults = formatJsonTestResultsPattern(system, testResultsPattern);
-        }
-        if (jsonResultTags != null && !jsonResultTags.isEmpty()) {
-            config.jsonResultTags = jsonResultTags;
-        }
-        config.jsonResultTags += "," + getOS();
-        config.jsonResultTags += "," + System.getProperty("os.arch");
-        if (!config.jsonResultTags.contains("native-image")) {
-            config.jsonResultTags += "," + "native-image";
-        }
-
+        var testsToRun = EconomicSet.create();
         int i = 0;
         while (i < args.length) {
             String arg = args[i++];
@@ -210,13 +157,37 @@ public class SVMJUnitRunner {
                 case "--eager-stacktrace":
                     config.eagerStackTrace = true;
                     break;
+                case "--run-explicit":
+                    if (i < args.length) {
+                        String classToRunOnly = args[i++];
+                        testsToRun.add(classToRunOnly);
+                    } else {
+                        system.out().println("Missing argument to --run-explicit");
+                    }
+                    break;
                 default:
                     system.out().println("Unknown command line argument: " + arg);
                     break;
             }
         }
 
-        Result result = MxJUnitWrapper.runRequest(junitCore, system, config, request);
+        var filter = Filter.ALL;
+        if (!testsToRun.isEmpty()) {
+            filter = new Filter() {
+                @Override
+                public boolean shouldRun(Description description) {
+                    // Always let non-test descriptions work, i.e. Parameterized tests.
+                    return testsToRun.contains(description.getClassName()) || !description.isTest();
+                }
+
+                @Override
+                public String describe() {
+                    return "Run only tests specified with the flag --run-explicit.";
+                }
+            };
+        }
+
+        Result result = MxJUnitWrapper.runRequest(junitCore, system, config, request, filter);
 
         if (result.wasSuccessful()) {
             system.out().println("Test run PASSED. Exiting with status 0.");

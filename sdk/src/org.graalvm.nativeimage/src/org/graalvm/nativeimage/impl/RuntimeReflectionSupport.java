@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2017, 2021, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2017, 2026, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * The Universal Permissive License (UPL), Version 1.0
@@ -40,22 +40,28 @@
  */
 package org.graalvm.nativeimage.impl;
 
-import java.lang.reflect.Executable;
-import java.util.Set;
+import java.util.Arrays;
+
+import org.graalvm.nativeimage.dynamicaccess.AccessCondition;
 
 public interface RuntimeReflectionSupport extends ReflectionRegistry {
-    // specific to java.lang.reflect reflection
-    Set<Executable> getQueriedOnlyMethods();
+    // needed as reflection-specific ImageSingletons key
+    default void registerAllFields(AccessCondition condition, boolean preserved, Class<?> clazz) {
+        register(condition, false, preserved, clazz.getFields());
+    }
 
-    /*
-     * Returns the methods that shadow a superclass method registered for reflection, to be excluded
-     * from reflection queries.
-     */
-    Set<?> getHidingMethods();
+    default void registerAllDeclaredFields(AccessCondition condition, boolean preserved, Class<?> clazz) {
+        register(condition, false, preserved, clazz.getDeclaredFields());
+    }
 
-    int getReflectionClassesCount();
+    void registerClassLookupException(AccessCondition condition, String typeName, Throwable t);
 
-    int getReflectionMethodsCount();
+    default void registerUnsafeAllocation(AccessCondition condition, boolean preserved, Class<?>... classes) {
+        Arrays.stream(classes).forEach(clazz -> {
+            register(condition, preserved, clazz);
+            registerUnsafeAllocation(condition, preserved, clazz);
+        });
+    }
 
-    int getReflectionFieldsCount();
+    void registerUnsafeAllocation(AccessCondition condition, boolean preserved, Class<?> clazz);
 }

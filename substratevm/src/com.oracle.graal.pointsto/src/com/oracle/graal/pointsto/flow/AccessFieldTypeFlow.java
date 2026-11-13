@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2020, 2020, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2020, 2026, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -24,10 +24,8 @@
  */
 package com.oracle.graal.pointsto.flow;
 
-import org.graalvm.compiler.nodes.ValueNode;
-
 import com.oracle.graal.pointsto.PointsToAnalysis;
-import com.oracle.graal.pointsto.meta.AnalysisField;
+import com.oracle.graal.pointsto.meta.PointsToAnalysisField;
 import com.oracle.graal.pointsto.typestate.TypeState;
 
 import jdk.vm.ci.code.BytecodePosition;
@@ -36,11 +34,11 @@ import jdk.vm.ci.code.BytecodePosition;
 public abstract class AccessFieldTypeFlow extends TypeFlow<BytecodePosition> {
 
     /** The field that this flow stores into or loads from. */
-    protected final AnalysisField field;
+    protected final PointsToAnalysisField field;
 
-    protected AccessFieldTypeFlow(ValueNode node, AnalysisField field) {
+    protected AccessFieldTypeFlow(BytecodePosition accessLocation, PointsToAnalysisField field) {
         /* The declared type of a field access node is the field declared type. */
-        super(node.getNodeSourcePosition(), field.getType());
+        super(accessLocation, dropUncheckedInterfaceBound(field.getType()));
         this.field = field;
     }
 
@@ -49,15 +47,8 @@ public abstract class AccessFieldTypeFlow extends TypeFlow<BytecodePosition> {
         this.field = original.field;
     }
 
-    public AnalysisField field() {
+    public PointsToAnalysisField field() {
         return field;
-    }
-
-    @Override
-    public final boolean addState(PointsToAnalysis bb, TypeState add) {
-        /* Only a clone should be updated */
-        assert this.isClone();
-        return super.addState(bb, add);
     }
 
     /**

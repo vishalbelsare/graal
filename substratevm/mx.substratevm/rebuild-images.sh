@@ -1,7 +1,5 @@
 #!/usr/bin/env bash
 #
-# ----------------------------------------------------------------------------------------------------
-#
 # Copyright (c) 2018, 2018, Oracle and/or its affiliates. All rights reserved.
 # DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
 #
@@ -25,7 +23,6 @@
 # or visit www.oracle.com if you need additional information or have any
 # questions.
 #
-# ----------------------------------------------------------------------------------------------------
 
 source="${BASH_SOURCE[0]}"
 while [[ -h "$source" ]] ; do
@@ -43,7 +40,7 @@ location="$( cd -P "$( dirname "$source" )" && pwd )"
 graalvm_home="${location}/../../.."
 
 function usage_and_exit() {
-    echo "Usage: $0 [--verbose] polyglot|libpolyglot|js|llvm|python|ruby|R... [custom native-image args]..."
+    echo "Usage: $0 [--verbose] polyglot|libpolyglot|espresso|js|llvm|python|R|wasm... [custom native-image args]..."
     exit 1
 }
 
@@ -52,7 +49,7 @@ custom_args=()
 
 for opt in "${@:1}"; do
     case "$opt" in
-        polyglot|libpolyglot|js|llvm|python|ruby|R)
+        polyglot|libpolyglot|espresso|js|llvm|python|R|wasm)
            to_build+=("${opt}")
             ;;
         --help|-h)
@@ -119,16 +116,19 @@ for binary in "${to_build[@]}"; do
             library jsvm
             ;;
         llvm)
-            launcher lli
+            library llvmvm
             ;;
         python)
-            launcher graalpython
-            ;;
-        ruby)
-            launcher truffleruby
+            library pythonvm
             ;;
         R)
             launcher RMain
+            ;;
+        wasm)
+            launcher wasm
+            ;;
+        espresso)
+            library javavm
             ;;
         *)
             echo "shouldNotReachHere()"

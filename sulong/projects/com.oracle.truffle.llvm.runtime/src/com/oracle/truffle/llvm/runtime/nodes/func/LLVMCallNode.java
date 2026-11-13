@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2016, 2021, Oracle and/or its affiliates.
+ * Copyright (c) 2016, 2022, Oracle and/or its affiliates.
  *
  * All rights reserved.
  *
@@ -37,7 +37,7 @@ import com.oracle.truffle.api.instrumentation.Tag;
 import com.oracle.truffle.api.nodes.ExplodeLoop;
 import com.oracle.truffle.llvm.runtime.LLVMFunction;
 import com.oracle.truffle.llvm.runtime.nodes.api.LLVMExpressionNode;
-import com.oracle.truffle.llvm.runtime.nodes.others.LLVMAccessSymbolNode;
+import com.oracle.truffle.llvm.runtime.nodes.others.LLVMAccessGlobalSymbolNode;
 import com.oracle.truffle.llvm.runtime.types.FunctionType;
 
 @NodeChild(value = "dispatchTarget", type = LLVMExpressionNode.class)
@@ -53,28 +53,45 @@ public abstract class LLVMCallNode extends LLVMExpressionNode {
     // therefore not be considered a function call for the debugger
     private final boolean isSourceCall;
 
-    public static LLVMCallNode create(FunctionType functionType, LLVMExpressionNode functionNode, LLVMExpressionNode[] argumentNodes, boolean isSourceCall) {
+    // Must tail requires forwarding of the variable args, and affects the handling of return values
+    protected boolean mustTail;
+
+    public static LLVMCallNode create(FunctionType functionType, LLVMExpressionNode functionNode, LLVMExpressionNode[] argumentNodes, boolean isSourceCall, boolean mustTail) {
         LLVMFunction llvmFun = null;
-        if (functionNode instanceof LLVMAccessSymbolNode) {
-            LLVMAccessSymbolNode node = (LLVMAccessSymbolNode) functionNode;
+        if (functionNode instanceof LLVMAccessGlobalSymbolNode) {
+            LLVMAccessGlobalSymbolNode node = (LLVMAccessGlobalSymbolNode) functionNode;
             if (node.getSymbol() instanceof LLVMFunction) {
                 llvmFun = (LLVMFunction) node.getSymbol();
             }
         }
-        return LLVMCallNodeGen.create(functionType, argumentNodes, isSourceCall, llvmFun, LLVMLookupDispatchTargetNode.createOptimized(functionNode));
+        return LLVMCallNodeGen.create(functionType, argumentNodes, isSourceCall, mustTail, llvmFun, LLVMLookupDispatchTargetNode.createOptimized(functionNode));
     }
 
-    LLVMCallNode(FunctionType functionType, LLVMExpressionNode[] argumentNodes, boolean isSourceCall, LLVMFunction llvmFunction) {
+    LLVMCallNode(FunctionType functionType, LLVMExpressionNode[] argumentNodes, boolean isSourceCall, boolean mustTail, LLVMFunction llvmFunction) {
         this.argumentNodes = argumentNodes;
+        this.mustTail = mustTail;
         this.prepareArgumentNodes = createPrepareArgumentNodes(argumentNodes);
         this.dispatchNode = LLVMDispatchNodeGen.create(functionType, llvmFunction);
         this.isSourceCall = isSourceCall;
     }
 
     @ExplodeLoop
-    @Specialization
+    @Specialization(guards = "!mustTail")
     Object doCall(VirtualFrame frame, Object function) {
         Object[] argValues = new Object[argumentNodes.length];
+        for (int i = 0; i < argumentNodes.length; i++) {
+            argValues[i] = prepareArgumentNodes[i].executeWithTarget(argumentNodes[i].executeGeneric(frame));
+        }
+
+        return dispatchNode.executeDispatch(function, argValues);
+    }
+
+    @ExplodeLoop
+    @Specialization(guards = "mustTail")
+    Object doTailCall(VirtualFrame frame, Object function) {
+        // Start with a copy of the frame arguments, which includes any varargs. Then overwrite the
+        // arguments that have changed.
+        Object[] argValues = frame.getArguments();
         for (int i = 0; i < argumentNodes.length; i++) {
             argValues[i] = prepareArgumentNodes[i].executeWithTarget(argumentNodes[i].executeGeneric(frame));
         }

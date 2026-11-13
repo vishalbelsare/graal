@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2018, 2021, Oracle and/or its affiliates.
+ * Copyright (c) 2018, 2026, Oracle and/or its affiliates.
  *
  * All rights reserved.
  *
@@ -36,11 +36,41 @@ import com.oracle.truffle.api.dsl.Specialization;
 import com.oracle.truffle.llvm.runtime.nodes.api.LLVMExpressionNode;
 import com.oracle.truffle.llvm.runtime.nodes.intrinsics.llvm.LLVMBuiltin;
 import com.oracle.truffle.llvm.runtime.vector.LLVMDoubleVector;
+import com.oracle.truffle.llvm.runtime.vector.LLVMFloatVector;
 import com.oracle.truffle.llvm.runtime.vector.LLVMI16Vector;
 import com.oracle.truffle.llvm.runtime.vector.LLVMI32Vector;
 import com.oracle.truffle.llvm.runtime.vector.LLVMI8Vector;
 
 public abstract class LLVMX86_VectorMathNode {
+
+    @NodeChild(type = LLVMExpressionNode.class)
+    @NodeChild(type = LLVMExpressionNode.class)
+    public abstract static class LLVMX86_SSE2MultiplyHighWordsNode extends LLVMBuiltin {
+
+        @Specialization(guards = {"left.getLength() == 8", "right.getLength() == 8"})
+        protected LLVMI16Vector doI16(LLVMI16Vector left, LLVMI16Vector right) {
+            short[] result = new short[8];
+            for (int i = 0; i < result.length; i++) {
+                result[i] = (short) ((left.getValue(i) * right.getValue(i)) >> Short.SIZE);
+            }
+            return LLVMI16Vector.create(result);
+        }
+    }
+
+    @NodeChild(type = LLVMExpressionNode.class)
+    @NodeChild(type = LLVMExpressionNode.class)
+    public abstract static class LLVMX86_SSE2MultiplyHighUnsignedWordsNode extends LLVMBuiltin {
+
+        @Specialization(guards = {"left.getLength() == 8", "right.getLength() == 8"})
+        protected LLVMI16Vector doI16(LLVMI16Vector left, LLVMI16Vector right) {
+            short[] result = new short[8];
+            for (int i = 0; i < result.length; i++) {
+                int product = Short.toUnsignedInt(left.getValue(i)) * Short.toUnsignedInt(right.getValue(i));
+                result[i] = (short) (product >>> Short.SIZE);
+            }
+            return LLVMI16Vector.create(result);
+        }
+    }
 
     @NodeChild(type = LLVMExpressionNode.class)
     public abstract static class LLVMX86_VectorSquareRootNode extends LLVMBuiltin { // mm_sqrt_pd
@@ -82,6 +112,74 @@ public abstract class LLVMX86_VectorMathNode {
             return LLVMDoubleVector.create(new double[]{
                             Math.min(v1.getValue(0), v2.getValue(0)),
                             Math.min(v1.getValue(1), v2.getValue(1))
+            });
+        }
+    }
+
+    @NodeChild(type = LLVMExpressionNode.class)
+    @NodeChild(type = LLVMExpressionNode.class)
+    public abstract static class LLVMX86_VectorMinsdNode extends LLVMBuiltin { // mm_min_sd
+        @Specialization(guards = {"v1.getLength() == 2", "v2.getLength() == 2"})
+        protected LLVMDoubleVector doM128(LLVMDoubleVector v1, LLVMDoubleVector v2) {
+            return LLVMDoubleVector.create(new double[]{
+                            Math.min(v1.getValue(0), v2.getValue(0)),
+                            v1.getValue(1)
+            });
+        }
+    }
+
+    @NodeChild(type = LLVMExpressionNode.class)
+    @NodeChild(type = LLVMExpressionNode.class)
+    public abstract static class LLVMX86_SSE_VectorMaxNode extends LLVMBuiltin { // mm_max_ps
+        @Specialization(guards = {"v1.getLength() == 4", "v2.getLength() == 4"})
+        protected LLVMFloatVector doM128(LLVMFloatVector v1, LLVMFloatVector v2) {
+            return LLVMFloatVector.create(new float[]{
+                            Math.max(v1.getValue(0), v2.getValue(0)),
+                            Math.max(v1.getValue(1), v2.getValue(1)),
+                            Math.max(v1.getValue(2), v2.getValue(2)),
+                            Math.max(v1.getValue(3), v2.getValue(3))
+            });
+        }
+    }
+
+    @NodeChild(type = LLVMExpressionNode.class)
+    @NodeChild(type = LLVMExpressionNode.class)
+    public abstract static class LLVMX86_SSE_VectorMaxsdNode extends LLVMBuiltin { // mm_max_ss
+        @Specialization(guards = {"v1.getLength() == 4", "v2.getLength() == 4"})
+        protected LLVMFloatVector doM128(LLVMFloatVector v1, LLVMFloatVector v2) {
+            return LLVMFloatVector.create(new float[]{
+                            Math.max(v1.getValue(0), v2.getValue(0)),
+                            v1.getValue(1),
+                            v1.getValue(2),
+                            v1.getValue(3)
+            });
+        }
+    }
+
+    @NodeChild(type = LLVMExpressionNode.class)
+    @NodeChild(type = LLVMExpressionNode.class)
+    public abstract static class LLVMX86_SSE_VectorMinNode extends LLVMBuiltin { // mm_min_ps
+        @Specialization(guards = {"v1.getLength() == 4", "v2.getLength() == 4"})
+        protected LLVMFloatVector doM128(LLVMFloatVector v1, LLVMFloatVector v2) {
+            return LLVMFloatVector.create(new float[]{
+                            Math.min(v1.getValue(0), v2.getValue(0)),
+                            Math.min(v1.getValue(1), v2.getValue(1)),
+                            Math.min(v1.getValue(2), v2.getValue(2)),
+                            Math.min(v1.getValue(3), v2.getValue(3))
+            });
+        }
+    }
+
+    @NodeChild(type = LLVMExpressionNode.class)
+    @NodeChild(type = LLVMExpressionNode.class)
+    public abstract static class LLVMX86_SSE_VectorMinsdNode extends LLVMBuiltin { // mm_min_ss
+        @Specialization(guards = {"v1.getLength() == 4", "v2.getLength() == 4"})
+        protected LLVMFloatVector doM128(LLVMFloatVector v1, LLVMFloatVector v2) {
+            return LLVMFloatVector.create(new float[]{
+                            Math.min(v1.getValue(0), v2.getValue(0)),
+                            v1.getValue(1),
+                            v1.getValue(2),
+                            v1.getValue(3)
             });
         }
     }
@@ -193,16 +291,6 @@ public abstract class LLVMX86_VectorMathNode {
             return Comparator.values()[predicate];
         }
 
-        @Specialization(guards = {"v1.getLength() == 2", "v2.getLength() == 2"})
-        protected LLVMDoubleVector doCmpAOT(LLVMDoubleVector v1, LLVMDoubleVector v2, int predicate) {
-            return compare(v1, v2, getComparator(predicate));
-        }
-
-        @Specialization(guards = {"v1.getLength() == 2", "v2.getLength() == 2"})
-        protected LLVMDoubleVector doCmpAOT(LLVMDoubleVector v1, LLVMDoubleVector v2, byte predicate) {
-            return compare(v1, v2, getComparator(predicate));
-        }
-
         @Specialization(guards = {"v1.getLength() == 2", "v2.getLength() == 2", "predicate == cachedPredicate"}, limit = "cmpCnt")
         @GenerateAOT.Exclude
         protected LLVMDoubleVector doCmp(LLVMDoubleVector v1, LLVMDoubleVector v2, @SuppressWarnings("unused") int predicate,
@@ -217,6 +305,16 @@ public abstract class LLVMX86_VectorMathNode {
                         @SuppressWarnings("unused") @Cached("predicate") byte cachedPredicate,
                         @Cached("getComparator(predicate)") Comparator comparator) {
             return compare(v1, v2, comparator);
+        }
+
+        @Specialization(guards = {"v1.getLength() == 2", "v2.getLength() == 2"})
+        protected LLVMDoubleVector doCmpAOT(LLVMDoubleVector v1, LLVMDoubleVector v2, int predicate) {
+            return compare(v1, v2, getComparator(predicate));
+        }
+
+        @Specialization(guards = {"v1.getLength() == 2", "v2.getLength() == 2"})
+        protected LLVMDoubleVector doCmpAOT(LLVMDoubleVector v1, LLVMDoubleVector v2, byte predicate) {
+            return compare(v1, v2, getComparator(predicate));
         }
 
         private static LLVMDoubleVector compare(LLVMDoubleVector v1, LLVMDoubleVector v2, Comparator comparator) {

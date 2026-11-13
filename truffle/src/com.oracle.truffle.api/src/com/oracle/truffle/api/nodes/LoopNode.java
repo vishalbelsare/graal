@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2014, 2020, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2014, 2022, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * The Universal Permissive License (UPL), Version 1.0
@@ -177,7 +177,7 @@ public abstract class LoopNode extends Node {
      * <pre>
      * public int executeCustomLoopSum(int[] data) {
      *     int sum = 0;
-     *     for (int i = 0; i < data.length; i++) {
+     *     for (int i = 0; i &lt; data.length; i++) {
      *         sum += data[i];
      *     }
      *     LoopNode.reportLoopCount(this, data.length);

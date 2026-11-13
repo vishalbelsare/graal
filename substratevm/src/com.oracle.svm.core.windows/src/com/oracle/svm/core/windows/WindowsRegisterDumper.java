@@ -26,32 +26,31 @@ package com.oracle.svm.core.windows;
 
 import static com.oracle.svm.core.RegisterDumper.dumpReg;
 
-import org.graalvm.nativeimage.ImageSingletons;
-import org.graalvm.nativeimage.hosted.Feature;
 import org.graalvm.word.PointerBase;
-import org.graalvm.word.WordFactory;
 
 import com.oracle.svm.core.RegisterDumper;
-import com.oracle.svm.core.annotate.AutomaticFeature;
-import com.oracle.svm.core.annotate.Uninterruptible;
+import com.oracle.svm.shared.Uninterruptible;
+import com.oracle.svm.shared.singletons.AutomaticallyRegisteredImageSingleton;
 import com.oracle.svm.core.graal.amd64.AMD64ReservedRegisters;
-import com.oracle.svm.core.log.Log;
-import com.oracle.svm.core.util.VMError;
+import com.oracle.svm.guest.staging.log.Log;
+import com.oracle.svm.shared.singletons.traits.BuiltinTraits.RuntimeAccessOnly;
+import com.oracle.svm.shared.singletons.traits.BuiltinTraits.SingleLayer;
+import com.oracle.svm.shared.singletons.traits.SingletonLayeredInstallationKind.InitialLayerOnly;
+import com.oracle.svm.shared.singletons.traits.SingletonTraits;
+import com.oracle.svm.shared.util.VMError;
 import com.oracle.svm.core.windows.headers.ErrHandlingAPI.CONTEXT;
 
 import jdk.vm.ci.amd64.AMD64;
+import org.graalvm.word.impl.Word;
 
-@AutomaticFeature
-class WindowsRegisterDumperFeature implements Feature {
-    @Override
-    public void afterRegistration(AfterRegistrationAccess access) {
-        VMError.guarantee(AMD64.r14.equals(AMD64ReservedRegisters.HEAP_BASE_REGISTER_CANDIDATE));
-        VMError.guarantee(AMD64.r15.equals(AMD64ReservedRegisters.THREAD_REGISTER_CANDIDATE));
-        ImageSingletons.add(RegisterDumper.class, new WindowsRegisterDumper());
+@AutomaticallyRegisteredImageSingleton(RegisterDumper.class)
+@SingletonTraits(access = RuntimeAccessOnly.class, layeredCallbacks = SingleLayer.class, layeredInstallationKind = InitialLayerOnly.class)
+class WindowsRegisterDumper implements RegisterDumper {
+    WindowsRegisterDumper() {
+        VMError.guarantee(AMD64.r14.equals(AMD64ReservedRegisters.HEAP_BASE_REGISTER));
+        VMError.guarantee(AMD64.r15.equals(AMD64ReservedRegisters.THREAD_REGISTER));
     }
-}
 
-public class WindowsRegisterDumper implements RegisterDumper {
     @Override
     public void dumpRegisters(Log log, Context context, boolean printLocationInfo, boolean allowJavaHeapAccess, boolean allowUnsafeOperations) {
         dumpRegisters(log, (CONTEXT) context, printLocationInfo, allowJavaHeapAccess, allowUnsafeOperations);
@@ -81,22 +80,24 @@ public class WindowsRegisterDumper implements RegisterDumper {
     @Override
     @Uninterruptible(reason = "Called from uninterruptible code.", mayBeInlined = true)
     public PointerBase getHeapBase(Context context) {
-        return WordFactory.pointer(((CONTEXT) context).R14());
+        return Word.pointer(((CONTEXT) context).R14());
     }
 
     @Override
     @Uninterruptible(reason = "Called from uninterruptible code.", mayBeInlined = true)
     public PointerBase getThreadPointer(Context context) {
-        return WordFactory.pointer(((CONTEXT) context).R15());
+        return Word.pointer(((CONTEXT) context).R15());
     }
 
     @Override
+    @Uninterruptible(reason = "Called from uninterruptible code.", mayBeInlined = true)
     public PointerBase getSP(Context context) {
-        return WordFactory.pointer(((CONTEXT) context).Rsp());
+        return Word.pointer(((CONTEXT) context).Rsp());
     }
 
     @Override
+    @Uninterruptible(reason = "Called from uninterruptible code.", mayBeInlined = true)
     public PointerBase getIP(Context context) {
-        return WordFactory.pointer(((CONTEXT) context).Rip());
+        return Word.pointer(((CONTEXT) context).Rip());
     }
 }

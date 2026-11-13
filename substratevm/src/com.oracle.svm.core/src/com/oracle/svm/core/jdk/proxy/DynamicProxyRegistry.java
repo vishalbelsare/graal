@@ -24,18 +24,14 @@
  */
 package com.oracle.svm.core.jdk.proxy;
 
-// Checkstyle: allow reflection
-
 import org.graalvm.nativeimage.Platform;
 import org.graalvm.nativeimage.Platforms;
+import org.graalvm.nativeimage.impl.RuntimeProxyCreationSupport;
 
-public interface DynamicProxyRegistry {
+public interface DynamicProxyRegistry extends RuntimeProxyCreationSupport {
+
+    Class<?> getProxyClass(ClassLoader loader, boolean nullIfMissing, Class<?>... interfaces);
 
     @Platforms(Platform.HOSTED_ONLY.class)
-    void addProxyClass(Class<?>... interfaces);
-
-    Class<?> getProxyClass(ClassLoader loader, Class<?>... interfaces);
-
-    boolean isProxyClass(Class<?> clazz);
-
+    Class<?> getProxyClassHosted(Class<?>... interfaces);
 }

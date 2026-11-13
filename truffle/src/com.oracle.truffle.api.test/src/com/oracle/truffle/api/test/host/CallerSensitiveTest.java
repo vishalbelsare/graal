@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2018, 2019, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2018, 2022, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * The Universal Permissive License (UPL), Version 1.0
@@ -69,13 +69,13 @@ public class CallerSensitiveTest extends ProxyLanguageEnvTest {
 
         TruffleObject getLogger = (TruffleObject) INTEROP.readMember(loggerClass, "getLogger");
         logger = (TruffleObject) INTEROP.execute(getLogger, loggerName);
-        assertTrue(env.isHostObject(logger));
-        assertTrue(env.asHostObject(logger) instanceof Logger);
+        assertTrue(INTEROP.isHostObject(logger));
+        assertTrue(INTEROP.asHostObject(logger) instanceof Logger);
         assertEquals(loggerName, asJavaObject(Logger.class, logger).getName());
 
         logger = (TruffleObject) INTEROP.invokeMember(loggerClass, "getLogger", loggerName);
-        assertTrue(env.isHostObject(logger));
-        assertTrue(env.asHostObject(logger) instanceof Logger);
+        assertTrue(INTEROP.isHostObject(logger));
+        assertTrue(INTEROP.asHostObject(logger) instanceof Logger);
         assertEquals(loggerName, asJavaObject(Logger.class, logger).getName());
     }
 }

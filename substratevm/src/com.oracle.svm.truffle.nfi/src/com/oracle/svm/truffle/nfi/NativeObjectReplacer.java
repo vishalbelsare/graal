@@ -24,17 +24,15 @@
  */
 package com.oracle.svm.truffle.nfi;
 
-//Checkstyle: allow reflection
-
+import java.lang.reflect.Field;
 import java.util.IdentityHashMap;
 import java.util.function.Function;
 
 import org.graalvm.nativeimage.hosted.Feature.DuringSetupAccess;
 
 import com.oracle.graal.pointsto.constraints.UnsupportedFeatureException;
-import com.oracle.svm.core.util.VMError;
-import com.oracle.svm.util.ClassUtil;
-import java.lang.reflect.Field;
+import com.oracle.svm.shared.util.ClassUtil;
+import com.oracle.svm.shared.util.VMError;
 
 /**
  * Fields that contain native pointers can not be part of the image heap, because the native
@@ -62,7 +60,7 @@ public final class NativeObjectReplacer implements Function<Object, Object> {
         disallowedClasses.put(nativePointer, Boolean.FALSE);
 
         try {
-            nativePointerField = nativePointer.getDeclaredField("nativePointer");
+            nativePointerField = nativePointer.getSuperclass().getDeclaredField("nativePointer");
             nativePointerField.setAccessible(true);
         } catch (NoSuchFieldException | SecurityException ex) {
             throw VMError.shouldNotReachHere(ex);

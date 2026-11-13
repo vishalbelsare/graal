@@ -78,6 +78,9 @@ final class EventContextObject extends AbstractContextObject {
     @ExportMessage
     @Override
     Object readMember(String member) throws UnknownIdentifierException {
+        if ("attributes".equals(member)) {
+            return context.getNodeObject();
+        }
         return super.readMember(member);
     }
 
@@ -129,10 +132,10 @@ final class EventContextObject extends AbstractContextObject {
                 return null;
             }
             final Frame frame = frameInstance.getFrame(FrameInstance.FrameAccess.READ_WRITE);
-            Node instrumentableNode = InstrumentableNode.findInstrumentableParent(n);
+            Node instrumentableNode = findInstrumentableParent(n);
             if (instrumentableNode != null && lib.hasScope(instrumentableNode, frame)) {
                 try {
-                    Object frameVars = new CurrentScopeView(lib.getScope(instrumentableNode, frame, false));
+                    Object frameVars = lib.getScope(instrumentableNode, frame, false);
                     Object ret = iop.execute(callback, location, frameVars);
                     return iop.isNull(ret) ? null : ret;
                 } catch (UnsupportedMessageException | UnsupportedTypeException | ArityException ex) {
@@ -179,5 +182,20 @@ final class EventContextObject extends AbstractContextObject {
         return n.getRootNode().getName() + " (" +
                         ss.getSource().getName() + ":" +
                         ss.getStartLine() + ":" + ss.getStartColumn() + ")";
+    }
+
+    static Node findInstrumentableParent(Node node) {
+        Node p = node;
+        while (p != null) {
+            Node n = p;
+            if (n instanceof InstrumentableNode.WrapperNode) {
+                n = ((InstrumentableNode.WrapperNode) n).getDelegateNode();
+            }
+            if (n instanceof InstrumentableNode && ((InstrumentableNode) n).isInstrumentable()) {
+                return n;
+            }
+            p = p.getParent();
+        }
+        return null;
     }
 }

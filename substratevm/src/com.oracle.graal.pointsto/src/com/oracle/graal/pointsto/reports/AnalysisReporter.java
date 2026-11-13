@@ -1,6 +1,6 @@
 /*
- * Copyright (c) 2021, 2021, Oracle and/or its affiliates. All rights reserved.
- * Copyright (c) 2021, 2021, Alibaba Group Holding Limited. All rights reserved.
+ * Copyright (c) 2021, 2025, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2021, 2025, Alibaba Group Holding Limited. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -25,46 +25,48 @@
  */
 package com.oracle.graal.pointsto.reports;
 
+import java.util.ArrayList;
+import java.util.List;
 import java.util.stream.Collectors;
-import java.util.stream.StreamSupport;
-
-import org.graalvm.compiler.options.OptionValues;
 
 import com.oracle.graal.pointsto.BigBang;
-import com.oracle.graal.pointsto.PointsToAnalysis;
 import com.oracle.graal.pointsto.api.PointstoOptions;
 import com.oracle.graal.pointsto.meta.AnalysisType;
 import com.oracle.graal.pointsto.typestate.PointsToStats;
-import com.oracle.graal.pointsto.typestate.TypeState;
 import com.oracle.graal.pointsto.typestate.TypeStateUtils;
+
+import jdk.graal.compiler.options.OptionValues;
 
 public class AnalysisReporter {
     public static void printAnalysisReports(String imageName, OptionValues options, String reportsPath, BigBang bb) {
         if (bb != null) {
+            String baseImageName = ReportUtils.extractImageName(imageName);
+
             if (AnalysisReportsOptions.PrintAnalysisStatistics.getValue(options)) {
-                StatisticsPrinter.print(bb, reportsPath, ReportUtils.extractImageName(imageName));
+                StatisticsPrinter.print(bb, reportsPath, baseImageName);
             }
 
             if (AnalysisReportsOptions.PrintAnalysisCallTree.getValue(options)) {
-                CallTreePrinter.print(bb, reportsPath, ReportUtils.extractImageName(imageName));
+                CallTreePrinter.print(bb, reportsPath, baseImageName);
             }
 
             if (AnalysisReportsOptions.PrintImageObjectTree.getValue(options)) {
-                ObjectTreePrinter.print(bb, reportsPath, ReportUtils.extractImageName(imageName));
-                AnalysisHeapHistogramPrinter.print(bb, reportsPath, ReportUtils.extractImageName(imageName));
+                ObjectTreePrinter.print(bb, reportsPath, baseImageName);
+                AnalysisHeapHistogramPrinter.print(bb, reportsPath, baseImageName);
             }
 
-            if (PointstoOptions.PrintPointsToStatistics.getValue(options)) {
-                PointsToStats.report(bb, ReportUtils.extractImageName(imageName));
+            if (PointstoOptions.PrintPointsToStatistics.getValue(options) || PointstoOptions.PrintTypeStateMemoryFootprint.getValue(options)) {
+                PointsToStats.report(bb, baseImageName);
             }
 
             if (PointstoOptions.PrintSynchronizedAnalysis.getValue(options)) {
-                TypeState allSynchronizedTypeState = bb.getAllSynchronizedTypeState();
-                String typesString = TypeStateUtils.closeToAllInstantiated((PointsToAnalysis) bb, allSynchronizedTypeState) ? "close to all instantiated" : //
-                                StreamSupport.stream(allSynchronizedTypeState.types(bb).spliterator(), false).map(AnalysisType::getName).collect(Collectors.joining(", "));
+                List<AnalysisType> synchronizedTypes = new ArrayList<>();
+                bb.getAllSynchronizedTypes().forEach(synchronizedTypes::add);
+                String typesString = TypeStateUtils.closeToAllInstantiated(bb, synchronizedTypes) ? "close to all instantiated" : //
+                                synchronizedTypes.stream().map(AnalysisType::getName).collect(Collectors.joining(", "));
                 System.out.println();
                 System.out.println("AllSynchronizedTypes");
-                System.out.println("Synchronized types #: " + allSynchronizedTypeState.typesCount());
+                System.out.println("Synchronized types #: " + synchronizedTypes.size());
                 System.out.println("Types: " + typesString);
                 System.out.println();
             }
